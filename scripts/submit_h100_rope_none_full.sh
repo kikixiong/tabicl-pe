@@ -27,7 +27,7 @@ submit_stage() {
     args+=(--dependency="afterok:$dependency")
   fi
   sbatch "${args[@]}" \
-    --export="ALL,MODE=$mode,STAGE=$stage,NUM_GPUS=$GPU_COUNT,N_JOBS=12" \
+    --export="ALL,MODE=$mode,STAGE=$stage,NUM_GPUS=$GPU_COUNT,N_JOBS=12,MICRO_BATCH_SIZE=8" \
     scripts/slurm_h100_identity_full.sh
 }
 

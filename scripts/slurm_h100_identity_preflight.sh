@@ -18,15 +18,17 @@ MONITOR="$ROOT/artifacts/gpu-monitor/preflight-${SLURM_JOB_ID}.csv"
 case "$NUM_GPUS" in 1|2|4) ;; *) echo "invalid NUM_GPUS=$NUM_GPUS" >&2; exit 2 ;; esac
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-export MAX_STEPS=500
+export MAX_STEPS="${MAX_STEPS:-100}"
 export N_JOBS="${N_JOBS:-12}"
-export CKPT_ROOT="$ROOT/artifacts/preflight/${NUM_GPUS}gpu"
-export SAVE_TEMP_EVERY=500
-export SAVE_PERM_EVERY=500
+export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-8}"
+export CKPT_ROOT="$ROOT/artifacts/preflight/${NUM_GPUS}gpu-mb${MICRO_BATCH_SIZE}"
+export SAVE_TEMP_EVERY="$MAX_STEPS"
+export SAVE_PERM_EVERY="$MAX_STEPS"
 export MAX_CHECKPOINTS=1
 export GPU_MONITOR_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 
 cd "$ROOT"
 scripts/run_with_gpu_monitor.sh "$MONITOR" scripts/train_v2_clf_identity_stage1.sh none
 .venv/bin/python scripts/summarize_gpu_usage.py "$MONITOR" \
-  --threshold 80 --warmup-samples 6 --min-samples 12 --expected-gpus "$NUM_GPUS"
+  --threshold 80 --start-after-active --warmup-samples 2 \
+  --min-samples 12 --expected-gpus "$NUM_GPUS"
