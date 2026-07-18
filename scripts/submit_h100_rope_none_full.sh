@@ -4,6 +4,14 @@ set -euo pipefail
 GPU_COUNT="${1:?usage: $0 {1|2|4}}"
 case "$GPU_COUNT" in 1|2|4) ;; *) echo "invalid GPU_COUNT=$GPU_COUNT" >&2; exit 2 ;; esac
 CPU_COUNT=$((GPU_COUNT * 16))
+MEMORY_GB=$((GPU_COUNT * 128))
+if [[ "$GPU_COUNT" -le 2 ]]; then
+  QOS=long
+  TIME_ARGS=()
+else
+  QOS=medium
+  TIME_ARGS=(--time=23:30:00)
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -13,7 +21,8 @@ submit_stage() {
   local mode="$1"
   local stage="$2"
   local dependency="${3:-}"
-  local args=(--parsable --gres="gpu:$GPU_COUNT" --cpus-per-task="$CPU_COUNT")
+  local args=(--parsable --qos="$QOS" --gres="gpu:$GPU_COUNT" \
+    --cpus-per-task="$CPU_COUNT" --mem="${MEMORY_GB}G" "${TIME_ARGS[@]}")
   if [[ -n "$dependency" ]]; then
     args+=(--dependency="afterok:$dependency")
   fi

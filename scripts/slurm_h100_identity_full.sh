@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tabicl-identity-full
 #SBATCH --partition=h100
+#SBATCH --qos=long
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
 #SBATCH --output=/slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain/artifacts/logs/%x-%j.out
 #SBATCH --error=/slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain/artifacts/logs/%x-%j.err
 
