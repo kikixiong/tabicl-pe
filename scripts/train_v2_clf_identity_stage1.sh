@@ -34,7 +34,8 @@ fi
   --scheduler cosine_with_restarts --warmup_proportion 0.01 \
   --cosine_num_cycles 1 --cosine_amplitude_decay 1 --cosine_lr_end 1e-7 \
   --gradient_clipping 10 \
-  --prior_type graph_scm --prior_device cpu --n_jobs "$N_JOBS" --batch_size_per_gp 4 \
+  --prior_type graph_scm --prior_device cpu --n_jobs "$N_JOBS" \
+  --batch_size_per_gp "${BATCH_SIZE_PER_GP:-4}" \
   --min_features 1 --max_features 100 --max_classes 10 --max_seq_len 1024 \
   --min_train_size 0.3 --max_train_size 0.9 --seq_len_per_gp True \
   --graph_noise False --filter_unpredictable_graphs True \
