@@ -5,7 +5,7 @@
 #SBATCH --time=02:00:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=128G
 #SBATCH --output=/slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain/artifacts/logs/%x-%j.out
 #SBATCH --error=/slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain/artifacts/logs/%x-%j.err
@@ -19,7 +19,7 @@ case "$NUM_GPUS" in 1|2|4) ;; *) echo "invalid NUM_GPUS=$NUM_GPUS" >&2; exit 2 ;
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export MAX_STEPS="${MAX_STEPS:-100}"
-export N_JOBS="${N_JOBS:-12}"
+export N_JOBS="${N_JOBS:-48}"
 export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-8}"
 export BATCH_SIZE_PER_GP="${BATCH_SIZE_PER_GP:-$MICRO_BATCH_SIZE}"
 export CKPT_ROOT="$ROOT/artifacts/preflight/${NUM_GPUS}gpu-mb${MICRO_BATCH_SIZE}"

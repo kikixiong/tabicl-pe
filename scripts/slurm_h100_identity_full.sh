@@ -4,7 +4,7 @@
 #SBATCH --qos=long
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=128G
 #SBATCH --output=/slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain/artifacts/logs/%x-%j.out
 #SBATCH --error=/slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain/artifacts/logs/%x-%j.err
@@ -22,7 +22,7 @@ ROOT=/slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain
 MONITOR="$ROOT/artifacts/gpu-monitor/${MODE}-stage${STAGE}-${SLURM_JOB_ID}.csv"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-export N_JOBS="${N_JOBS:-12}"
+export N_JOBS="${N_JOBS:-48}"
 export CKPT_ROOT="$ROOT/artifacts/tabiclv2-clf-identity"
 export GPU_MONITOR_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 if [[ "$STAGE" -eq 3 ]]; then

@@ -3,7 +3,7 @@ set -euo pipefail
 
 GPU_COUNT="${1:?usage: $0 {1|2|4}}"
 case "$GPU_COUNT" in 1|2|4) ;; *) echo "invalid GPU_COUNT=$GPU_COUNT" >&2; exit 2 ;; esac
-CPU_COUNT=$((GPU_COUNT * 16))
+CPU_COUNT=$((GPU_COUNT * 64))
 MEMORY_GB=$((GPU_COUNT * 128))
 if [[ "$GPU_COUNT" -le 2 ]]; then
   QOS=long
@@ -27,7 +27,7 @@ submit_stage() {
     args+=(--dependency="afterok:$dependency")
   fi
   sbatch "${args[@]}" \
-    --export="ALL,MODE=$mode,STAGE=$stage,NUM_GPUS=$GPU_COUNT,N_JOBS=12,MICRO_BATCH_SIZE=8,BATCH_SIZE_PER_GP=8" \
+    --export="ALL,MODE=$mode,STAGE=$stage,NUM_GPUS=$GPU_COUNT,N_JOBS=48,MICRO_BATCH_SIZE=8,BATCH_SIZE_PER_GP=8" \
     scripts/slurm_h100_identity_full.sh
 }
 
