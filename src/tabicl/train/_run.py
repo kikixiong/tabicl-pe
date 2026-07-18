@@ -215,6 +215,7 @@ class Trainer:
             "row_num_cls": self.config.row_num_cls,
             "row_rope_base": self.config.row_rope_base,
             "row_rope_interleaved": self.config.row_rope_interleaved,
+            "row_identity_mode": self.config.row_identity_mode,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
             "icl_ssmax": self.config.ssmax_type if self.config.icl_ssmax else False,
@@ -515,10 +516,9 @@ class Trainer:
                 results = self.run_batch(batch)
             train_time = train_timer.elapsed
 
-            # Clear CUDA cache to free memory
-            torch.cuda.empty_cache()
-
             self.curr_step = step + 1
+            if self.config.empty_cache_every > 0 and self.curr_step % self.config.empty_cache_every == 0:
+                torch.cuda.empty_cache()
             if self.master_process:
                 # Add timing information to results
                 results.update({"prior_time": prior_time, "train_time": train_time})
