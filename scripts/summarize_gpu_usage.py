@@ -22,6 +22,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Discard cold-start samples before the first utilization value of at least 10%.",
     )
+    parser.add_argument(
+        "--end-after-active",
+        action="store_true",
+        help="Discard shutdown samples after the last utilization value of at least 10%.",
+    )
     return parser.parse_args()
 
 
@@ -52,9 +57,16 @@ def main() -> int:
         return 2
 
     for gpu_index, raw_values in sorted(samples.items()):
+        start_index = 0
+        end_index = len(raw_values)
         if args.start_after_active:
-            first_active = next((i for i, value in enumerate(raw_values) if value >= 10), len(raw_values))
-            raw_values = raw_values[first_active:]
+            start_index = next((i for i, value in enumerate(raw_values) if value >= 10), len(raw_values))
+        if args.end_after_active:
+            end_index = next(
+                (len(raw_values) - i for i, value in enumerate(reversed(raw_values)) if value >= 10),
+                0,
+            )
+        raw_values = raw_values[start_index:end_index]
         values = raw_values[args.warmup_samples :]
         if len(values) < args.min_samples:
             print(f"GPU {gpu_index}: only {len(values)} post-warmup samples")

@@ -38,4 +38,5 @@ scripts/run_with_gpu_monitor.sh \
   "$MONITOR" \
   "scripts/train_v2_clf_identity_stage${STAGE}.sh" "$MODE"
 .venv/bin/python scripts/summarize_gpu_usage.py "$MONITOR" \
-  --threshold 80 --expected-gpus "$NUM_GPUS"
+  --threshold 80 --start-after-active --end-after-active \
+  --expected-gpus "$NUM_GPUS"

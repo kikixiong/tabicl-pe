@@ -31,5 +31,5 @@ export GPU_MONITOR_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 cd "$ROOT"
 scripts/run_with_gpu_monitor.sh "$MONITOR" scripts/train_v2_clf_identity_stage1.sh none
 .venv/bin/python scripts/summarize_gpu_usage.py "$MONITOR" \
-  --threshold 80 --start-after-active --warmup-samples 2 \
+  --threshold 80 --start-after-active --end-after-active --warmup-samples 2 \
   --min-samples 12 --expected-gpus "$NUM_GPUS"
