@@ -15,6 +15,8 @@ SEED="${SEED:-42}"
 CKPT_ROOT="${CKPT_ROOT:-$ROOT/artifacts/tabiclv2-clf-identity}"
 STAGE2_CKPT="$CKPT_ROOT/$MODE/seed-$SEED/stage2/step-40000.ckpt"
 CKPT_DIR="$CKPT_ROOT/$MODE/seed-$SEED/stage3"
+WANDB_DIR="${WANDB_DIR:-$ROOT/artifacts/wandb}"
+mkdir -p "$WANDB_DIR"
 
 RESUME_ARGS=(--checkpoint_path "$STAGE2_CKPT" --only_load_model True)
 if compgen -G "$CKPT_DIR/step-*.ckpt" >/dev/null; then
@@ -28,8 +30,10 @@ else
 fi
 
 "${LAUNCHER[@]}" \
-  --wandb_log False --wandb_project TabICLv2-Identity \
+  --wandb_log "${WANDB_LOG:-False}" \
+  --wandb_project "${WANDB_PROJECT:-TabICLv2-Identity}" \
   --wandb_name "tabiclv2_clf_stage3_${MODE}_seed${SEED}" \
+  --wandb_mode "${WANDB_MODE:-offline}" --wandb_dir "$WANDB_DIR" \
   --device cuda --dtype float32 --amp True \
   --np_seed "$SEED" --torch_seed "$SEED" --max_steps 10000 \
   --batch_size 64 --micro_batch_size 1 --lr 2e-5 \

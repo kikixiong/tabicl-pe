@@ -14,11 +14,12 @@ NVIDIA_SMI_ARGS=()
 if [[ -n "${GPU_MONITOR_DEVICES:-}" ]]; then
   NVIDIA_SMI_ARGS=(-i "$GPU_MONITOR_DEVICES")
 fi
+GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-5}"
 
 nvidia-smi "${NVIDIA_SMI_ARGS[@]}" \
   --query-gpu=timestamp,index,name,utilization.gpu,memory.used,memory.total,power.draw,power.limit \
   --format=csv,noheader,nounits \
-  --loop=5 >"$OUTPUT" &
+  --loop="$GPU_MONITOR_INTERVAL" >"$OUTPUT" &
 MONITOR_PID=$!
 
 cleanup() {

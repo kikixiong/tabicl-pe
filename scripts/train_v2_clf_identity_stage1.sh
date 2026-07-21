@@ -17,6 +17,8 @@ N_JOBS="${N_JOBS:-16}"
 SEED="${SEED:-42}"
 CKPT_ROOT="${CKPT_ROOT:-$ROOT/artifacts/tabiclv2-clf-identity-stage1}"
 CKPT_DIR="$CKPT_ROOT/$MODE/seed-$SEED/stage1"
+WANDB_DIR="${WANDB_DIR:-$ROOT/artifacts/wandb}"
+mkdir -p "$WANDB_DIR"
 
 if [[ "$NUM_GPUS" -eq 1 ]]; then
   LAUNCHER=("$PYTHON" -m tabicl.train)
@@ -25,8 +27,10 @@ else
 fi
 
 "${LAUNCHER[@]}" \
-  --wandb_log False --wandb_project TabICLv2-Identity \
+  --wandb_log "${WANDB_LOG:-False}" \
+  --wandb_project "${WANDB_PROJECT:-TabICLv2-Identity}" \
   --wandb_name "tabiclv2_clf_stage1_${MODE}_seed${SEED}" \
+  --wandb_mode "${WANDB_MODE:-offline}" --wandb_dir "$WANDB_DIR" \
   --device cuda --dtype float32 --amp True \
   --np_seed "$SEED" --torch_seed "$SEED" --max_steps "$MAX_STEPS" \
   --batch_size "$BATCH_SIZE" --micro_batch_size "$MICRO_BATCH_SIZE" \
