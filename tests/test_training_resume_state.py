@@ -259,3 +259,149 @@ def test_checkpoint_rng_boundary_is_after_logging(monkeypatch):
     Trainer.train.__wrapped__(trainer)
 
     torch.testing.assert_close(captured[0], expected_at_boundary, rtol=0, atol=0)
+
+
+def _cpu_trainer_config(checkpoint_dir, *, checkpoint_path=None):
+    from tabicl.train._train_config import build_parser
+
+    args = [
+        "--device",
+        "cpu",
+        "--amp",
+        "false",
+        "--max_steps",
+        "2",
+        "--batch_size",
+        "2",
+        "--micro_batch_size",
+        "2",
+        "--scheduler",
+        "constant",
+        "--prior_type",
+        "dummy",
+        "--prior_device",
+        "cpu",
+        "--n_jobs",
+        "1",
+        "--batch_size_per_gp",
+        "1",
+        "--min_features",
+        "2",
+        "--max_features",
+        "2",
+        "--max_classes",
+        "2",
+        "--min_seq_len",
+        "6",
+        "--max_seq_len",
+        "6",
+        "--min_train_size",
+        "2",
+        "--max_train_size",
+        "4",
+        "--embed_dim",
+        "8",
+        "--col_num_blocks",
+        "1",
+        "--col_nhead",
+        "2",
+        "--col_num_inds",
+        "2",
+        "--row_num_blocks",
+        "1",
+        "--row_nhead",
+        "2",
+        "--row_num_cls",
+        "1",
+        "--row_identity_mode",
+        "temporary",
+        "--identity_rng_seed",
+        "29",
+        "--icl_num_blocks",
+        "1",
+        "--icl_nhead",
+        "2",
+        "--ff_factor",
+        "1",
+        "--dropout",
+        "0.1",
+        "--zero_init",
+        "false",
+        "--np_seed",
+        "17",
+        "--torch_seed",
+        "23",
+        "--checkpoint_dir",
+        str(checkpoint_dir),
+        "--save_temp_every",
+        "1",
+        "--save_perm_every",
+        "100",
+        "--max_checkpoints",
+        "0",
+    ]
+    if checkpoint_path is not None:
+        args.extend(["--checkpoint_path", str(checkpoint_path)])
+    return build_parser().parse_args(args)
+
+
+def _assert_checkpoint_tree_equal(actual, expected):
+    assert type(actual) is type(expected)
+    if isinstance(actual, torch.Tensor):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    elif isinstance(actual, dict):
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            _assert_checkpoint_tree_equal(actual[key], expected[key])
+    elif isinstance(actual, (list, tuple)):
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected):
+            _assert_checkpoint_tree_equal(actual_item, expected_item)
+    else:
+        assert actual == expected
+
+
+def test_actual_cpu_trainer_step_one_resume_matches_uninterrupted(tmp_path, monkeypatch):
+    import tabicl.train._run as run_module
+
+    real_make_prior_dataloader = run_module.make_prior_dataloader
+
+    def make_in_process_loader(dataset, **kwargs):
+        return real_make_prior_dataloader(
+            dataset,
+            num_workers=0,
+            pin_memory=False,
+        )
+
+    monkeypatch.setattr(run_module, "make_prior_dataloader", make_in_process_loader)
+    uninterrupted_dir = tmp_path / "uninterrupted"
+    split_dir = tmp_path / "split"
+    previous_num_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        uninterrupted = run_module.Trainer(_cpu_trainer_config(uninterrupted_dir))
+        uninterrupted.train()
+
+        first_leg = run_module.Trainer(_cpu_trainer_config(split_dir))
+        # Keep the scheduler's two-step horizon while deliberately stopping at
+        # the first durable end-of-step checkpoint.
+        first_leg.config.max_steps = 1
+        first_leg.train()
+
+        resumed = run_module.Trainer(
+            _cpu_trainer_config(
+                split_dir,
+                checkpoint_path=split_dir / "step-1.ckpt",
+            )
+        )
+        resumed.train()
+    finally:
+        torch.set_num_threads(previous_num_threads)
+
+    uninterrupted_checkpoint = torch.load(
+        uninterrupted_dir / "step-2.ckpt", map_location="cpu", weights_only=True
+    )
+    resumed_checkpoint = torch.load(
+        split_dir / "step-2.ckpt", map_location="cpu", weights_only=True
+    )
+    _assert_checkpoint_tree_equal(resumed_checkpoint, uninterrupted_checkpoint)

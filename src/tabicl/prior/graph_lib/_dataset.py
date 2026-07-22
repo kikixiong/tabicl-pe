@@ -38,7 +38,7 @@ class RandomDataset(PriorComponent):
 
             node_feature_specs = [dict() for _ in range(n_nodes)]
 
-            feature_groups = list(set(spec.group for spec in data_prop.feature_specs.values()))
+            feature_groups = sorted({spec.group for spec in data_prop.feature_specs.values()})
             for feature_group in feature_groups:
                 feature_specs = {
                     key: value for key, value in data_prop.feature_specs.items() if value.group == feature_group
