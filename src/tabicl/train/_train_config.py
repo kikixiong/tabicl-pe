@@ -382,6 +382,35 @@ def build_parser():
     parser.add_argument("--only_load_model", default=False, type=str2bool, help="Whether to only load model weights")
 
     ###########################################################################
+    ###### Formal provenance (opt-in; ordinary training remains unchanged) ####
+    ###########################################################################
+    parser.add_argument(
+        "--formal_training",
+        default=False,
+        type=str2bool,
+        help="Enable fail-closed formal provenance and parent validation.",
+    )
+    parser.add_argument(
+        "--formal_stage", choices=["stage1", "stage2", "stage3"], default=None
+    )
+    parser.add_argument("--formal_source_manifest", type=str, default=None)
+    parser.add_argument("--formal_source_sha256", type=str, default=None)
+    parser.add_argument("--formal_source_commit_sha", type=str, default=None)
+    parser.add_argument("--formal_source_tree_sha", type=str, default=None)
+    parser.add_argument("--formal_environment_sha256", type=str, default=None)
+    parser.add_argument("--formal_study_id", type=str, default=None)
+    parser.add_argument("--formal_output_id", type=str, default=None)
+    parser.add_argument("--formal_transaction_ledger", type=str, default=None)
+    parser.add_argument("--formal_transaction_ledger_sha256", type=str, default=None)
+    parser.add_argument("--formal_parent_finalized_manifest", type=str, default=None)
+    parser.add_argument(
+        "--formal_parent_stage", choices=["stage1", "stage2", "stage3"], default=None
+    )
+    parser.add_argument("--formal_parent_upstream_identity", type=str, default=None)
+    parser.add_argument("--formal_parent_artifact_identity", type=str, default=None)
+    parser.add_argument("--formal_artifact_root", type=str, default=None)
+
+    ###########################################################################
     ###### Graph prior (graph_scm) config #####################################
     ###########################################################################
     # Adds the graph_scm PriorConfig options (e.g. --graph_noise, --filter_unpredictable_graphs,

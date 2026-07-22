@@ -8,6 +8,7 @@ import warnings
 import functools
 from contextlib import nullcontext
 from dataclasses import asdict
+from pathlib import Path
 
 import math
 import numpy as np
@@ -35,6 +36,15 @@ from tabicl.train._muon import Muon
 from tabicl.train._train_config import build_parser
 from tabicl.train._checkpoint_io import atomic_torch_save
 from tabicl.train._identity_rng import SAMPLER_VERSION, TrainerIdentityRNG
+from tabicl.train._provenance import (
+    FORMAL_PROTOCOL_CONFIG_FIELDS,
+    ParentTrust,
+    build_checkpoint_provenance,
+    load_source_manifest,
+    make_manifest,
+    runtime_environment_manifest,
+    validate_parent_trust,
+)
 from tabicl.train._rng_state import (
     gather_all_rank_rng_state,
     restore_all_rank_rng_state,
@@ -106,6 +116,7 @@ class Trainer:
         self.configure_prior()
         self.configure_optimizer()
         self.configure_amp()
+        self.configure_formal_provenance()
         self._loaded_full_resume = False
         self.load_checkpoint()
         if not self._loaded_full_resume:
@@ -454,6 +465,171 @@ class Trainer:
         else:
             self.amp_ctx = nullcontext()
 
+    def _formal_optimizer_config(self):
+        fields = (
+            "lr",
+            "weight_decay",
+            "beta1",
+            "beta2",
+            "muon",
+            "use_cautious_wd",
+            "scheduler",
+            "warmup_proportion",
+            "warmup_steps",
+            "cosine_num_cycles",
+            "cosine_amplitude_decay",
+            "cosine_lr_end",
+            "poly_decay_lr_end",
+            "poly_decay_power",
+            "gradient_clipping",
+        )
+        return {
+            "optimizer": "Muon" if self.config.muon else "AdamW",
+            **{field: getattr(self.config, field) for field in fields},
+        }
+
+    def _formal_parent_manifest(self):
+        stage = self.config.formal_stage
+        parent_names = (
+            "formal_transaction_ledger",
+            "formal_transaction_ledger_sha256",
+            "formal_parent_finalized_manifest",
+            "formal_parent_stage",
+            "formal_parent_upstream_identity",
+            "formal_parent_artifact_identity",
+            "formal_artifact_root",
+        )
+        supplied = [getattr(self.config, name) is not None for name in parent_names]
+        if stage == "stage1":
+            if (
+                any(supplied)
+                or self.config.checkpoint_path is not None
+                or self.config.only_load_model
+            ):
+                raise ValueError(
+                    "formal Stage 1 is fresh-only and requires an explicit null parent"
+                )
+            return make_manifest("parent", {"parent": None})
+        if (
+            not all(supplied)
+            or self.config.checkpoint_path is None
+            or not self.config.only_load_model
+        ):
+            raise ValueError(
+                "formal Stage 2/3 requires an explicit model-only parent and every immutable trust input"
+            )
+        expected_parent_stage = "stage1" if stage == "stage2" else "stage2"
+        if self.config.formal_parent_stage != expected_parent_stage:
+            raise ValueError(
+                f"formal {stage} parent must be {expected_parent_stage}, got {self.config.formal_parent_stage}"
+            )
+        trust = ParentTrust(
+            checkpoint_path=Path(self.config.checkpoint_path).resolve(),
+            finalized_manifest_path=Path(
+                self.config.formal_parent_finalized_manifest
+            ).resolve(),
+            transaction_ledger_path=Path(
+                self.config.formal_transaction_ledger
+            ).resolve(),
+            transaction_ledger_sha256=self.config.formal_transaction_ledger_sha256,
+            study_id=self.config.formal_study_id,
+            arm=self.config.row_identity_mode,
+            parent_stage=self.config.formal_parent_stage,
+            upstream_identity=self.config.formal_parent_upstream_identity,
+            artifact_identity=self.config.formal_parent_artifact_identity,
+            artifact_root=Path(self.config.formal_artifact_root).resolve(),
+        )
+        parent = validate_parent_trust(trust)
+        payload = parent["payload"]["parent"]
+        expected_current = {
+            "np_seed": self.config.np_seed,
+            "torch_seed": self.config.torch_seed,
+            "identity_rng_seed": self.config.identity_rng_seed,
+            "world_size": self.ddp_world_size,
+        }
+        for field, expected in expected_current.items():
+            if payload[field] != expected:
+                raise ValueError(f"formal parent {field} differs from the child run")
+        return parent
+
+    def configure_formal_provenance(self):
+        """Build immutable checkpoint provenance for opt-in formal runs."""
+        if not getattr(self.config, "formal_training", False):
+            self.formal_provenance = None
+            return
+        required = (
+            "formal_stage",
+            "formal_source_manifest",
+            "formal_source_sha256",
+            "formal_source_commit_sha",
+            "formal_source_tree_sha",
+            "formal_environment_sha256",
+            "formal_study_id",
+            "formal_output_id",
+        )
+        missing = [
+            name for name in required if getattr(self.config, name, None) is None
+        ]
+        if missing:
+            raise ValueError(
+                f"formal training is missing required inputs: {', '.join(missing)}"
+            )
+        if self.config.prior_dir is not None:
+            raise ValueError("formal training requires the logical on-the-fly prior")
+        source = load_source_manifest(
+            self.config.formal_source_manifest,
+            expected_sha256=self.config.formal_source_sha256,
+            expected_commit_sha=self.config.formal_source_commit_sha,
+            expected_tree_sha=self.config.formal_source_tree_sha,
+        )
+        environment = runtime_environment_manifest()
+        if environment["sha256"] != self.config.formal_environment_sha256:
+            raise ValueError("environment does not match external expected sha256")
+        parent = self._formal_parent_manifest()
+        run_config = {
+            key: value
+            for key, value in vars(self.config).items()
+            if key not in FORMAL_PROTOCOL_CONFIG_FIELDS
+            and key != "identity_sampler_version"
+        }
+        prior_stream = self.prior_dataset.logical_stream_state_dict(
+            cursor=self.prior_cursor
+        )
+        self.formal_provenance = build_checkpoint_provenance(
+            source_manifest=source,
+            environment=environment["payload"],
+            model_config=self.model_config,
+            state_dict=self.raw_model.state_dict(),
+            prior_stream=prior_stream,
+            optimizer_config=self._formal_optimizer_config(),
+            stage=self.config.formal_stage,
+            terminal_step=self.config.max_steps,
+            np_seed=self.config.np_seed,
+            torch_seed=self.config.torch_seed,
+            identity_seed=self.config.identity_rng_seed,
+            world_size=self.ddp_world_size,
+            identity_treatment=self.identity_rng.treatment_manifest(),
+            run_config=run_config,
+            operational_context={
+                "study_id": self.config.formal_study_id,
+                "arm": self.config.row_identity_mode,
+                "output_id": self.config.formal_output_id,
+            },
+            parent_manifest=parent,
+        )
+        if self.config.formal_stage != "stage1":
+            parent_payload = parent["payload"]["parent"]
+            current = self.formal_provenance["manifests"]
+            for field, manifest_name in (
+                ("source_sha256", "source"),
+                ("environment_sha256", "environment"),
+                ("architecture_sha256", "architecture"),
+            ):
+                if parent_payload[field] != current[manifest_name]["sha256"]:
+                    raise ValueError(
+                        f"formal parent {field} differs from the child run"
+                    )
+
     def get_latest_checkpoint(self):
         """Returns the latest checkpoint from `checkpoint_dir`
 
@@ -492,6 +668,14 @@ class Trainer:
         elif hasattr(self.config, "checkpoint_dir") and self.config.checkpoint_dir:
             checkpoint_path = self.get_latest_checkpoint()
 
+        if (
+            getattr(self.config, "formal_training", False)
+            and self.config.formal_stage == "stage1"
+            and checkpoint_path is not None
+        ):
+            raise ValueError(
+                "formal Stage 1 is fresh-only and refuses any discovered checkpoint"
+            )
         if checkpoint_path is None or not os.path.exists(checkpoint_path):
             print("No checkpoint found, starting from scratch.")
             return
@@ -584,6 +768,8 @@ class Trainer:
             "prior_stream": prior_stream,
         }
         checkpoint.update(identity_fields)
+        if getattr(self, "formal_provenance", None) is not None:
+            checkpoint["provenance"] = self.formal_provenance
         atomic_torch_save(checkpoint, checkpoint_path)
 
     def coordinate_checkpoint_phase(
