@@ -146,3 +146,6 @@ CLAUDE.md
 ckpts/
 artifacts/
 src_private/
+
+# Local Git transfer bundles; never publish these repository snapshots.
+/tabicl-*.bundle
