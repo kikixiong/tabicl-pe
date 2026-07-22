@@ -586,6 +586,32 @@ class Trainer:
         checkpoint.update(identity_fields)
         atomic_torch_save(checkpoint, checkpoint_path)
 
+    def coordinate_checkpoint_phase(
+        self, phase: str, local_error: Exception | None
+    ) -> None:
+        """Make every rank observe the same checkpoint-boundary outcome."""
+        local_failure = None
+        if local_error is not None:
+            local_failure = {
+                "rank": self.ddp_rank,
+                "type": type(local_error).__name__,
+                "message": str(local_error),
+            }
+
+        if self.ddp:
+            failures = [None] * self.ddp_world_size
+            torch.distributed.all_gather_object(failures, local_failure)
+        else:
+            failures = [local_failure]
+
+        failures = [failure for failure in failures if failure is not None]
+        if failures:
+            details = "; ".join(
+                f"rank {failure['rank']} {failure['type']}: {failure['message']}"
+                for failure in failures
+            )
+            raise RuntimeError(f"checkpoint {phase} phase failed on {details}") from local_error
+
     def manage_checkpoint(self):
         """Manage temporary checkpoints by deleting the oldest when limit is exceeded."""
         ckpt_dir = self.config.checkpoint_dir
@@ -660,30 +686,55 @@ class Trainer:
             is_perm_save = self.curr_step % self.config.save_perm_every == 0
             should_save = is_temp_save or is_perm_save
 
-            if self.master_process:
-                # Add timing information to results
-                results.update({"prior_time": prior_time, "train_time": train_time})
+            hook_error = None
+            try:
+                if self.master_process:
+                    # Add timing information to results
+                    results.update({"prior_time": prior_time, "train_time": train_time})
 
-                # Update progress bar with rounded values for cleaner display
-                step_progress.set_postfix(**{k: round(v, 3) if isinstance(v, float) else v for k, v in results.items()})
+                    # Update progress bar with rounded values for cleaner display
+                    step_progress.set_postfix(
+                        **{
+                            k: round(v, 3) if isinstance(v, float) else v
+                            for k, v in results.items()
+                        }
+                    )
 
-            # Logging to Weights & Biases
-            if self.wandb_run is not None:
-                # Add learning rate to results
-                results["lr"] = self.scheduler.get_last_lr()[0]
-                wandb.log(results, step=self.curr_step)
+                # Logging to Weights & Biases
+                if self.wandb_run is not None:
+                    # Add learning rate to results
+                    results["lr"] = self.scheduler.get_last_lr()[0]
+                    wandb.log(results, step=self.curr_step)
+            except Exception as error:
+                if not should_save:
+                    raise
+                hook_error = error
 
             # Capture stochastic state at the true end-of-step boundary, after
             # progress/logging hooks that may themselves consume a global RNG.
             if should_save:
-                self.save_checkpoint(name=f"step-{self.curr_step}.ckpt")
-                if (
-                    self.master_process
-                    and is_temp_save
+                self.coordinate_checkpoint_phase("hook", hook_error)
+
+                write_error = None
+                try:
+                    self.save_checkpoint(name=f"step-{self.curr_step}.ckpt")
+                except Exception as error:
+                    write_error = error
+                self.coordinate_checkpoint_phase("write", write_error)
+
+                should_prune = (
+                    is_temp_save
                     and not is_perm_save
                     and self.config.max_checkpoints > 0
-                ):
-                    self.manage_checkpoint()
+                )
+                if should_prune:
+                    prune_error = None
+                    if self.master_process:
+                        try:
+                            self.manage_checkpoint()
+                        except Exception as error:
+                            prune_error = error
+                    self.coordinate_checkpoint_phase("prune", prune_error)
 
     def validate_micro_batch(self, micro_seq_len, micro_train_size):
         """Validate consistent sequence length and train size within a micro batch.

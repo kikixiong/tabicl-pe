@@ -176,8 +176,10 @@ class RowInteraction(nn.Module):
                 )
             permutations = row_identity_permutation.to(device=embeddings.device, dtype=torch.long)
             expected = torch.arange(num_features, device=embeddings.device).expand(batch_size, -1)
-            if not torch.equal(permutations.sort(dim=-1).values, expected):
-                raise ValueError("row_identity_permutation rows must each be a feature permutation")
+            torch._assert_async(
+                torch.all(permutations.sort(dim=-1).values == expected),
+                "row_identity_permutation rows must each be a feature permutation",
+            )
         feature_index = permutations[:, None, :, None].expand(batch_size, num_rows, num_features, embed_dim)
         permuted_features = embeddings[:, :, self.num_cls :].gather(2, feature_index)
         embeddings = torch.cat((embeddings[:, :, : self.num_cls], permuted_features), dim=2)

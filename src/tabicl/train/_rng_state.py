@@ -166,11 +166,18 @@ def select_rank_rng_state(
     rank_states = bundle.get("rank_states")
     if not isinstance(rank_states, dict):
         raise ValueError("all-rank RNG rank_states is missing")
+    for outer_rank, state in rank_states.items():
+        inner_rank = state.get("rank") if isinstance(state, dict) else None
+        if outer_rank != str(inner_rank):
+            raise ValueError(
+                f"all-rank RNG outer rank key {outer_rank!r} does not match "
+                f"inner rank {inner_rank!r}"
+            )
     normalized = make_all_rank_rng_bundle(list(rank_states.values()), world_size=world_size)
     if normalized["manifest_sha256"] != bundle.get("manifest_sha256"):
         raise ValueError("all-rank RNG bundle manifest hash mismatch")
     try:
-        return rank_states[str(rank)]
+        return normalized["rank_states"][str(rank)]
     except KeyError as error:
         raise ValueError(f"all-rank RNG state is missing rank {rank}") from error
 

@@ -8,7 +8,9 @@ import torch.multiprocessing as mp
 
 from tabicl.train._identity_rng import (
     TrainerIdentityRNG,
+    build_checkpoint_bundle,
     make_identity_treatment,
+    restore_sampler_from_bundle,
     validate_identity_treatment,
 )
 
@@ -107,6 +109,26 @@ def test_identity_sampler_state_round_trips_and_is_hash_protected():
     state["generator_state"][0] ^= 1
     with pytest.raises(ValueError, match="hash"):
         restored.load_state_dict(state)
+
+
+def test_identity_bundle_swapped_outer_rank_keys_fail_closed():
+    states = [
+        TrainerIdentityRNG(
+            mode="temporary", seed=17, rank=rank, world_size=2
+        ).state_dict()
+        for rank in range(2)
+    ]
+    bundle = build_checkpoint_bundle(states)
+    bundle["rank_states"] = {
+        "0": bundle["rank_states"]["1"],
+        "1": bundle["rank_states"]["0"],
+    }
+    restored = TrainerIdentityRNG(
+        mode="temporary", seed=17, rank=0, world_size=2
+    )
+
+    with pytest.raises(ValueError, match="rank"):
+        restore_sampler_from_bundle(restored.sampler, bundle)
 
 
 def test_treatment_validation_rejects_mode_seed_and_world_size_drift():

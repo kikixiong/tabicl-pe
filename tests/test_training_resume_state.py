@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from tabicl.train._rng_state import (
     capture_rank_rng_state,
@@ -24,6 +26,140 @@ class _Stateful:
     def load_state_dict(self, state):
         self.load_calls += 1
         self.state = state
+
+
+class _CheckpointProgress:
+    def __init__(self, values, *, fail_hook=False):
+        self.values = values
+        self.fail_hook = fail_hook
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def set_postfix(self, **kwargs):
+        if self.fail_hook:
+            raise RuntimeError("master hook boom")
+
+
+def _checkpoint_coordination_worker(
+    rank, world_size, init_file, checkpoint_dir, scenario
+):
+    import tabicl.train._run as run_module
+    from tabicl.prior._dataset import PriorDataset
+    from tabicl.train._identity_rng import TrainerIdentityRNG
+    from tabicl.train._run import Trainer
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        trainer = Trainer.__new__(Trainer)
+        trainer.config = SimpleNamespace(
+            max_steps=1,
+            empty_cache_every=0,
+            save_temp_every=1,
+            save_perm_every=100,
+            max_checkpoints=1 if scenario == "prune_failure" else 0,
+            checkpoint_dir=checkpoint_dir,
+        )
+        trainer.ddp = True
+        trainer.ddp_rank = rank
+        trainer.ddp_world_size = world_size
+        trainer.master_process = rank == 0
+        trainer.curr_step = 0
+        trainer.prior_cursor = 0
+        trainer.dataloader = [None]
+        trainer.run_batch = lambda batch: {"loss": 0.0}
+        trainer.wandb_run = None
+        trainer.model_config = {}
+        trainer.raw_model = _Stateful({"weight": torch.tensor([rank])})
+        trainer.optimizer = _Stateful({"optimizer": rank})
+        trainer.scheduler = _Stateful({"scheduler": rank})
+        trainer.scaler = _Stateful({"scale": 1.0})
+        trainer.identity_rng = TrainerIdentityRNG(
+            identity_mode="temporary",
+            base_seed=31,
+            rank=rank,
+            world_size=world_size,
+        )
+        trainer.prior_dataset = PriorDataset(
+            prior_type="dummy",
+            batch_size=1,
+            min_features=2,
+            max_features=2,
+            max_classes=2,
+            min_seq_len=4,
+            max_seq_len=5,
+            min_train_size=1,
+            max_train_size=3,
+        )
+        trainer.prior_dataset.configure_logical_stream(
+            schema="checkpoint-coordination-v1",
+            experiment_seed=19,
+            ddp_rank=rank,
+            world_size=world_size,
+            cursor=0,
+        )
+
+        run_module.tqdm = lambda values, **kwargs: _CheckpointProgress(
+            values,
+            fail_hook=scenario == "hook_failure",
+        )
+        if scenario == "write_failure":
+
+            def fail_write(*args, **kwargs):
+                raise OSError("master write boom")
+
+            run_module.atomic_torch_save = fail_write
+        if scenario == "prune_failure":
+
+            def fail_prune():
+                raise OSError("master prune boom")
+
+            trainer.manage_checkpoint = fail_prune
+
+        error = None
+        try:
+            Trainer.train.__wrapped__(trainer)
+        except Exception as caught:
+            error = caught
+
+        outcomes = [None] * world_size
+        dist.all_gather_object(
+            outcomes,
+            None if error is None else f"{type(error).__name__}: {error}",
+        )
+        assert outcomes[1:] == outcomes[:-1]
+        if scenario == "success":
+            assert error is None
+        else:
+            assert isinstance(error, RuntimeError)
+            assert "rank 0" in str(error)
+            assert scenario.split("_")[0] in str(error)
+            assert "boom" in str(error)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "scenario", ["success", "hook_failure", "write_failure", "prune_failure"]
+)
+def test_two_rank_checkpoint_boundary_coordinates_outcomes(tmp_path, scenario):
+    mp.spawn(
+        _checkpoint_coordination_worker,
+        args=(
+            2,
+            str(tmp_path / f"{scenario}-gloo-init"),
+            str(tmp_path / scenario),
+            scenario,
+        ),
+        nprocs=2,
+        join=True,
+    )
 
 
 def _make_resume_trainer(tmp_path, *, mode="temporary", seed=71, world_size=1):
@@ -124,6 +260,18 @@ def test_all_rank_bundle_selects_exact_rank_and_rejects_wrong_world_size():
     assert select_rank_rng_state(bundle, rank=1, world_size=2)["rank"] == 1
     with pytest.raises(ValueError, match="world_size"):
         select_rank_rng_state(bundle, rank=0, world_size=1)
+
+
+def test_all_rank_bundle_rejects_swapped_outer_rank_keys():
+    states = [capture_rank_rng_state(rank=rank) for rank in range(2)]
+    bundle = make_all_rank_rng_bundle(states, world_size=2)
+    bundle["rank_states"] = {
+        "0": bundle["rank_states"]["1"],
+        "1": bundle["rank_states"]["0"],
+    }
+
+    with pytest.raises(ValueError, match="outer rank key"):
+        select_rank_rng_state(bundle, rank=0, world_size=2)
 
 
 def test_incomplete_legacy_checkpoint_is_not_a_full_resume_checkpoint():

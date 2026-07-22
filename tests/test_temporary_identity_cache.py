@@ -33,6 +33,25 @@ def test_explicit_identity_permutation_is_shared_by_every_row():
             torch.testing.assert_close(actual[table, row, 2:, 0], expected)
 
 
+def test_explicit_identity_validation_supports_fullgraph_compile():
+    interactor = _interactor()
+    embeddings = torch.zeros(2, 3, 6, 8)
+    permutations = torch.tensor([[3, 1, 0, 2], [2, 0, 3, 1]])
+
+    def apply_identity(values, identity):
+        return interactor._apply_temporary_feature_identity(
+            values, row_identity_permutation=identity
+        )[0]
+
+    compiled_apply = torch.compile(apply_identity, backend="eager", fullgraph=True)
+    actual = compiled_apply(embeddings, permutations)
+    expected = apply_identity(embeddings, permutations)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    with pytest.raises(RuntimeError, match="feature permutation"):
+        compiled_apply(embeddings, torch.tensor([[0, 0, 2, 3], [0, 1, 2, 3]]))
+
+
 def test_cache_serialization_slice_move_and_concat_preserve_identity():
     identity = torch.tensor([[2, 0, 1], [1, 2, 0]])
     cache = TabICLCache(train_shape=(2, 4, 3), row_identity_permutation=identity)
