@@ -33,8 +33,14 @@ Before changing code, jobs, or artifacts:
 - The research repository `kikixiong/tabicl-pe` is public by explicit user
   choice. Before every push, inspect the exact staged paths and reject secrets,
   checkpoints, raw predictions, logs, GPU CSVs, W&B state, and transfer bundles.
-- Preserve `soda-inria/tabicl` as the upstream reference. Use the authenticated
-  SSH URL `git@github.com:kikixiong/tabicl-pe.git` for research publication.
+- Never push this raw operational checkout to the public repository: its local
+  history and context documents intentionally contain Noether-only metadata.
+  Publish from the sanitized checkout at `../tabicl-pe-public`, where `origin`
+  is `git@github.com:kikixiong/tabicl-pe.git` and `upstream` is
+  `https://github.com/soda-inria/tabicl.git`.
+- Maintain an explicit raw-to-public commit mapping in
+  `docs/NOETHER_HANDOFF.md`. A sanitized or squashed public commit is not the
+  exact source of a running job unless its tree and provenance say so.
 - Disk reserve is a hard gate. The shared filesystem has previously reached
   100% usage and produced `ENOSPC`; inspect it before tests, checkpoint writes,
   submissions, or artifact generation.

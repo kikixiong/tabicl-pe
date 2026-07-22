@@ -40,14 +40,31 @@ within the actual controls and evidence.
 - Real path: `/mnt/data/slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain`
 - Working branch: `codex/h100-rope-none-full`
 - Baseline handoff commit: `69e6d3d961e16a9b33bc2c9f9107c382df469d2f`
+- Local operational-doc commit: `3d70a17f42efaea65e7800cdce21fd2e2e7028da`
 - Public research repository: `https://github.com/kikixiong/tabicl-pe`
 - Research push URL: `git@github.com:kikixiong/tabicl-pe.git`
+- Public branch: `codex/h100-rope-none-full`
+- Public sanitized commit: `8513d8a19afd8b301bc08ab05dbec9bd34e09cc6`
+- Dedicated public checkout: `/mnt/data/slurm-storage/jiaxio/ws/TabFM/train/tabicl-pe-public`
 
 The public research repository is an explicit user choice. Publish source,
 tests, small protocol documents, and machine-readable provenance only. Never
 publish checkpoints, raw predictions, W&B state, logs, GPU CSVs, credentials,
-or transfer bundles. Keep the official `soda-inria/tabicl` remote available as
-the upstream reference.
+transfer bundles, or the Noether context documents in this checkout. Keep the
+official `soda-inria/tabicl` remote available as the upstream reference.
+
+The first public publication is a sanitized squash of the functional state at
+raw commit `69e6d3d`: public commit `8513d8a`. It excludes `AGENTS.md` and the
+two Noether context documents, changes the author to the GitHub noreply
+identity, and replaces three hard-coded Slurm storage paths with
+`TABICL_ROOT`/`SLURM_SUBMIT_DIR`-based paths. Consequently these commits are
+scientifically related but not byte-identical. The running pilots remain bound
+to raw commit `69e6d3d`; do not relabel them as runs of public commit
+`8513d8a`.
+
+Do not add the public GitHub repository as a push remote in this raw checkout.
+All future public commits and pushes must be prepared and reviewed in the
+dedicated sanitized checkout named above.
 
 Always recheck the branch, HEAD, and worktree. The six root-level
 `tabicl-*.bundle` files are known historical untracked inputs; their presence

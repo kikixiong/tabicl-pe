@@ -15,8 +15,10 @@ conclusions.
 - Branch: `codex/h100-rope-none-full`
 - Public research repository: `https://github.com/kikixiong/tabicl-pe`
 - GitHub SSH authentication: verified as `kikixiong`; no `gh` CLI required
-- Publication scope: source and context documents only; six historical
-  root-level `tabicl-*.bundle` files are explicitly excluded
+- Public branches: `main` at upstream baseline `46b9196`; sanitized experiment
+  branch `codex/h100-rope-none-full` at `8513d8a`
+- Publication scope: sanitized source and tests only; Noether context documents,
+  six historical root-level `tabicl-*.bundle` files, and artifacts are excluded
 - Shared filesystem: 3.4T total, 3.2T used, approximately 24G available,
   reported as 100% used
 - Repository `artifacts/`: approximately 2.7G
@@ -123,6 +125,15 @@ six-case H100 maximum-sequence evidence.
 
 ## Recent actions
 
+- At 2026-07-22 17:28 BST, atomically published the full official baseline as
+  public `main` and a sanitized experiment snapshot as public
+  `codex/h100-rope-none-full` (`8513d8a`). The publication passed shell tests,
+  focused Python tests (9 passed), syntax/whitespace checks, secret/internal-
+  metadata scans, and a full Git object-integrity check.
+- Recorded the provenance mapping from the pilots' raw source `69e6d3d` and
+  local documentation descendant `3d70a17` to public sanitized `8513d8a`.
+  These commits are not interchangeable: the public snapshot is squashed,
+  omits operational documents, and parameterizes three Slurm paths.
 - Refreshed the native Noether job, log, GPU, checkpoint, and disk snapshot at
   2026-07-22 17:13 BST; no pilot job was modified.
 - Verified the existing Noether SSH key authenticates to GitHub as `kikixiong`.
