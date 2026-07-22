@@ -46,6 +46,14 @@ class RowInteraction(nn.Module):
         If False, uses non-interleaved rotation where the embedding is split into
         first half [0:d//2] and second half [d//2:d].
 
+    identity_mode : {"rope", "temporary", "none"}, default="rope"
+        Feature identity signal used by the row transformer. ``"rope"`` keeps
+        the input feature order and applies RoPE. ``"temporary"`` applies a
+        fresh, table-wise random permutation to feature tokens before RoPE;
+        the permutation is shared by every row in a table, so it supplies
+        within-table identity without a stable ordinal meaning. ``"none"``
+        disables RoPE entirely.
+
     dropout : float, default=0.0
         Dropout probability used in the encoder.
 
@@ -72,6 +80,7 @@ class RowInteraction(nn.Module):
         num_cls: int = 4,
         rope_base: float = 100000,
         rope_interleaved: bool = True,
+        identity_mode: str = "rope",
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
@@ -86,6 +95,12 @@ class RowInteraction(nn.Module):
         self.norm_first = norm_first
         self.recompute = recompute
 
+        if identity_mode not in {"rope", "temporary", "none"}:
+            raise ValueError(
+                f"identity_mode must be one of 'rope', 'temporary', or 'none', got {identity_mode!r}"
+            )
+        self.identity_mode = identity_mode
+
         self.tf_row = Encoder(
             num_blocks=num_blocks,
             d_model=embed_dim,
@@ -95,7 +110,7 @@ class RowInteraction(nn.Module):
             activation=activation,
             norm_first=norm_first,
             bias_free_ln=bias_free_ln,
-            use_rope=True,
+            use_rope=identity_mode != "none",
             rope_base=rope_base,
             rope_interleaved=rope_interleaved,
             zero_init=zero_init,
@@ -107,6 +122,35 @@ class RowInteraction(nn.Module):
 
         self.out_ln = nn.LayerNorm(embed_dim, bias=not bias_free_ln) if norm_first else nn.Identity()
         self.inference_mgr = InferenceManager(enc_name="tf_row", out_dim=embed_dim * self.num_cls, out_no_seq=True)
+
+    def _apply_temporary_feature_identity(
+        self, embeddings: Tensor, key_mask: Optional[Tensor] = None
+    ) -> tuple[Tensor, Optional[Tensor]]:
+        """Randomly assign RoPE positions to features for this forward pass.
+
+        A single permutation is sampled per table and shared across all rows.
+        CLS tokens stay fixed. When a padding mask is present it is permuted
+        together with the feature tokens.
+        """
+        if self.identity_mode != "temporary":
+            return embeddings, key_mask
+
+        batch_size, num_rows, total_tokens, embed_dim = embeddings.shape
+        num_features = total_tokens - self.num_cls
+        if num_features <= 1:
+            return embeddings, key_mask
+
+        permutations = torch.rand(batch_size, num_features, device=embeddings.device).argsort(dim=-1)
+        feature_index = permutations[:, None, :, None].expand(batch_size, num_rows, num_features, embed_dim)
+        permuted_features = embeddings[:, :, self.num_cls :].gather(2, feature_index)
+        embeddings = torch.cat((embeddings[:, :, : self.num_cls], permuted_features), dim=2)
+
+        if key_mask is not None:
+            mask_index = permutations[:, None, :].expand(batch_size, num_rows, num_features)
+            permuted_mask = key_mask[:, :, self.num_cls :].gather(2, mask_index)
+            key_mask = torch.cat((key_mask[:, :, : self.num_cls], permuted_mask), dim=2)
+
+        return embeddings, key_mask
 
     def _aggregate_embeddings(self, embeddings: Tensor, key_mask: Optional[Tensor] = None) -> Tensor:
         """Process a batch of rows through a transformer encoder.
@@ -203,6 +247,7 @@ class RowInteraction(nn.Module):
             indices = torch.arange(HC, device=device).view(1, 1, HC).expand(B, T, HC)
             key_mask = indices >= d.view(B, 1, 1)  # (B, T, HC)
 
+        embeddings, key_mask = self._apply_temporary_feature_identity(embeddings, key_mask)
         representations = self._aggregate_embeddings(embeddings, key_mask)  # (B, T, C*E)
 
         return representations  # (B, T, C*E)
@@ -236,6 +281,7 @@ class RowInteraction(nn.Module):
         B, T = embeddings.shape[:2]
         cls_tokens = self.cls_tokens.expand(B, T, self.num_cls, self.embed_dim)
         embeddings[:, :, : self.num_cls] = cls_tokens.to(embeddings.device)
+        embeddings, _ = self._apply_temporary_feature_identity(embeddings)
         representations = self.inference_mgr(
             self._aggregate_embeddings, inputs=OrderedDict([("embeddings", embeddings)])
         )

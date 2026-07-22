@@ -105,6 +105,11 @@ class TabICL(nn.Module):
         (the TabICLv2 variant). The two variants are not equivalent; checkpoint
         configs store this flag explicitly.
 
+    row_identity_mode : {"rope", "temporary", "none"}, default="rope"
+        Identity signal in the feature-wise row transformer. ``"temporary"``
+        randomly reassigns RoPE positions per table and forward pass, while
+        preserving the assignment across all rows in that table.
+
     icl_num_blocks : int, default=12
         Number of transformer blocks in the in-context learning transformer.
 
@@ -178,6 +183,7 @@ class TabICL(nn.Module):
         row_num_cls: int = 4,
         row_rope_base: float = 100000,
         row_rope_interleaved: bool = True,
+        row_identity_mode: Literal["rope", "temporary", "none"] = "rope",
         icl_num_blocks: int = 12,
         icl_nhead: int = 8,
         icl_ssmax: Union[
@@ -227,6 +233,7 @@ class TabICL(nn.Module):
         self.row_num_cls = row_num_cls
         self.row_rope_base = row_rope_base
         self.row_rope_interleaved = row_rope_interleaved
+        self.row_identity_mode = row_identity_mode
         self.icl_num_blocks = icl_num_blocks
         self.icl_nhead = icl_nhead
         self.icl_ssmax = icl_ssmax
@@ -266,6 +273,7 @@ class TabICL(nn.Module):
             num_cls=row_num_cls,
             rope_base=row_rope_base,
             rope_interleaved=row_rope_interleaved,
+            identity_mode=row_identity_mode,
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,

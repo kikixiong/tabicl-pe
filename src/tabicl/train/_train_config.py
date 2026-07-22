@@ -292,6 +292,12 @@ def build_parser():
         help="RoPE rotation layout in the row interactor: True = interleaved dimension pairs "
         "(TabICLv1), False = split-half rotation (TabICLv2). The two are not equivalent.",
     )
+    parser.add_argument(
+        "--row_identity_mode",
+        choices=["rope", "temporary", "none"],
+        default="rope",
+        help="Feature identity signal in the row transformer: ordered RoPE, freshly randomized temporary RoPE identity, or no RoPE.",
+    )
     parser.add_argument("--freeze_row", default=False, type=str2bool, help="Whether to freeze the row interactor")
 
     # ICL Config
@@ -359,6 +365,12 @@ def build_parser():
         type=int,
         default=5,
         help="Maximum number of temporary checkpoints to keep. Permanent checkpoints are not counted.",
+    )
+    parser.add_argument(
+        "--empty_cache_every",
+        type=int,
+        default=0,
+        help="Call torch.cuda.empty_cache every N steps. Use 0 to keep the caching allocator hot.",
     )
     parser.add_argument("--checkpoint_path", default=None, type=str, help="Path to specific checkpoint file to load")
     parser.add_argument("--only_load_model", default=False, type=str2bool, help="Whether to only load model weights")
