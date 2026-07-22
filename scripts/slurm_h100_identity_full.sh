@@ -20,6 +20,7 @@ case "$NUM_GPUS" in 1|2|4) ;; *) echo "invalid NUM_GPUS=$NUM_GPUS" >&2; exit 2 ;
 
 ROOT=/slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain
 MONITOR="$ROOT/artifacts/gpu-monitor/${MODE}-stage${STAGE}-${SLURM_JOB_ID}.csv"
+source "$ROOT/scripts/configure_wandb_node_local.sh"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export N_JOBS="${N_JOBS:-48}"

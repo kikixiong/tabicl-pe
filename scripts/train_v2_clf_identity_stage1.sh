@@ -18,7 +18,7 @@ SEED="${SEED:-42}"
 CKPT_ROOT="${CKPT_ROOT:-$ROOT/artifacts/tabiclv2-clf-identity-stage1}"
 CKPT_DIR="$CKPT_ROOT/$MODE/seed-$SEED/stage1"
 WANDB_DIR="${WANDB_DIR:-$ROOT/artifacts/wandb}"
-mkdir -p "$WANDB_DIR"
+mkdir -p "$CKPT_DIR" "$WANDB_DIR"
 
 if [[ "$NUM_GPUS" -eq 1 ]]; then
   LAUNCHER=("$PYTHON" -m tabicl.train)

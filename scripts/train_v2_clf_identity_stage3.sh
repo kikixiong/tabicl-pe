@@ -16,7 +16,7 @@ CKPT_ROOT="${CKPT_ROOT:-$ROOT/artifacts/tabiclv2-clf-identity}"
 STAGE2_CKPT="$CKPT_ROOT/$MODE/seed-$SEED/stage2/step-40000.ckpt"
 CKPT_DIR="$CKPT_ROOT/$MODE/seed-$SEED/stage3"
 WANDB_DIR="${WANDB_DIR:-$ROOT/artifacts/wandb}"
-mkdir -p "$WANDB_DIR"
+mkdir -p "$CKPT_DIR" "$WANDB_DIR"
 
 RESUME_ARGS=(--checkpoint_path "$STAGE2_CKPT" --only_load_model True)
 if compgen -G "$CKPT_DIR/step-*.ckpt" >/dev/null; then
