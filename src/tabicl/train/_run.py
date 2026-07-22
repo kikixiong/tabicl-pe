@@ -40,6 +40,7 @@ from tabicl.train._provenance import (
     FORMAL_PROTOCOL_CONFIG_FIELDS,
     ParentTrust,
     build_checkpoint_provenance,
+    build_optimizer_protocol,
     load_source_manifest,
     make_manifest,
     runtime_environment_manifest,
@@ -53,7 +54,9 @@ from tabicl.train._rng_state import (
 )
 
 warnings.filterwarnings(
-    "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
+    "ignore",
+    message=".*The PyTorch API of nested tensors is in prototype stage.*",
+    category=UserWarning,
 )
 
 
@@ -145,7 +148,9 @@ class Trainer:
 
             # Adjust batch size for distributed training
             original_batch_size = self.config.batch_size
-            self.config.batch_size = math.ceil(original_batch_size / self.ddp_world_size)
+            self.config.batch_size = math.ceil(
+                original_batch_size / self.ddp_world_size
+            )
 
             if self.master_process:
                 print(f"DDP training with {self.ddp_world_size} processes")
@@ -227,7 +232,9 @@ class Trainer:
                 "Only None (classification) and 'quantile' (pinball regression) are available."
             )
         if self.regression and self.config.num_quantiles <= 0:
-            raise ValueError("For quantile regression, num_quantiles must be greater than 0.")
+            raise ValueError(
+                "For quantile regression, num_quantiles must be greater than 0."
+            )
 
         # Map the private-style --norm_type to the public model's bias_free_ln flag.
         if self.config.norm_type == "default":
@@ -304,7 +311,9 @@ class Trainer:
 
         # Wrap model into DDP container if using distributed training
         if self.ddp:
-            self.model = DDP(model, device_ids=[self.ddp_local_rank], broadcast_buffers=False)
+            self.model = DDP(
+                model, device_ids=[self.ddp_local_rank], broadcast_buffers=False
+            )
             self.raw_model = self.model.module
         else:
             self.model = model
@@ -431,7 +440,9 @@ class Trainer:
             if self.master_process:
                 print("Using Muon optimizer.")
             self.optimizer = Muon(
-                param_groups=[dict(params=list(self.raw_model.parameters()), use_muon=True)],
+                param_groups=[
+                    dict(params=list(self.raw_model.parameters()), use_muon=True)
+                ],
                 lr=self.config.lr,
                 weight_decay=self.config.weight_decay,
                 matched_adamw_rms=0.2,
@@ -460,33 +471,46 @@ class Trainer:
             if self.master_process:
                 print(f"Automatic Mixed Precision is enabled.")
             self.amp_ctx = torch.autocast(
-                device_type="cuda", dtype=torch.float16 if self.config.dtype == "float16" else torch.float32
+                device_type="cuda",
+                dtype=(
+                    torch.float16 if self.config.dtype == "float16" else torch.float32
+                ),
             )
         else:
             self.amp_ctx = nullcontext()
 
     def _formal_optimizer_config(self):
-        fields = (
-            "lr",
-            "weight_decay",
-            "beta1",
-            "beta2",
-            "muon",
-            "use_cautious_wd",
-            "scheduler",
-            "warmup_proportion",
-            "warmup_steps",
-            "cosine_num_cycles",
-            "cosine_amplitude_decay",
-            "cosine_lr_end",
-            "poly_decay_lr_end",
-            "poly_decay_power",
-            "gradient_clipping",
+        warmup_steps = (
+            self.config.max_steps * self.config.warmup_proportion
+            if self.config.warmup_proportion >= 0
+            else self.config.warmup_steps
         )
-        return {
-            "optimizer": "Muon" if self.config.muon else "AdamW",
-            **{field: getattr(self.config, field) for field in fields},
-        }
+        scheduler_config = {"max_steps": self.config.max_steps}
+        if self.config.scheduler != "constant":
+            scheduler_config["warmup_steps"] = warmup_steps
+        if self.config.scheduler == "cosine_with_restarts":
+            scheduler_config.update(
+                {
+                    "num_cycles": self.config.cosine_num_cycles,
+                    "amplitude_decay": self.config.cosine_amplitude_decay,
+                    "lr_end": self.config.cosine_lr_end,
+                }
+            )
+        elif self.config.scheduler == "polynomial_decay_warmup":
+            scheduler_config.update(
+                {
+                    "lr_end": self.config.poly_decay_lr_end,
+                    "power": self.config.poly_decay_power,
+                }
+            )
+        return build_optimizer_protocol(
+            self.raw_model,
+            self.optimizer,
+            self.scheduler,
+            self.scaler,
+            scheduler_algorithm=self.config.scheduler,
+            scheduler_config=scheduler_config,
+        )
 
     def _formal_parent_manifest(self):
         stage = self.config.formal_stage
@@ -524,22 +548,20 @@ class Trainer:
                 f"formal {stage} parent must be {expected_parent_stage}, got {self.config.formal_parent_stage}"
             )
         trust = ParentTrust(
-            checkpoint_path=Path(self.config.checkpoint_path).resolve(),
-            finalized_manifest_path=Path(
-                self.config.formal_parent_finalized_manifest
-            ).resolve(),
-            transaction_ledger_path=Path(
-                self.config.formal_transaction_ledger
-            ).resolve(),
+            checkpoint_path=Path(self.config.checkpoint_path),
+            finalized_manifest_path=Path(self.config.formal_parent_finalized_manifest),
+            transaction_ledger_path=Path(self.config.formal_transaction_ledger),
             transaction_ledger_sha256=self.config.formal_transaction_ledger_sha256,
             study_id=self.config.formal_study_id,
             arm=self.config.row_identity_mode,
             parent_stage=self.config.formal_parent_stage,
             upstream_identity=self.config.formal_parent_upstream_identity,
             artifact_identity=self.config.formal_parent_artifact_identity,
-            artifact_root=Path(self.config.formal_artifact_root).resolve(),
+            artifact_root=Path(self.config.formal_artifact_root),
         )
-        parent = validate_parent_trust(trust)
+        validated_parent = validate_parent_trust(trust)
+        self._validated_parent_checkpoint = validated_parent.checkpoint
+        parent = validated_parent.manifest
         payload = parent["payload"]["parent"]
         expected_current = {
             "np_seed": self.config.np_seed,
@@ -641,14 +663,20 @@ class Trainer:
             return None
 
         # Filter for files with "ckpt" extension matching the pattern "step-*.ckpt"
-        checkpoints = [f for f in os.listdir(ckpt_dir) if f.startswith("step-") and f.endswith(".ckpt")]
+        checkpoints = [
+            f
+            for f in os.listdir(ckpt_dir)
+            if f.startswith("step-") and f.endswith(".ckpt")
+        ]
 
         if not checkpoints:
             return None
 
         # Sort the checkpoint files by step number and get the latest
         try:
-            latest_checkpoint = sorted(checkpoints, key=lambda x: int(x.split("-")[1].split(".")[0]))[-1]
+            latest_checkpoint = sorted(
+                checkpoints, key=lambda x: int(x.split("-")[1].split(".")[0])
+            )[-1]
             checkpoint_path = os.path.join(ckpt_dir, latest_checkpoint)
             return checkpoint_path
         except Exception as e:
@@ -676,12 +704,26 @@ class Trainer:
             raise ValueError(
                 "formal Stage 1 is fresh-only and refuses any discovered checkpoint"
             )
-        if checkpoint_path is None or not os.path.exists(checkpoint_path):
+        formal_parent = getattr(
+            self.config, "formal_training", False
+        ) and self.config.formal_stage in {"stage2", "stage3"}
+        if formal_parent:
+            checkpoint = getattr(self, "_validated_parent_checkpoint", None)
+            if checkpoint is None:
+                raise ValueError(
+                    "formal Stage 2/3 requires the same-FD validated parent object"
+                )
+        elif checkpoint_path is None or not os.path.exists(checkpoint_path):
             print("No checkpoint found, starting from scratch.")
             return
 
         print(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.config.device, weights_only=True)
+        if not formal_parent:
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location=self.config.device,
+                weights_only=True,
+            )
 
         # Load model state
         if "state_dict" not in checkpoint:
@@ -701,12 +743,18 @@ class Trainer:
                 world_size=self.ddp_world_size,
             )
             if not hasattr(self.prior_dataset, "load_logical_stream_state_dict"):
-                raise ValueError("full resume requires a logical on-the-fly prior stream")
-            self.prior_dataset.load_logical_stream_state_dict(checkpoint["prior_stream"])
+                raise ValueError(
+                    "full resume requires a logical on-the-fly prior stream"
+                )
+            self.prior_dataset.load_logical_stream_state_dict(
+                checkpoint["prior_stream"]
+            )
             if checkpoint["prior_stream"]["cursor"] != checkpoint["curr_step"]:
                 raise ValueError("prior stream cursor must equal curr_step")
 
         self.raw_model.load_state_dict(checkpoint["state_dict"])
+        if formal_parent:
+            del self._validated_parent_checkpoint
 
         # Optionally load optimizer and scheduler state
         if self.config.only_load_model:
@@ -796,7 +844,9 @@ class Trainer:
                 f"rank {failure['rank']} {failure['type']}: {failure['message']}"
                 for failure in failures
             )
-            raise RuntimeError(f"checkpoint {phase} phase failed on {details}") from local_error
+            raise RuntimeError(
+                f"checkpoint {phase} phase failed on {details}"
+            ) from local_error
 
     def manage_checkpoint(self):
         """Manage temporary checkpoints by deleting the oldest when limit is exceeded."""
@@ -804,7 +854,11 @@ class Trainer:
         limit = self.config.max_checkpoints
 
         # Filter for files with "ckpt" extension matching the pattern "step-*.ckpt"
-        checkpoints = [f for f in os.listdir(ckpt_dir) if f.startswith("step-") and f.endswith(".ckpt")]
+        checkpoints = [
+            f
+            for f in os.listdir(ckpt_dir)
+            if f.startswith("step-") and f.endswith(".ckpt")
+        ]
         temp_checkpoints = []
         for ckpt in checkpoints:
             try:
@@ -848,7 +902,9 @@ class Trainer:
         """
 
         if self.master_process:
-            step_progress = tqdm(range(self.curr_step, self.config.max_steps), desc="Step", leave=True)
+            step_progress = tqdm(
+                range(self.curr_step, self.config.max_steps), desc="Step", leave=True
+            )
         else:
             step_progress = range(self.curr_step, self.config.max_steps)
 
@@ -866,7 +922,10 @@ class Trainer:
 
             self.curr_step = step + 1
             self.prior_cursor = self.curr_step
-            if self.config.empty_cache_every > 0 and self.curr_step % self.config.empty_cache_every == 0:
+            if (
+                self.config.empty_cache_every > 0
+                and self.curr_step % self.config.empty_cache_every == 0
+            ):
                 torch.cuda.empty_cache()
             is_temp_save = self.curr_step % self.config.save_temp_every == 0
             is_perm_save = self.curr_step % self.config.save_perm_every == 0
@@ -952,10 +1011,14 @@ class Trainer:
             If sequence lengths or train sizes are inconsistent.
         """
         if len(torch.unique(micro_seq_len)) > 1:
-            raise ValueError("All datasets in the micro batch must have the same sequence length.")
+            raise ValueError(
+                "All datasets in the micro batch must have the same sequence length."
+            )
 
         if len(torch.unique(micro_train_size)) > 1:
-            raise ValueError("All datasets in the micro batch must have the same training size.")
+            raise ValueError(
+                "All datasets in the micro batch must have the same training size."
+            )
 
         seq_len = micro_seq_len[0].item()
         train_size = micro_train_size[0].item()
@@ -1039,7 +1102,9 @@ class Trainer:
 
         # Set DDP gradient sync for last micro batch only
         if self.ddp:
-            self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
+            self.model.require_backward_grad_sync = (
+                micro_batch_idx == num_micro_batches - 1
+            )
 
         # By default (v2), ignore the per-dataset feature count so the model treats all (padded)
         # columns uniformly. This is required for the model's feature grouping and supports
@@ -1048,7 +1113,9 @@ class Trainer:
 
         row_identity_permutation = self.identity_rng.sample_for_micro_batch(
             batch_size=micro_X.shape[0],
-            num_identity_tokens=self.raw_model._num_row_identity_tokens(micro_X.shape[-1]),
+            num_identity_tokens=self.raw_model._num_row_identity_tokens(
+                micro_X.shape[-1]
+            ),
             device=self.config.device,
         )
 
@@ -1063,7 +1130,11 @@ class Trainer:
                     row_identity_permutation=row_identity_permutation,
                 )
                 alphas = torch.linspace(
-                    0.0, 1.0, self.config.num_quantiles + 2, device=pred.device, dtype=pred.dtype
+                    0.0,
+                    1.0,
+                    self.config.num_quantiles + 2,
+                    device=pred.device,
+                    dtype=pred.dtype,
                 )[1:-1].view(1, 1, -1)
                 errors = y_test.unsqueeze(-1) - pred
                 loss = torch.maximum(alphas * errors, (alphas - 1) * errors).mean()
@@ -1124,8 +1195,12 @@ class Trainer:
         batch = [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]
 
         # Split the batch into micro-batches along the first dimension
-        num_micro_batches = math.ceil(self.config.batch_size / self.config.micro_batch_size)
-        micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
+        num_micro_batches = math.ceil(
+            self.config.batch_size / self.config.micro_batch_size
+        )
+        micro_batches = [
+            torch.split(t, self.config.micro_batch_size, dim=0) for t in batch
+        ]
         micro_batches = list(zip(*micro_batches))
 
         results = {"pinball": 0.0} if self.regression else {"ce": 0.0, "accuracy": 0.0}
@@ -1133,7 +1208,9 @@ class Trainer:
 
         for idx, micro_batch in enumerate(micro_batches):
             try:
-                micro_results = self.run_micro_batch(micro_batch, idx, num_micro_batches)
+                micro_results = self.run_micro_batch(
+                    micro_batch, idx, num_micro_batches
+                )
                 for k, v in micro_results.items():
                     results[k] += v
             except torch.cuda.OutOfMemoryError:
@@ -1154,7 +1231,9 @@ class Trainer:
         # Clip the gradient
         if self.config.gradient_clipping > 0:
             self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+            nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.config.gradient_clipping
+            )
 
         # Update parameters
         self.scaler.step(self.optimizer)

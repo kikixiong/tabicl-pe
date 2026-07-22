@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -10,8 +11,11 @@ import torch
 from tabicl.train._provenance import (
     OPERATIONAL_CONFIG_FIELDS,
     architecture_manifest,
+    build_git_source_manifest,
     build_checkpoint_provenance,
+    canonical_json_bytes,
     canonical_sha256,
+    load_source_manifest,
     make_manifest,
     partition_run_config,
     runtime_environment_manifest,
@@ -19,6 +23,80 @@ from tabicl.train._provenance import (
     validate_manifest,
     validate_provenance_bundle,
 )
+
+
+def _git(*args: str, cwd) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+
+
+def test_git_source_manifest_rejects_tracked_gitlinks(tmp_path):
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    _git("init", "-q", cwd=nested)
+    _git("config", "user.name", "Test", cwd=nested)
+    _git("config", "user.email", "test@example.invalid", cwd=nested)
+    (nested / "payload.py").write_text("SENTINEL = True\n")
+    _git("add", "payload.py", cwd=nested)
+    _git("commit", "-qm", "nested", cwd=nested)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    _git("config", "user.email", "test@example.invalid", cwd=repo)
+    _git(
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(nested),
+        "vendor/nested",
+        cwd=repo,
+    )
+    _git("commit", "-qm", "gitlink", cwd=repo)
+
+    with pytest.raises(ValueError, match="unsupported Git object"):
+        build_git_source_manifest(repo, commit_sha="HEAD")
+
+
+def test_git_source_manifest_rejects_dirty_extracted_bytes(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src/tabicl").mkdir(parents=True)
+    _git("init", "-q", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    _git("config", "user.email", "test@example.invalid", cwd=repo)
+    tracked = repo / "src/tabicl/__init__.py"
+    tracked.write_text("SOURCE = 'committed'\n")
+    _git("add", "src/tabicl/__init__.py", cwd=repo)
+    _git("commit", "-qm", "source", cwd=repo)
+    tracked.write_text("SOURCE = 'dirty'\n")
+
+    with pytest.raises(ValueError, match="clean exact checkout"):
+        build_git_source_manifest(repo, commit_sha="HEAD")
+
+
+def test_git_source_manifest_rejects_symlink_in_repository_path(tmp_path):
+    actual = tmp_path / "actual"
+    repo = actual / "repo"
+    (repo / "src/tabicl").mkdir(parents=True)
+    _git("init", "-q", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    _git("config", "user.email", "test@example.invalid", cwd=repo)
+    (repo / "src/tabicl/__init__.py").write_text("SOURCE = 'trusted'\n")
+    _git("add", "src/tabicl/__init__.py", cwd=repo)
+    _git("commit", "-qm", "source", cwd=repo)
+    alias = tmp_path / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        build_git_source_manifest(alias / "repo", commit_sha="HEAD")
 
 
 def _model_config(mode: str = "rope") -> dict[str, object]:
@@ -56,6 +134,24 @@ def _source_manifest():
     )
 
 
+def test_library_source_manifest_loader_rejects_parent_symlink(tmp_path):
+    manifest = _source_manifest()
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    path = trusted / "source.json"
+    path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+    alias = tmp_path / "alias"
+    alias.symlink_to(trusted, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        load_source_manifest(
+            alias / path.name,
+            expected_sha256=manifest["sha256"],
+            expected_commit_sha="1" * 40,
+            expected_tree_sha="2" * 40,
+        )
+
+
 def _prior_stream() -> dict[str, object]:
     schema = '{"prior":"dummy","version":1}'
     import hashlib
@@ -80,6 +176,61 @@ def _identity_treatment(mode: str) -> dict[str, object]:
     from tabicl.train._identity_rng import make_identity_treatment
 
     return make_identity_treatment(mode=mode, seed=17, world_size=1)
+
+
+def _optimizer_protocol() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "optimizer": {
+            "type": "torch.optim.adamw.AdamW",
+            "groups": [
+                {
+                    "parameters": [
+                        {
+                            "name": "layer.bias",
+                            "shape": [2],
+                            "dtype": "torch.float32",
+                            "requires_grad": True,
+                        },
+                        {
+                            "name": "layer.weight",
+                            "shape": [2, 3],
+                            "dtype": "torch.float32",
+                            "requires_grad": True,
+                        },
+                    ],
+                    "base_lr": 1e-4,
+                    "static": {
+                        "betas": [0.9, 0.999],
+                        "eps": 1e-8,
+                        "weight_decay": 0.0,
+                        "amsgrad": False,
+                        "maximize": False,
+                        "foreach": None,
+                        "capturable": False,
+                        "differentiable": False,
+                        "fused": None,
+                    },
+                }
+            ],
+        },
+        "scheduler": {
+            "type": "torch.optim.lr_scheduler.LambdaLR",
+            "algorithm": "constant",
+            "static": {"max_steps": 500_000},
+        },
+        "scaler": {
+            "type": "torch.amp.grad_scaler.GradScaler",
+            "enabled": False,
+            "static": {
+                "device": "cuda",
+                "init_scale": 65536.0,
+                "growth_factor": 2.0,
+                "backoff_factor": 0.5,
+                "growth_interval": 2000,
+            },
+        },
+    }
 
 
 def _run_config(mode: str, output_id: str) -> dict[str, object]:
@@ -108,7 +259,7 @@ def _bundle(mode: str, *, output_id: str | None = None, run_config=None):
         model_config=_model_config(mode),
         state_dict=_state_dict(),
         prior_stream=_prior_stream(),
-        optimizer_config={"name": "AdamW", "lr": 1e-4, "betas": [0.9, 0.999]},
+        optimizer_config=_optimizer_protocol(),
         stage="stage1",
         terminal_step=500_000,
         np_seed=11,
@@ -396,11 +547,11 @@ def _formal_trainer(tmp_path, *, source_sha=None):
     trainer.ddp_rank = 0
     trainer.ddp_world_size = 1
     trainer.master_process = True
-    trainer.optimizer = SimpleNamespace(
-        state_dict=lambda: {"state": {}, "param_groups": []}
+    trainer.optimizer = torch.optim.AdamW(trainer.raw_model.parameters(), lr=1e-4)
+    trainer.scheduler = torch.optim.lr_scheduler.LambdaLR(
+        trainer.optimizer, lambda _step: 1.0
     )
-    trainer.scheduler = SimpleNamespace(state_dict=lambda: {"last_epoch": 1})
-    trainer.scaler = SimpleNamespace(state_dict=lambda: {})
+    trainer.scaler = torch.GradScaler("cuda", enabled=False)
     return trainer
 
 

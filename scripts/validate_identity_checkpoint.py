@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arm-protocol-sha256", required=True)
     parser.add_argument("--world-size", required=True, type=int)
     parser.add_argument("--cuda-device-count", required=True, type=int)
+    parser.add_argument("--max-checkpoint-bytes", required=True, type=int)
 
     parent = parser.add_argument_group("Stage 2/3 immutable parent trust")
     parent.add_argument("--parent-checkpoint", type=Path)
@@ -154,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         arm_protocol_sha256=args.arm_protocol_sha256,
         world_size=args.world_size,
         cuda_device_count=args.cuda_device_count,
+        max_checkpoint_bytes=args.max_checkpoint_bytes,
         parent_trust=_parent_trust(args),
     )
     if finalization_trust is None:

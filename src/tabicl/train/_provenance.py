@@ -4,11 +4,18 @@ The self-hashes in this module detect corruption.  They are not trust roots: a
 formal validator must also receive expected digests from outside the mutable
 checkpoint/archive.  Exact parent-checkpoint bytes are the authority for model
 weights because a manifest embedded in the same file cannot authenticate them.
+
+No-replace finalization is a publisher API invariant, not filesystem
+immutability.  A malicious artifact owner who can unlink and recreate both a
+checkpoint and its unsigned finalization record is outside this threat model;
+that case requires an external signature, append-only receipt, or a different
+publishing principal.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import copy
 import hashlib
 import json
 import math
@@ -79,7 +86,9 @@ REQUIRED_MANIFESTS = frozenset(
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX_40 = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_SOURCE_MODES = frozenset({"100644", "100755", "120000"})
+_SOURCE_MODES = frozenset({"100644", "100755"})
+_LINK_SUPPORTS_DIR_FD = os.link in os.supports_dir_fd
+_UNLINK_SUPPORTS_DIR_FD = os.unlink in os.supports_dir_fd
 
 
 def _normalize_json(value: Any, *, where: str = "value") -> Any:
@@ -201,22 +210,70 @@ def _strict_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _open_regular_nofollow(path: str | os.PathLike[str]) -> tuple[int, os.stat_result]:
-    flags = os.O_RDONLY
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    if not candidate.name or candidate.name in {".", ".."}:
+        raise ValueError(f"path must name a regular file: {path}")
+    parent_fd = _open_directory_components_nofollow(
+        candidate.parent, where="regular file parent"
+    )
+    flags = os.O_RDONLY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(os.fspath(path), flags)
+        fd = os.open(candidate.name, flags, dir_fd=parent_fd)
     except OSError as error:
         raise ValueError(
             f"refusing to open non-regular or symlink path: {path}"
         ) from error
+    finally:
+        os.close(parent_fd)
     before = os.fstat(fd)
     if not stat.S_ISREG(before.st_mode):
         os.close(fd)
         raise ValueError(f"path must be a regular file: {path}")
     return fd, before
+
+
+def _open_directory_components_nofollow(
+    path: str | os.PathLike[str], *, where: str
+) -> int:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    parts = candidate.parts
+    if (
+        not parts
+        or parts[0] != os.path.sep
+        or any(part in {"", ".", ".."} for part in parts[1:])
+    ):
+        raise ValueError(f"{where} must be a normalized absolute path")
+    if (
+        not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+        or os.open not in os.supports_dir_fd
+    ):
+        raise ValueError("no-follow path-component traversal is unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd: int | None = None
+    try:
+        fd = os.open(os.path.sep, flags)
+        for part in parts[1:]:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise ValueError(f"{where} is not a directory")
+        return fd
+    except OSError as error:
+        if fd is not None:
+            os.close(fd)
+        raise ValueError(
+            f"{where} has a symlink or invalid path component: {candidate}"
+        ) from error
 
 
 def _same_file_snapshot(
@@ -274,19 +331,40 @@ def _validate_relative_path(path: Any, *, where: str) -> str:
 
 
 def _source_bytes(root: Path, relative: str, mode: str) -> bytes:
-    path = root.joinpath(*PurePosixPath(relative).parts)
-    if mode == "120000":
-        if not path.is_symlink():
-            raise ValueError(
-                f"tracked source mode mismatch for {relative}: expected symlink"
-            )
-        target = os.readlink(path)
-        return os.fsencode(target)
-    if path.is_symlink():
-        raise ValueError(
-            f"tracked source path unexpectedly became a symlink: {relative}"
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    file_flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        file_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        file_flags |= os.O_NOFOLLOW
+    directory_fds: list[int] = []
+    try:
+        directory_fds.append(
+            _open_directory_components_nofollow(root, where="source root")
         )
-    fd, before = _open_regular_nofollow(path)
+        parts = PurePosixPath(relative).parts
+        for part in parts[:-1]:
+            directory_fds.append(
+                os.open(part, directory_flags, dir_fd=directory_fds[-1])
+            )
+        fd = os.open(parts[-1], file_flags, dir_fd=directory_fds[-1])
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            os.close(fd)
+            raise ValueError(f"tracked source must be a regular file: {relative}")
+    except OSError as error:
+        raise ValueError(
+            f"tracked source has a symlink or invalid path component: {relative}"
+        ) from error
+    finally:
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
     try:
         chunks: list[bytes] = []
         while True:
@@ -312,7 +390,11 @@ def build_source_manifest_from_files(
     tracked: Mapping[str, str],
     code_roots: Sequence[str] = ("src/tabicl", "scripts"),
 ) -> dict[str, Any]:
-    root_path = Path(root).resolve(strict=True)
+    root_path = Path(root)
+    if not root_path.is_absolute():
+        root_path = Path.cwd() / root_path
+    root_fd = _open_directory_components_nofollow(root_path, where="source root")
+    os.close(root_fd)
     if _HEX_40.fullmatch(commit_sha) is None or _HEX_40.fullmatch(tree_sha) is None:
         raise ValueError(
             "source commit/tree must be lowercase 40-character Git object IDs"
@@ -324,6 +406,8 @@ def build_source_manifest_from_files(
         if relative in seen:
             raise ValueError(f"duplicate tracked source path: {relative}")
         seen.add(relative)
+        if mode == "120000":
+            raise ValueError(f"tracked source symlinks are forbidden: {relative}")
         if mode not in _SOURCE_MODES:
             raise ValueError(f"unsupported tracked source mode {mode!r}")
         raw = _source_bytes(root_path, relative, mode)
@@ -353,14 +437,41 @@ def build_git_source_manifest(
     commit_sha: str,
     code_roots: Sequence[str] = ("src/tabicl", "scripts"),
 ) -> dict[str, Any]:
-    """Build the expected source manifest from immutable Git objects."""
+    """Build a manifest for the final extracted bytes of one Git checkout."""
     repo_path = Path(repo)
+    if not repo_path.is_absolute():
+        repo_path = Path.cwd() / repo_path
+    repo_fd = _open_directory_components_nofollow(repo_path, where="Git source root")
+    os.close(repo_fd)
     commit = subprocess.run(
         ["git", "-C", str(repo_path), "rev-parse", f"{commit_sha}^{{commit}}"],
         check=True,
         stdout=subprocess.PIPE,
         text=True,
     ).stdout.strip()
+    head = subprocess.run(
+        ["git", "-C", str(repo_path), "rev-parse", "HEAD^{commit}"],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_path),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout
+    if head != commit or status:
+        raise ValueError(
+            "final extracted bytes require a clean exact checkout of the requested commit"
+        )
     tree = subprocess.run(
         ["git", "-C", str(repo_path), "rev-parse", f"{commit}^{{tree}}"],
         check=True,
@@ -368,37 +479,34 @@ def build_git_source_manifest(
         text=True,
     ).stdout.strip()
     listing = subprocess.run(
-        ["git", "-C", str(repo_path), "ls-tree", "-rz", "--full-tree", commit],
+        ["git", "-C", str(repo_path), "ls-tree", "-rz", "-r", "--full-tree", commit],
         check=True,
         stdout=subprocess.PIPE,
     ).stdout
-    entries = []
+    records = []
     for record in listing.split(b"\0"):
         if not record:
             continue
         metadata, raw_path = record.split(b"\t", 1)
-        mode_b, object_type, object_id = metadata.split(b" ", 2)
+        mode_b, object_type, _object_id = metadata.split(b" ", 2)
         if object_type != b"blob":
-            continue
+            raise ValueError(
+                "unsupported Git object "
+                f"{object_type.decode('ascii', errors='replace')!r} for "
+                f"{raw_path.decode('utf-8', errors='replace')!r}"
+            )
         path = raw_path.decode("utf-8", errors="strict")
         mode = mode_b.decode("ascii")
         if mode not in _SOURCE_MODES:
             raise ValueError(f"unsupported Git source mode {mode!r} for {path}")
-        blob = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_path),
-                "cat-file",
-                "blob",
-                object_id.decode("ascii"),
-            ],
-            check=True,
-            stdout=subprocess.PIPE,
-        ).stdout
+        relative = _validate_relative_path(path, where="Git source")
+        records.append((relative, mode))
+    entries = []
+    for relative, mode in records:
+        blob = _source_bytes(repo_path, relative, mode)
         entries.append(
             {
-                "path": _validate_relative_path(path, where="Git source"),
+                "path": relative,
                 "mode": mode,
                 "size": len(blob),
                 "sha256": hashlib.sha256(blob).hexdigest(),
@@ -455,6 +563,8 @@ def validate_source_manifest(manifest: Mapping[str, Any]) -> None:
             raise ValueError("source entries must be sorted by path")
         seen.add(path)
         last = path
+        if entry["mode"] == "120000":
+            raise ValueError(f"source symlink entries are forbidden: {path}")
         if entry["mode"] not in _SOURCE_MODES:
             raise ValueError(f"source entry mode is invalid for {path}")
         if (
@@ -546,6 +656,94 @@ def architecture_manifest(
             "state_dict_schema": state_dict_schema(state_dict),
         },
     )
+
+
+def _qualified_type(value: Any) -> str:
+    cls = value.__class__
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def build_optimizer_protocol(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    scaler: Any,
+    *,
+    scheduler_algorithm: str,
+    scheduler_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Describe only static optimizer machinery and ordered parameter schema."""
+    named = {
+        id(parameter): (name, parameter) for name, parameter in model.named_parameters()
+    }
+    seen: set[int] = set()
+    groups = []
+    for index, group in enumerate(optimizer.param_groups):
+        parameters = []
+        for parameter in group["params"]:
+            identity = id(parameter)
+            if identity not in named:
+                raise ValueError("optimizer must cover only named model parameters")
+            if identity in seen:
+                raise ValueError("optimizer contains a duplicate model parameter")
+            seen.add(identity)
+            name, parameter = named[identity]
+            parameters.append(
+                {
+                    "name": name,
+                    "shape": list(parameter.shape),
+                    "dtype": str(parameter.dtype),
+                    "requires_grad": bool(parameter.requires_grad),
+                }
+            )
+        base_lr = group.get("initial_lr", optimizer.defaults.get("lr"))
+        if not isinstance(base_lr, (int, float)) or isinstance(base_lr, bool):
+            raise ValueError(f"optimizer group {index} has no numeric base LR")
+        static = {
+            key: value
+            for key, value in group.items()
+            if key not in {"params", "lr", "initial_lr"}
+        }
+        groups.append(
+            {
+                "parameters": parameters,
+                "base_lr": float(base_lr),
+                "static": _normalize_json(
+                    static, where=f"optimizer group {index} static config"
+                ),
+            }
+        )
+    if seen != set(named):
+        missing = sorted(
+            name for identity, (name, _) in named.items() if identity not in seen
+        )
+        raise ValueError(f"optimizer is missing named parameters: {missing}")
+    if not groups:
+        raise ValueError("optimizer protocol requires at least one parameter group")
+    enabled = bool(scaler.is_enabled())
+    scaler_static = {
+        "device": str(getattr(scaler, "_device", "cuda")),
+        "init_scale": float(getattr(scaler, "_init_scale", 65536.0)),
+        "growth_factor": float(getattr(scaler, "_growth_factor", 2.0)),
+        "backoff_factor": float(getattr(scaler, "_backoff_factor", 0.5)),
+        "growth_interval": int(getattr(scaler, "_growth_interval", 2000)),
+    }
+    return {
+        "schema_version": 1,
+        "optimizer": {"type": _qualified_type(optimizer), "groups": groups},
+        "scheduler": {
+            "type": _qualified_type(scheduler),
+            "algorithm": scheduler_algorithm,
+            "static": _normalize_json(
+                scheduler_config, where="scheduler static config"
+            ),
+        },
+        "scaler": {
+            "type": _qualified_type(scaler),
+            "enabled": enabled,
+            "static": scaler_static,
+        },
+    }
 
 
 def _strict_json_value(raw: str, *, where: str) -> Any:
@@ -691,6 +889,7 @@ def build_checkpoint_provenance(
     parent_manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
     validate_source_manifest(source_manifest)
+    _validate_optimizer_protocol(optimizer_config)
     if stage not in FORMAL_STAGES:
         raise ValueError("formal stage must be stage1, stage2, or stage3")
     for name, value, minimum in (
@@ -782,7 +981,48 @@ def validate_provenance_bundle(bundle: Mapping[str, Any]) -> str:
         raise ValueError("provenance manifests are incomplete or contain unknown names")
     for name, manifest in manifests.items():
         validate_manifest(manifest, expected_kind=name)
+    _validate_optimizer_protocol(manifests["optimizer"]["payload"])
     stage_payload = manifests["stage"]["payload"]
+    _require_exact_keys(
+        stage_payload, {"stage", "terminal_step"}, where="stage payload"
+    )
+    if stage_payload["stage"] not in FORMAL_STAGES:
+        raise ValueError("stage payload stage is invalid")
+    if (
+        isinstance(stage_payload["terminal_step"], bool)
+        or not isinstance(stage_payload["terminal_step"], int)
+        or stage_payload["terminal_step"] < 1
+    ):
+        raise ValueError("stage payload terminal_step is invalid")
+    seed_payload = manifests["seed"]["payload"]
+    _require_exact_keys(
+        seed_payload,
+        {"np_seed", "torch_seed", "identity_rng_seed", "world_size"},
+        where="seed payload",
+    )
+    for field, minimum in (
+        ("np_seed", 0),
+        ("torch_seed", 0),
+        ("identity_rng_seed", 0),
+        ("world_size", 1),
+    ):
+        value = seed_payload[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"seed payload {field} is invalid")
+    treatment_payload = manifests["treatment"]["payload"]
+    _require_exact_keys(
+        treatment_payload,
+        {
+            "schema_version",
+            "row_identity_mode",
+            "identity_rng_seed",
+            "seed_policy",
+            "sampler_version",
+            "world_size",
+            "manifest_sha256",
+        },
+        where="treatment payload",
+    )
     cohort_payload = manifests["cohort_protocol"]["payload"]
     expected_cohort_payload = {
         "stage": stage_payload.get("stage"),
@@ -797,7 +1037,6 @@ def validate_provenance_bundle(bundle: Mapping[str, Any]) -> str:
     }
     if cohort_payload != expected_cohort_payload:
         raise ValueError("cohort protocol does not bind the exact shared manifests")
-    treatment_payload = manifests["treatment"]["payload"]
     expected_arm_payload = {
         "cohort_protocol_sha256": manifests["cohort_protocol"]["sha256"],
         "mode": treatment_payload.get("row_identity_mode"),
@@ -915,7 +1154,16 @@ class CheckpointExpectations:
     arm_protocol_sha256: str
     world_size: int
     cuda_device_count: int
+    max_checkpoint_bytes: int
     parent_trust: ParentTrust | None = None
+
+
+@dataclass(frozen=True)
+class ValidatedParent:
+    manifest: dict[str, Any]
+    checkpoint: dict[str, Any]
+    checkpoint_sha256: str
+    checkpoint_size: int
 
 
 _LEDGER_ENTRY_KEYS = {
@@ -930,6 +1178,8 @@ _LEDGER_ENTRY_KEYS = {
     "torch_seed",
     "identity_rng_seed",
     "world_size",
+    "cuda_device_count",
+    "max_checkpoint_bytes",
     "source_sha256",
     "environment_sha256",
     "prior_sha256",
@@ -955,6 +1205,8 @@ _LEDGER_INTEGER_FIELDS = (
     ("torch_seed", 0),
     ("identity_rng_seed", 0),
     ("world_size", 1),
+    ("cuda_device_count", 0),
+    ("max_checkpoint_bytes", 1),
 )
 
 
@@ -999,8 +1251,25 @@ def checkpoint_sha256(path: str | os.PathLike[str]) -> str:
     return digest.hexdigest()
 
 
-def _load_checkpoint_and_hash(path: Path) -> tuple[dict[str, Any], str, int]:
+def _load_checkpoint_and_hash(
+    path: Path, *, max_checkpoint_bytes: int
+) -> tuple[dict[str, Any], str, int]:
+    if (
+        isinstance(max_checkpoint_bytes, bool)
+        or not isinstance(max_checkpoint_bytes, int)
+        or max_checkpoint_bytes < 1
+    ):
+        raise ValueError("max_checkpoint_bytes must be a positive integer")
     fd, before = _open_regular_nofollow(path)
+    if before.st_size <= 0:
+        os.close(fd)
+        raise ValueError("checkpoint must contain at least one byte")
+    if before.st_size > max_checkpoint_bytes:
+        os.close(fd)
+        raise ValueError(
+            "checkpoint exceeds external byte ceiling: "
+            f"{before.st_size} > {max_checkpoint_bytes}"
+        )
     digest = hashlib.sha256()
     try:
         with os.fdopen(fd, "rb", closefd=False) as handle:
@@ -1305,7 +1574,374 @@ def _validate_finite(value: Any, *, path: str) -> None:
             _validate_finite(child, path=f"{path}[{index}]")
 
 
-def _validate_optimizer_state(state: Mapping[str, Any]) -> None:
+def _require_finite_number(
+    value: Any,
+    *,
+    where: str,
+    minimum: float | None = None,
+    strict_minimum: bool = False,
+    maximum: float | None = None,
+    strict_maximum: bool = False,
+) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"{where} is invalid")
+    number = float(value)
+    if minimum is not None and (
+        number < minimum or (strict_minimum and number == minimum)
+    ):
+        raise ValueError(f"{where} is invalid")
+    if maximum is not None and (
+        number > maximum or (strict_maximum and number == maximum)
+    ):
+        raise ValueError(f"{where} is invalid")
+    return number
+
+
+def _validate_betas(value: Any, *, where: str) -> None:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"{where} is invalid")
+    for index, beta in enumerate(value):
+        _require_finite_number(
+            beta,
+            where=f"{where}[{index}]",
+            minimum=0.0,
+            maximum=1.0,
+            strict_maximum=True,
+        )
+
+
+def _validate_optimizer_group_static(
+    optimizer_type: str, static: Mapping[str, Any], *, group_index: int
+) -> None:
+    if optimizer_type == "torch.optim.adamw.AdamW":
+        required = {
+            "betas",
+            "eps",
+            "weight_decay",
+            "amsgrad",
+            "maximize",
+            "foreach",
+            "capturable",
+            "differentiable",
+            "fused",
+        }
+        optional = {"decoupled_weight_decay"}
+        missing = sorted(required - set(static))
+        extra = sorted(set(static) - required - optional)
+        if missing or extra:
+            raise ValueError(
+                f"AdamW static group {group_index} keys mismatch; "
+                f"missing={missing}, extra={extra}"
+            )
+        _validate_betas(static["betas"], where="AdamW static betas")
+        _require_finite_number(
+            static["eps"], where="AdamW static eps", minimum=0.0, strict_minimum=True
+        )
+        _require_finite_number(
+            static["weight_decay"],
+            where="AdamW static weight_decay",
+            minimum=0.0,
+        )
+        for field in ("amsgrad", "maximize", "capturable", "differentiable"):
+            if not isinstance(static[field], bool):
+                raise ValueError(f"AdamW static {field} is invalid")
+        if (
+            "decoupled_weight_decay" in static
+            and static["decoupled_weight_decay"] is not True
+        ):
+            raise ValueError("AdamW static decoupled_weight_decay is invalid")
+        for field in ("foreach", "fused"):
+            if static[field] is not None and not isinstance(static[field], bool):
+                raise ValueError(f"AdamW static {field} is invalid")
+        return
+
+    if optimizer_type == "tabicl.train._muon.Muon":
+        required = {
+            "use_muon",
+            "weight_decay",
+            "matched_adamw_rms",
+            "momentum",
+            "nesterov",
+            "ns_steps",
+            "adamw_betas",
+            "adamw_eps",
+            "use_cautious_wd",
+        }
+        _require_exact_keys(static, required, where=f"Muon static group {group_index}")
+        if static["use_muon"] is not True:
+            raise ValueError("Muon static use_muon must be true")
+        _require_finite_number(
+            static["weight_decay"],
+            where="Muon static weight_decay",
+            minimum=0.0,
+        )
+        _require_finite_number(
+            static["matched_adamw_rms"],
+            where="Muon static matched_adamw_rms",
+            minimum=0.0,
+            strict_minimum=True,
+        )
+        _require_finite_number(
+            static["momentum"],
+            where="Muon static momentum",
+            minimum=0.0,
+            maximum=1.0,
+            strict_maximum=True,
+        )
+        if not isinstance(static["nesterov"], bool):
+            raise ValueError("Muon static nesterov is invalid")
+        if (
+            isinstance(static["ns_steps"], bool)
+            or not isinstance(static["ns_steps"], int)
+            or static["ns_steps"] < 1
+        ):
+            raise ValueError("Muon static ns_steps is invalid")
+        _validate_betas(static["adamw_betas"], where="Muon static adamw_betas")
+        _require_finite_number(
+            static["adamw_eps"],
+            where="Muon static adamw_eps",
+            minimum=0.0,
+            strict_minimum=True,
+        )
+        if not isinstance(static["use_cautious_wd"], bool):
+            raise ValueError("Muon static use_cautious_wd is invalid")
+        return
+
+    raise ValueError("optimizer protocol optimizer type is unsupported")
+
+
+def _validate_optimizer_protocol(payload: Any) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise ValueError("optimizer protocol must be an object")
+    _require_exact_keys(
+        payload,
+        {"schema_version", "optimizer", "scheduler", "scaler"},
+        where="optimizer protocol",
+    )
+    if payload["schema_version"] != 1:
+        raise ValueError("optimizer protocol schema_version mismatch")
+    optimizer = payload["optimizer"]
+    scheduler = payload["scheduler"]
+    scaler = payload["scaler"]
+    for name, value, keys in (
+        ("optimizer", optimizer, {"type", "groups"}),
+        ("scheduler", scheduler, {"type", "algorithm", "static"}),
+        ("scaler", scaler, {"type", "enabled", "static"}),
+    ):
+        if not isinstance(value, Mapping):
+            raise ValueError(f"optimizer protocol {name} must be an object")
+        _require_exact_keys(value, keys, where=f"optimizer protocol {name}")
+        if not isinstance(value["type"], str) or not value["type"]:
+            raise ValueError(f"optimizer protocol {name} type is invalid")
+    supported_optimizer_types = {
+        "torch.optim.adamw.AdamW",
+        "tabicl.train._muon.Muon",
+    }
+    if optimizer["type"] not in supported_optimizer_types:
+        raise ValueError("optimizer protocol optimizer type is unsupported")
+    if scheduler["type"] != "torch.optim.lr_scheduler.LambdaLR":
+        raise ValueError("optimizer protocol scheduler type is unsupported")
+    if scaler["type"] != "torch.amp.grad_scaler.GradScaler":
+        raise ValueError("optimizer protocol scaler type is unsupported")
+    if not isinstance(optimizer["groups"], list) or not optimizer["groups"]:
+        raise ValueError("optimizer protocol groups must be a non-empty list")
+    names: set[str] = set()
+    for group_index, group in enumerate(optimizer["groups"]):
+        if not isinstance(group, Mapping):
+            raise ValueError("optimizer protocol group must be an object")
+        _require_exact_keys(
+            group,
+            {"parameters", "base_lr", "static"},
+            where=f"optimizer protocol group {group_index}",
+        )
+        if (
+            isinstance(group["base_lr"], bool)
+            or not isinstance(group["base_lr"], (int, float))
+            or not math.isfinite(group["base_lr"])
+            or group["base_lr"] < 0
+        ):
+            raise ValueError("optimizer protocol base_lr is invalid")
+        if not isinstance(group["static"], Mapping):
+            raise ValueError("optimizer protocol group static config is invalid")
+        _validate_optimizer_group_static(
+            optimizer["type"], group["static"], group_index=group_index
+        )
+        parameters = group["parameters"]
+        if not isinstance(parameters, list) or not parameters:
+            raise ValueError("optimizer protocol group parameters must be non-empty")
+        for parameter in parameters:
+            if not isinstance(parameter, Mapping):
+                raise ValueError("optimizer parameter schema must be an object")
+            _require_exact_keys(
+                parameter,
+                {"name", "shape", "dtype", "requires_grad"},
+                where="optimizer parameter schema",
+            )
+            name = parameter["name"]
+            if not isinstance(name, str) or not name or name in names:
+                raise ValueError("optimizer parameter names must be unique")
+            names.add(name)
+            shape = parameter["shape"]
+            if (
+                not isinstance(shape, list)
+                or any(
+                    isinstance(size, bool) or not isinstance(size, int) or size < 0
+                    for size in shape
+                )
+                or not isinstance(parameter["dtype"], str)
+                or not parameter["dtype"].startswith("torch.")
+                or (
+                    parameter["requires_grad"] is not True
+                    and parameter["requires_grad"] is not False
+                )
+            ):
+                raise ValueError("optimizer parameter schema is invalid")
+    algorithms = {
+        "constant": {"max_steps"},
+        "linear_warmup": {"max_steps", "warmup_steps"},
+        "cosine_warmup": {"max_steps", "warmup_steps"},
+        "cosine_with_restarts": {
+            "max_steps",
+            "warmup_steps",
+            "num_cycles",
+            "amplitude_decay",
+            "lr_end",
+        },
+        "polynomial_decay_warmup": {
+            "max_steps",
+            "warmup_steps",
+            "lr_end",
+            "power",
+        },
+    }
+    algorithm = scheduler["algorithm"]
+    if algorithm not in algorithms or not isinstance(scheduler["static"], Mapping):
+        raise ValueError("optimizer protocol scheduler algorithm/config is invalid")
+    _require_exact_keys(
+        scheduler["static"],
+        algorithms[algorithm],
+        where="optimizer protocol scheduler static config",
+    )
+    for field, value in scheduler["static"].items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"scheduler static {field} is invalid")
+    if (
+        isinstance(scheduler["static"]["max_steps"], bool)
+        or not isinstance(scheduler["static"]["max_steps"], int)
+        or scheduler["static"]["max_steps"] < 1
+    ):
+        raise ValueError("scheduler static max_steps is invalid")
+    static = scheduler["static"]
+    max_steps = static["max_steps"]
+    if algorithm != "constant":
+        warmup_steps = _require_finite_number(
+            static["warmup_steps"],
+            where="scheduler static warmup_steps",
+            minimum=0.0,
+        )
+        if warmup_steps > max_steps:
+            raise ValueError("scheduler static warmup_steps is invalid")
+    if algorithm == "cosine_with_restarts":
+        if (
+            isinstance(static["num_cycles"], bool)
+            or not isinstance(static["num_cycles"], int)
+            or static["num_cycles"] < 1
+        ):
+            raise ValueError("scheduler static num_cycles is invalid")
+        _require_finite_number(
+            static["amplitude_decay"],
+            where="scheduler static amplitude_decay",
+            minimum=0.0,
+            strict_minimum=True,
+            maximum=1.0,
+        )
+    if algorithm == "polynomial_decay_warmup":
+        _require_finite_number(
+            static["power"],
+            where="scheduler static power",
+            minimum=0.0,
+            strict_minimum=True,
+        )
+    if algorithm in {"cosine_with_restarts", "polynomial_decay_warmup"}:
+        lr_end = _require_finite_number(
+            static["lr_end"], where="scheduler static lr_end", minimum=0.0
+        )
+        if any(lr_end > group["base_lr"] for group in optimizer["groups"]):
+            raise ValueError("scheduler static lr_end exceeds an optimizer base_lr")
+    if scaler["enabled"] is not True and scaler["enabled"] is not False:
+        raise ValueError("optimizer protocol scaler enabled is invalid")
+    if not isinstance(scaler["static"], Mapping):
+        raise ValueError("optimizer protocol scaler static config is invalid")
+    _require_exact_keys(
+        scaler["static"],
+        {
+            "device",
+            "init_scale",
+            "growth_factor",
+            "backoff_factor",
+            "growth_interval",
+        },
+        where="optimizer protocol scaler static config",
+    )
+    if scaler["static"]["device"] not in {"cpu", "cuda"}:
+        raise ValueError("scaler static device is invalid")
+    _require_finite_number(
+        scaler["static"]["init_scale"],
+        where="scaler static init_scale",
+        minimum=0.0,
+        strict_minimum=True,
+    )
+    _require_finite_number(
+        scaler["static"]["growth_factor"],
+        where="scaler static growth_factor",
+        minimum=1.0,
+        strict_minimum=True,
+    )
+    _require_finite_number(
+        scaler["static"]["backoff_factor"],
+        where="scaler static backoff_factor",
+        minimum=0.0,
+        strict_minimum=True,
+        maximum=1.0,
+        strict_maximum=True,
+    )
+    growth_interval = scaler["static"]["growth_interval"]
+    if (
+        isinstance(growth_interval, bool)
+        or not isinstance(growth_interval, int)
+        or growth_interval < 1
+    ):
+        raise ValueError("scaler static growth_interval is invalid")
+    return payload
+
+
+def _validate_parameter_tensor(
+    tensor: Any, parameter: Mapping[str, Any], *, where: str
+) -> None:
+    if not isinstance(tensor, Tensor):
+        raise ValueError(f"{where} must be a tensor")
+    if list(tensor.shape) != parameter["shape"]:
+        raise ValueError(f"{where} shape does not match parameter schema")
+    if str(tensor.dtype) != parameter["dtype"]:
+        raise ValueError(f"{where} dtype does not match parameter schema")
+    _validate_finite(tensor, path=where)
+
+
+def _validate_optimizer_state(
+    state: Mapping[str, Any],
+    *,
+    protocol: Mapping[str, Any],
+    model_state: Mapping[str, Any],
+    terminal_step: int,
+) -> tuple[list[float], list[float]]:
     _require_exact_keys(state, {"state", "param_groups"}, where="optimizer_state")
     slot_state = state["state"]
     groups = state["param_groups"]
@@ -1315,19 +1951,58 @@ def _validate_optimizer_state(state: Mapping[str, Any]) -> None:
         or not groups
     ):
         raise ValueError("optimizer_state state/param_groups structure is invalid")
+    expected_groups = protocol["optimizer"]["groups"]
+    if len(groups) != len(expected_groups):
+        raise ValueError("optimizer_state parameter group count mismatch")
     parameter_ids: list[int] = []
-    for index, group in enumerate(groups):
+    current_lrs: list[float] = []
+    base_lrs: list[float] = []
+    id_to_parameter: dict[int, Mapping[str, Any]] = {}
+    for index, (group, expected_group) in enumerate(zip(groups, expected_groups)):
         if not isinstance(group, Mapping) or "params" not in group:
             raise ValueError(f"optimizer_state param_groups[{index}] is missing params")
         params = group["params"]
-        if not isinstance(params, list):
+        expected_parameters = expected_group["parameters"]
+        if not isinstance(params, list) or len(params) != len(expected_parameters):
             raise ValueError("optimizer_state group params must be a list")
-        for parameter_id in params:
+        actual_static = {
+            key: value
+            for key, value in group.items()
+            if key not in {"params", "lr", "initial_lr"}
+        }
+        normalized_static = _normalize_json(
+            actual_static, where=f"optimizer_state group {index} static config"
+        )
+        if normalized_static != expected_group["static"]:
+            differing = sorted(set(normalized_static) | set(expected_group["static"]))
+            raise ValueError(
+                "optimizer_state static config mismatch: " + ", ".join(differing)
+            )
+        if group.get("initial_lr") != expected_group["base_lr"]:
+            raise ValueError("optimizer_state initial_lr mismatch")
+        lr = group.get("lr")
+        if (
+            isinstance(lr, bool)
+            or not isinstance(lr, (int, float))
+            or not math.isfinite(lr)
+            or lr < 0
+        ):
+            raise ValueError("optimizer_state current lr is invalid")
+        current_lrs.append(float(lr))
+        base_lrs.append(float(expected_group["base_lr"]))
+        for parameter_id, parameter in zip(params, expected_parameters):
             if isinstance(parameter_id, bool) or not isinstance(parameter_id, int):
                 raise ValueError("optimizer_state param IDs must be non-bool integers")
             if parameter_id < 0:
                 raise ValueError("optimizer_state param IDs must be non-negative")
             parameter_ids.append(parameter_id)
+            id_to_parameter[parameter_id] = parameter
+            name = parameter["name"]
+            if name not in model_state:
+                raise ValueError(f"optimizer parameter {name} is absent from model")
+            _validate_parameter_tensor(
+                model_state[name], parameter, where=f"model parameter {name}"
+            )
     if len(parameter_ids) != len(set(parameter_ids)):
         raise ValueError("optimizer_state contains duplicate param IDs")
     state_ids = set()
@@ -1342,33 +2017,142 @@ def _validate_optimizer_state(state: Mapping[str, Any]) -> None:
         raise ValueError(
             f"optimizer_state contains foreign state IDs: {sorted(foreign)}"
         )
-    missing = set(parameter_ids) - state_ids
+    required_state_ids = {
+        parameter_id
+        for parameter_id, parameter in id_to_parameter.items()
+        if parameter["requires_grad"]
+    }
+    missing = required_state_ids - state_ids
     if missing:
         raise ValueError(
             f"optimizer_state is missing state for param IDs: {sorted(missing)}"
         )
+    optimizer_type = protocol["optimizer"]["type"]
+    for parameter_id in sorted(state_ids):
+        slot = slot_state[parameter_id]
+        parameter = id_to_parameter[parameter_id]
+        if optimizer_type.endswith(".AdamW"):
+            group = next(item for item in groups if parameter_id in item["params"])
+            required = {"step", "exp_avg", "exp_avg_sq"}
+            if group.get("amsgrad"):
+                required.add("max_exp_avg_sq")
+            _require_exact_keys(slot, required, where="AdamW optimizer slot")
+            step = slot["step"]
+            if isinstance(step, Tensor):
+                if step.numel() != 1:
+                    raise ValueError("AdamW optimizer step must be scalar")
+                if not step.dtype.is_floating_point:
+                    raise ValueError("AdamW optimizer step tensor dtype is invalid")
+                step = float(step.detach().cpu().item())
+            if (
+                isinstance(step, bool)
+                or not isinstance(step, (int, float))
+                or not math.isfinite(step)
+                or step != terminal_step
+            ):
+                raise ValueError("AdamW optimizer step does not equal terminal step")
+            for key in required - {"step"}:
+                _validate_parameter_tensor(
+                    slot[key], parameter, where=f"AdamW optimizer {key}"
+                )
+        elif optimizer_type.endswith("._muon.Muon"):
+            _require_exact_keys(slot, {"momentum_buffer"}, where="Muon optimizer slot")
+            _validate_parameter_tensor(
+                slot["momentum_buffer"],
+                parameter,
+                where="Muon optimizer momentum_buffer",
+            )
+        else:
+            raise ValueError(f"unsupported formal optimizer type: {optimizer_type}")
+    return current_lrs, base_lrs
 
 
-def _validate_scheduler_state(state: Mapping[str, Any], *, terminal_step: int) -> None:
+def _validate_scheduler_state(
+    state: Mapping[str, Any],
+    *,
+    terminal_step: int,
+    protocol: Mapping[str, Any],
+    current_lrs: Sequence[float],
+    base_lrs: Sequence[float],
+) -> None:
+    required = {
+        "base_lrs",
+        "last_epoch",
+        "_step_count",
+        "_last_lr",
+        "lr_lambdas",
+    }
+    optional = {"_is_initial", "_get_lr_called_within_step", "verbose"}
+    missing = sorted(required - set(state))
+    extra = sorted(set(state) - required - optional)
+    if missing or extra:
+        raise ValueError(
+            f"scheduler_state keys mismatch; missing={missing}, extra={extra}"
+        )
+    for field in optional & set(state):
+        if state[field] is not False:
+            raise ValueError(f"scheduler_state {field} must be false")
     last_epoch = state.get("last_epoch")
     if isinstance(last_epoch, bool) or not isinstance(last_epoch, int):
         raise ValueError("scheduler_state must contain integer last_epoch")
     if last_epoch != terminal_step:
         raise ValueError("scheduler_state last_epoch does not equal terminal step")
-    step_count = state.get("_step_count")
-    if step_count is not None:
-        if isinstance(step_count, bool) or not isinstance(step_count, int):
-            raise ValueError("scheduler_state step count must be an integer")
-        if step_count != terminal_step + 1:
-            raise ValueError(
-                "scheduler_state step count does not equal terminal step plus one"
-            )
+    step_count = state["_step_count"]
+    if isinstance(step_count, bool) or not isinstance(step_count, int):
+        raise ValueError("scheduler_state step count must be an integer")
+    if step_count != terminal_step + 1:
+        raise ValueError(
+            "scheduler_state step count does not equal terminal step plus one"
+        )
+    if state["base_lrs"] != list(base_lrs):
+        raise ValueError("scheduler_state base_lrs mismatch")
+    if state["_last_lr"] != list(current_lrs):
+        raise ValueError("scheduler_state current LR mismatch")
+    algorithm = protocol["scheduler"]["algorithm"]
+    expected_lambdas = (
+        [None] * len(base_lrs) if algorithm == "constant" else [{} for _ in base_lrs]
+    )
+    if state["lr_lambdas"] != expected_lambdas:
+        raise ValueError("scheduler_state lambda structure mismatch")
+    static = protocol["scheduler"]["static"]
+    if static["max_steps"] != terminal_step:
+        raise ValueError("scheduler protocol max_steps mismatch")
+    expected_lrs = []
+    for base_lr in base_lrs:
+        if algorithm == "constant":
+            expected_lrs.append(base_lr)
+        elif algorithm in {"linear_warmup", "cosine_warmup"}:
+            expected_lrs.append(0.0)
+        elif algorithm == "cosine_with_restarts":
+            expected_lrs.append(float(static["lr_end"]))
+        elif algorithm == "polynomial_decay_warmup":
+            expected_lrs.append(float(static["lr_end"]))
+    if any(
+        not math.isclose(actual, wanted, rel_tol=1e-9, abs_tol=1e-12)
+        for actual, wanted in zip(current_lrs, expected_lrs)
+    ):
+        raise ValueError("scheduler_state terminal LR is inconsistent with protocol")
+    try:
+        parameters = [torch.nn.Parameter(torch.zeros(())) for _ in base_lrs]
+        dummy_optimizer = torch.optim.SGD(
+            [
+                {"params": [parameter], "lr": base_lr}
+                for parameter, base_lr in zip(parameters, base_lrs)
+            ]
+        )
+        dummy_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            dummy_optimizer, [lambda _step: 1.0 for _ in base_lrs]
+        )
+        dummy_scheduler.load_state_dict(copy.deepcopy(dict(state)))
+    except Exception as error:
+        raise ValueError("scheduler_state is not restorable") from error
 
 
-def _validate_scaler_state(state: Mapping[str, Any], *, amp_enabled: bool) -> None:
-    if not isinstance(amp_enabled, bool):
-        raise ValueError("scientific config amp must be a boolean")
-    if not amp_enabled:
+def _validate_scaler_state(
+    state: Mapping[str, Any], *, protocol: Mapping[str, Any]
+) -> None:
+    scaler_protocol = protocol["scaler"]
+    if not scaler_protocol["enabled"]:
         if state:
             raise ValueError("disabled AMP scaler_state must be empty")
         return
@@ -1379,9 +2163,43 @@ def _validate_scaler_state(state: Mapping[str, Any], *, amp_enabled: bool) -> No
         "growth_interval",
         "_growth_tracker",
     }
-    missing = sorted(required - set(state))
-    if missing:
-        raise ValueError(f"enabled AMP scaler_state is missing: {', '.join(missing)}")
+    _require_exact_keys(state, required, where="enabled AMP scaler_state")
+    static = scaler_protocol["static"]
+    for field in ("growth_factor", "backoff_factor", "growth_interval"):
+        if state[field] != static[field]:
+            raise ValueError(f"enabled AMP scaler_state {field} mismatch")
+    growth_tracker = state["_growth_tracker"]
+    if (
+        isinstance(growth_tracker, bool)
+        or not isinstance(growth_tracker, int)
+        or growth_tracker < 0
+        or growth_tracker >= state["growth_interval"]
+    ):
+        raise ValueError("enabled AMP scaler_state growth tracker is invalid")
+    if (
+        not isinstance(state["scale"], (int, float))
+        or isinstance(state["scale"], bool)
+        or not math.isfinite(state["scale"])
+        or state["scale"] <= 0
+        or not (state["growth_factor"] > 1)
+        or not (0 < state["backoff_factor"] < 1)
+        or not isinstance(state["growth_interval"], int)
+        or state["growth_interval"] < 1
+    ):
+        raise ValueError("enabled AMP scaler_state is invalid")
+    try:
+        dummy = torch.GradScaler(
+            "cpu",
+            enabled=True,
+            init_scale=static["init_scale"],
+            growth_factor=static["growth_factor"],
+            backoff_factor=static["backoff_factor"],
+            growth_interval=static["growth_interval"],
+        )
+        dummy.load_state_dict(copy.deepcopy(dict(state)))
+        dummy.scale(torch.ones((), requires_grad=True))
+    except Exception as error:
+        raise ValueError("enabled AMP scaler_state is not restorable") from error
 
 
 def _read_manifest_file(
@@ -1394,15 +2212,41 @@ def _read_manifest_file(
     return value
 
 
+def _absolute_lexical_path(path: str | os.PathLike[str], *, where: str) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    parts = candidate.parts
+    if (
+        not parts
+        or parts[0] != os.path.sep
+        or any(part in {"", ".", ".."} for part in parts[1:])
+    ):
+        raise ValueError(f"{where} must be a normalized absolute path")
+    return candidate
+
+
+def _regular_lexical_path(path: str | os.PathLike[str], *, where: str) -> Path:
+    candidate = _absolute_lexical_path(path, where=where)
+    try:
+        fd, _snapshot = _open_regular_nofollow(candidate)
+    except ValueError as error:
+        raise ValueError(f"{where} has a symlink or invalid path component") from error
+    os.close(fd)
+    return candidate
+
+
 def _resolved_ledger_path(root: Path, relative: str, *, where: str) -> Path:
     relative = _validate_relative_path(relative, where=where)
-    root = root.resolve(strict=True)
-    path = root.joinpath(*PurePosixPath(relative).parts).resolve(strict=True)
+    root = _absolute_lexical_path(root, where="artifact root")
+    root_fd = _open_directory_components_nofollow(root, where="artifact root")
+    os.close(root_fd)
+    path = root.joinpath(*PurePosixPath(relative).parts)
     try:
         path.relative_to(root)
     except ValueError as error:
         raise ValueError(f"{where} escapes artifact root") from error
-    return path
+    return _regular_lexical_path(path, where=where)
 
 
 def _expected_parent_manifest(
@@ -1429,6 +2273,8 @@ def _expected_parent_manifest(
                 "torch_seed": ledger_entry["torch_seed"],
                 "identity_rng_seed": ledger_entry["identity_rng_seed"],
                 "world_size": ledger_entry["world_size"],
+                "cuda_device_count": ledger_entry["cuda_device_count"],
+                "max_checkpoint_bytes": ledger_entry["max_checkpoint_bytes"],
                 "source_sha256": ledger_entry["source_sha256"],
                 "environment_sha256": ledger_entry["environment_sha256"],
                 "prior_sha256": ledger_entry["prior_sha256"],
@@ -1442,7 +2288,7 @@ def _expected_parent_manifest(
     )
 
 
-def validate_parent_trust(trust: ParentTrust) -> dict[str, Any]:
+def validate_parent_trust(trust: ParentTrust) -> ValidatedParent:
     _require_digest("parent transaction_ledger_sha256", trust.transaction_ledger_sha256)
     if trust.arm not in FORMAL_MODES or trust.parent_stage not in FORMAL_STAGES:
         raise ValueError("parent arm/stage is invalid")
@@ -1486,16 +2332,23 @@ def validate_parent_trust(trust: ParentTrust) -> dict[str, Any]:
         entry["finalized_manifest_relpath"],
         where="ledger finalized manifest",
     )
-    if expected_checkpoint_path != trust.checkpoint_path.resolve(strict=True):
+    actual_checkpoint_path = _regular_lexical_path(
+        trust.checkpoint_path, where="parent checkpoint path"
+    )
+    actual_final_path = _regular_lexical_path(
+        trust.finalized_manifest_path, where="parent finalized manifest path"
+    )
+    if expected_checkpoint_path != actual_checkpoint_path:
         raise ValueError("parent checkpoint path does not match immutable ledger")
-    if expected_final_path != trust.finalized_manifest_path.resolve(strict=True):
+    if expected_final_path != actual_final_path:
         raise ValueError("finalized manifest path does not match immutable ledger")
 
     finalized_value, _raw_sha = strict_json_load_nofollow(trust.finalized_manifest_path)
     if not isinstance(finalized_value, Mapping):
         raise ValueError("finalized checkpoint manifest file must contain an object")
     finalized_sha = validate_manifest(
-        finalized_value, expected_kind="finalized_checkpoint"
+        finalized_value,
+        expected_kind="finalized_checkpoint",
     )
     finalized = finalized_value
     final_payload = finalized["payload"]
@@ -1519,6 +2372,8 @@ def validate_parent_trust(trust: ParentTrust) -> dict[str, Any]:
         "scientific_sha256",
         "cohort_protocol_sha256",
         "arm_protocol_sha256",
+        "cuda_device_count",
+        "max_checkpoint_bytes",
     }
     _require_exact_keys(final_payload, final_keys, where="finalized checkpoint")
     expected_identity = {
@@ -1533,9 +2388,13 @@ def validate_parent_trust(trust: ParentTrust) -> dict[str, Any]:
             raise ValueError(f"finalized checkpoint {field} mismatch")
     if final_payload["terminal_step"] != entry["terminal_step"]:
         raise ValueError("finalized checkpoint terminal_step mismatch")
+    for field in ("cuda_device_count", "max_checkpoint_bytes"):
+        if final_payload[field] != entry[field]:
+            raise ValueError(f"finalized checkpoint {field} mismatch")
 
     parent_checkpoint, parent_sha, parent_size = _load_checkpoint_and_hash(
-        trust.checkpoint_path
+        trust.checkpoint_path,
+        max_checkpoint_bytes=entry["max_checkpoint_bytes"],
     )
     _require_digest(
         "finalized parent checkpoint_sha256", final_payload["checkpoint_sha256"]
@@ -1546,6 +2405,33 @@ def validate_parent_trust(trust: ParentTrust) -> dict[str, Any]:
         )
     if final_payload["checkpoint_size"] != parent_size:
         raise ValueError("finalized checkpoint byte size mismatch")
+    parent_expected = CheckpointExpectations(
+        mode=entry["arm"],
+        np_seed=entry["np_seed"],
+        torch_seed=entry["torch_seed"],
+        identity_seed=entry["identity_rng_seed"],
+        stage=entry["stage"],
+        terminal_step=entry["terminal_step"],
+        source_sha256=entry["source_sha256"],
+        environment_sha256=entry["environment_sha256"],
+        prior_sha256=entry["prior_sha256"],
+        architecture_sha256=entry["architecture_sha256"],
+        optimizer_sha256=entry["optimizer_sha256"],
+        scientific_sha256=entry["scientific_sha256"],
+        cohort_protocol_sha256=entry["cohort_protocol_sha256"],
+        arm_protocol_sha256=entry["arm_protocol_sha256"],
+        world_size=entry["world_size"],
+        cuda_device_count=entry["cuda_device_count"],
+        max_checkpoint_bytes=entry["max_checkpoint_bytes"],
+    )
+    _validate_loaded_identity_checkpoint(
+        parent_checkpoint,
+        checkpoint_digest=parent_sha,
+        checkpoint_size=parent_size,
+        path=Path(trust.checkpoint_path),
+        expected=parent_expected,
+        validate_exact_parent=False,
+    )
     provenance = parent_checkpoint.get("provenance")
     validate_provenance_bundle(provenance)
     manifests = provenance["manifests"]
@@ -1583,6 +2469,9 @@ def validate_parent_trust(trust: ParentTrust) -> dict[str, Any]:
         "torch_seed": seed_payload.get("torch_seed"),
         "identity_rng_seed": seed_payload.get("identity_rng_seed"),
         "world_size": seed_payload.get("world_size"),
+        "cuda_device_count": manifests["environment"]["payload"].get(
+            "visible_cuda_device_count"
+        ),
         "source_sha256": manifests["source"]["sha256"],
         "environment_sha256": manifests["environment"]["sha256"],
         "prior_sha256": manifests["prior"]["sha256"],
@@ -1595,11 +2484,16 @@ def validate_parent_trust(trust: ParentTrust) -> dict[str, Any]:
     for field, actual in ledger_invariants.items():
         if entry[field] != actual:
             raise ValueError(f"parent {field} does not match immutable ledger")
-    return _expected_parent_manifest(
-        trust,
+    return ValidatedParent(
+        manifest=_expected_parent_manifest(
+            trust,
+            checkpoint_sha256=parent_sha,
+            finalized_manifest_sha256=finalized_sha,
+            ledger_entry=entry,
+        ),
+        checkpoint=parent_checkpoint,
         checkpoint_sha256=parent_sha,
-        finalized_manifest_sha256=finalized_sha,
-        ledger_entry=entry,
+        checkpoint_size=parent_size,
     )
 
 
@@ -1621,12 +2515,109 @@ def _validate_expected_manifest_hashes(
             raise ValueError(f"{name} manifest does not match explicit expected sha256")
 
 
-def validate_identity_checkpoint(
-    checkpoint_path: str | os.PathLike[str], expected: CheckpointExpectations
+_PARENT_RECORD_KEYS = {
+    "checkpoint_sha256",
+    "finalized_manifest_sha256",
+    "transaction_ledger_sha256",
+    "study_id",
+    "arm",
+    "stage",
+    "terminal_step",
+    "upstream_identity",
+    "artifact_identity",
+    "np_seed",
+    "torch_seed",
+    "identity_rng_seed",
+    "world_size",
+    "cuda_device_count",
+    "max_checkpoint_bytes",
+    "source_sha256",
+    "environment_sha256",
+    "prior_sha256",
+    "architecture_sha256",
+    "optimizer_sha256",
+    "scientific_sha256",
+    "cohort_protocol_sha256",
+    "arm_protocol_sha256",
+}
+
+
+def _validate_parent_lineage_structure(
+    parent: Mapping[str, Any],
+    *,
+    expected: CheckpointExpectations,
+    manifests: Mapping[str, Mapping[str, Any]],
+    study_id: str,
+) -> None:
+    payload = parent["payload"]
+    if expected.stage == "stage1":
+        if payload != {"parent": None}:
+            raise ValueError("Stage 1 requires an explicit null parent")
+        return
+    _require_exact_keys(payload, {"parent"}, where="parent manifest payload")
+    record = payload["parent"]
+    if not isinstance(record, Mapping):
+        raise ValueError("Stage 2/3 parent lineage must be an object")
+    _require_exact_keys(record, _PARENT_RECORD_KEYS, where="parent lineage")
+    for field in (
+        "checkpoint_sha256",
+        "finalized_manifest_sha256",
+        "transaction_ledger_sha256",
+        "source_sha256",
+        "environment_sha256",
+        "prior_sha256",
+        "architecture_sha256",
+        "optimizer_sha256",
+        "scientific_sha256",
+        "cohort_protocol_sha256",
+        "arm_protocol_sha256",
+    ):
+        _require_digest(f"parent lineage {field}", record[field])
+    for field, minimum in (
+        ("terminal_step", 1),
+        ("np_seed", 0),
+        ("torch_seed", 0),
+        ("identity_rng_seed", 0),
+        ("world_size", 1),
+        ("cuda_device_count", 0),
+        ("max_checkpoint_bytes", 1),
+    ):
+        value = record[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"parent lineage {field} is invalid")
+    for field in ("study_id", "upstream_identity", "artifact_identity"):
+        value = record[field]
+        if not isinstance(value, str) or _SAFE_ID.fullmatch(value) is None:
+            raise ValueError(f"parent lineage {field} is invalid")
+    predecessor = "stage1" if expected.stage == "stage2" else "stage2"
+    locked = {
+        "study_id": study_id,
+        "arm": expected.mode,
+        "stage": predecessor,
+        "np_seed": expected.np_seed,
+        "torch_seed": expected.torch_seed,
+        "identity_rng_seed": expected.identity_seed,
+        "world_size": expected.world_size,
+        "cuda_device_count": expected.cuda_device_count,
+        "source_sha256": manifests["source"]["sha256"],
+        "environment_sha256": manifests["environment"]["sha256"],
+        "architecture_sha256": manifests["architecture"]["sha256"],
+    }
+    for field, value in locked.items():
+        if record[field] != value:
+            raise ValueError(f"parent {field} lineage does not match child")
+
+
+def _validate_loaded_identity_checkpoint(
+    checkpoint: Mapping[str, Any],
+    *,
+    checkpoint_digest: str,
+    checkpoint_size: int,
+    path: Path,
+    expected: CheckpointExpectations,
+    validate_exact_parent: bool,
 ) -> dict[str, Any]:
-    """Validate one complete formal checkpoint without restoring runtime RNG."""
-    path = Path(checkpoint_path)
-    checkpoint, checkpoint_digest, checkpoint_size = _load_checkpoint_and_hash(path)
+    """Validate an already loaded formal checkpoint without reopening its path."""
     required = {
         "config",
         "state_dict",
@@ -1660,16 +2651,35 @@ def validate_identity_checkpoint(
         if not isinstance(checkpoint[name], Mapping):
             raise ValueError(f"checkpoint {name} must be an object")
         _validate_finite(checkpoint[name], path=name)
-    _validate_optimizer_state(checkpoint["optimizer_state"])
-    _validate_scheduler_state(
-        checkpoint["scheduler_state"], terminal_step=expected.terminal_step
-    )
     _validate_finite(checkpoint["state_dict"], path="state_dict")
 
     provenance = checkpoint["provenance"]
     validate_provenance_bundle(provenance)
     manifests = provenance["manifests"]
     _validate_expected_manifest_hashes(manifests, expected)
+    if not isinstance(checkpoint["config"], Mapping):
+        raise ValueError("checkpoint config must be an object")
+    if checkpoint["config"].get("row_identity_mode") != expected.mode:
+        raise ValueError("checkpoint row_identity_mode mismatch")
+    actual_architecture = architecture_manifest(
+        checkpoint["config"], checkpoint["state_dict"]
+    )
+    if actual_architecture["sha256"] != manifests["architecture"]["sha256"]:
+        raise ValueError("architecture/state_dict key-shape-dtype schema mismatch")
+    optimizer_protocol = _validate_optimizer_protocol(manifests["optimizer"]["payload"])
+    current_lrs, base_lrs = _validate_optimizer_state(
+        checkpoint["optimizer_state"],
+        protocol=optimizer_protocol,
+        model_state=checkpoint["state_dict"],
+        terminal_step=expected.terminal_step,
+    )
+    _validate_scheduler_state(
+        checkpoint["scheduler_state"],
+        terminal_step=expected.terminal_step,
+        protocol=optimizer_protocol,
+        current_lrs=current_lrs,
+        base_lrs=base_lrs,
+    )
     validate_source_manifest(manifests["source"])
     environment_payload = manifests["environment"]["payload"]
     if (
@@ -1677,10 +2687,7 @@ def validate_identity_checkpoint(
         != expected.cuda_device_count
     ):
         raise ValueError("environment visible CUDA device count mismatch")
-    scientific_payload = manifests["scientific_config"]["payload"]
-    _validate_scaler_state(
-        checkpoint["scaler_state"], amp_enabled=scientific_payload.get("amp")
-    )
+    _validate_scaler_state(checkpoint["scaler_state"], protocol=optimizer_protocol)
 
     stage_payload = manifests["stage"]["payload"]
     if stage_payload.get("stage") != expected.stage:
@@ -1699,16 +2706,6 @@ def validate_identity_checkpoint(
             key for key in expected_seed if seed_payload.get(key) != expected_seed[key]
         ]
         raise ValueError(f"seed manifest mismatch: {', '.join(differing)}")
-
-    if not isinstance(checkpoint["config"], Mapping):
-        raise ValueError("checkpoint config must be an object")
-    if checkpoint["config"].get("row_identity_mode") != expected.mode:
-        raise ValueError("checkpoint row_identity_mode mismatch")
-    actual_architecture = architecture_manifest(
-        checkpoint["config"], checkpoint["state_dict"]
-    )
-    if actual_architecture["sha256"] != manifests["architecture"]["sha256"]:
-        raise ValueError("architecture/state_dict key-shape-dtype schema mismatch")
 
     actual_prior = prior_manifest(checkpoint["prior_stream"])
     if actual_prior["sha256"] != manifests["prior"]["sha256"]:
@@ -1762,13 +2759,19 @@ def validate_identity_checkpoint(
         raise ValueError("rope/none checkpoint must not contain identity_sampler")
 
     parent = manifests["parent"]
+    _validate_parent_lineage_structure(
+        parent,
+        expected=expected,
+        manifests=manifests,
+        study_id=operational["context"]["study_id"],
+    )
     if expected.stage == "stage1":
-        if parent["payload"] != {"parent": None} or expected.parent_trust is not None:
+        if expected.parent_trust is not None:
             raise ValueError("Stage 1 requires an explicit null parent")
-    else:
+    elif validate_exact_parent:
         if expected.parent_trust is None:
             raise ValueError("Stage 2/3 requires explicit parent trust inputs")
-        trusted_parent = validate_parent_trust(expected.parent_trust)
+        trusted_parent = validate_parent_trust(expected.parent_trust).manifest
         if parent != trusted_parent:
             raise ValueError(
                 "parent manifest does not match immutable ledger and exact parent bytes"
@@ -1796,6 +2799,10 @@ def validate_identity_checkpoint(
         for field, child_value in parent_child_invariants.items():
             if parent_payload[field] != child_value:
                 raise ValueError(f"parent {field} does not match child checkpoint")
+    elif expected.parent_trust is not None:
+        raise ValueError(
+            "non-recursive parent validation must not receive parent trust"
+        )
 
     return {
         "checkpoint_sha256": checkpoint_digest,
@@ -1816,7 +2823,26 @@ def validate_identity_checkpoint(
         "mode": expected.mode,
         "stage": expected.stage,
         "terminal_step": expected.terminal_step,
+        "max_checkpoint_bytes": expected.max_checkpoint_bytes,
     }
+
+
+def validate_identity_checkpoint(
+    checkpoint_path: str | os.PathLike[str], expected: CheckpointExpectations
+) -> dict[str, Any]:
+    """Validate one complete formal checkpoint without restoring runtime RNG."""
+    path = Path(checkpoint_path)
+    checkpoint, checkpoint_digest, checkpoint_size = _load_checkpoint_and_hash(
+        path, max_checkpoint_bytes=expected.max_checkpoint_bytes
+    )
+    return _validate_loaded_identity_checkpoint(
+        checkpoint,
+        checkpoint_digest=checkpoint_digest,
+        checkpoint_size=checkpoint_size,
+        path=path,
+        expected=expected,
+        validate_exact_parent=True,
+    )
 
 
 def _load_finalization_ledger_entry(
@@ -1860,16 +2886,31 @@ def _load_finalization_ledger_entry(
     return matches[0]
 
 
-def _resolved_future_ledger_path(root: Path, relative: str, *, where: str) -> Path:
+def _open_future_ledger_target(
+    root: Path, relative: str, *, where: str
+) -> tuple[Path, int, str]:
+    """Resolve a future regular-file name beneath a held no-follow parent FD."""
     relative = _validate_relative_path(relative, where=where)
-    root = root.resolve(strict=True)
-    lexical = root.joinpath(*PurePosixPath(relative).parts)
-    parent = lexical.parent.resolve(strict=True)
+    root = _absolute_lexical_path(root, where="artifact root")
+    parts = PurePosixPath(relative).parts
+    lexical = root.joinpath(*parts)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    parent_fd = _open_directory_components_nofollow(root, where="artifact root")
     try:
-        parent.relative_to(root)
-    except ValueError as error:
-        raise ValueError(f"{where} escapes artifact root") from error
-    return parent / lexical.name
+        for component in parts[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        if not stat.S_ISDIR(os.fstat(parent_fd).st_mode):
+            raise ValueError(f"{where} parent is not a directory")
+        return lexical, parent_fd, parts[-1]
+    except OSError as error:
+        os.close(parent_fd)
+        raise ValueError(
+            f"{where} has a symlink or invalid parent path component"
+        ) from error
 
 
 def _prepare_finalized_manifest(
@@ -1878,7 +2919,7 @@ def _prepare_finalized_manifest(
     *,
     finalized_manifest_path: str | os.PathLike[str],
     trust: FinalizationTrust,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], int, str, Path]:
     report = validate_identity_checkpoint(checkpoint_path, expected)
     entry = _load_finalization_ledger_entry(
         trust, mode=expected.mode, stage=expected.stage
@@ -1886,64 +2927,78 @@ def _prepare_finalized_manifest(
     expected_checkpoint = _resolved_ledger_path(
         trust.artifact_root, entry["checkpoint_relpath"], where="ledger checkpoint"
     )
-    actual_checkpoint = Path(checkpoint_path).resolve(strict=True)
+    actual_checkpoint = _regular_lexical_path(
+        checkpoint_path, where="finalization checkpoint path"
+    )
     if actual_checkpoint != expected_checkpoint:
         raise ValueError("checkpoint path does not match immutable finalization ledger")
-    expected_final = _resolved_future_ledger_path(
+    expected_final, parent_fd, final_name = _open_future_ledger_target(
         trust.artifact_root,
         entry["finalized_manifest_relpath"],
         where="ledger finalized manifest",
     )
-    actual_final = (
-        Path(finalized_manifest_path).parent.resolve(strict=True)
-        / Path(finalized_manifest_path).name
-    )
-    if actual_final != expected_final:
-        raise ValueError("finalized manifest path does not match immutable ledger")
-    expected_invariants = {
-        "terminal_step": expected.terminal_step,
-        "np_seed": expected.np_seed,
-        "torch_seed": expected.torch_seed,
-        "identity_rng_seed": expected.identity_seed,
-        "world_size": expected.world_size,
-        "source_sha256": report["source_sha256"],
-        "environment_sha256": report["environment_sha256"],
-        "prior_sha256": report["prior_sha256"],
-        "architecture_sha256": report["architecture_sha256"],
-        "optimizer_sha256": report["optimizer_sha256"],
-        "scientific_sha256": report["scientific_sha256"],
-        "cohort_protocol_sha256": report["cohort_protocol_sha256"],
-        "arm_protocol_sha256": report["arm_protocol_sha256"],
-    }
-    for field, actual in expected_invariants.items():
-        if entry[field] != actual:
-            raise ValueError(f"finalization {field} does not match immutable ledger")
-    if report["study_id"] != trust.study_id:
-        raise ValueError("finalization study_id does not match checkpoint provenance")
-    return make_manifest(
-        "finalized_checkpoint",
-        {
-            "study_id": trust.study_id,
-            "arm": expected.mode,
-            "stage": expected.stage,
+    try:
+        actual_final = _absolute_lexical_path(
+            finalized_manifest_path, where="finalized manifest path"
+        )
+        if actual_final != expected_final:
+            raise ValueError("finalized manifest path does not match immutable ledger")
+        expected_invariants = {
             "terminal_step": expected.terminal_step,
-            "upstream_identity": trust.upstream_identity,
-            "artifact_identity": trust.artifact_identity,
-            "checkpoint_sha256": report["checkpoint_sha256"],
-            "checkpoint_size": report["checkpoint_size"],
-            "provenance_sha256": report["provenance_sha256"],
+            "np_seed": expected.np_seed,
+            "torch_seed": expected.torch_seed,
+            "identity_rng_seed": expected.identity_seed,
+            "world_size": expected.world_size,
+            "cuda_device_count": expected.cuda_device_count,
+            "max_checkpoint_bytes": expected.max_checkpoint_bytes,
             "source_sha256": report["source_sha256"],
             "environment_sha256": report["environment_sha256"],
             "prior_sha256": report["prior_sha256"],
             "architecture_sha256": report["architecture_sha256"],
             "optimizer_sha256": report["optimizer_sha256"],
-            "seed_sha256": report["seed_sha256"],
-            "treatment_sha256": report["treatment_sha256"],
             "scientific_sha256": report["scientific_sha256"],
             "cohort_protocol_sha256": report["cohort_protocol_sha256"],
             "arm_protocol_sha256": report["arm_protocol_sha256"],
-        },
-    )
+        }
+        for field, actual in expected_invariants.items():
+            if entry[field] != actual:
+                raise ValueError(
+                    f"finalization {field} does not match immutable ledger"
+                )
+        if report["study_id"] != trust.study_id:
+            raise ValueError(
+                "finalization study_id does not match checkpoint provenance"
+            )
+        manifest = make_manifest(
+            "finalized_checkpoint",
+            {
+                "study_id": trust.study_id,
+                "arm": expected.mode,
+                "stage": expected.stage,
+                "terminal_step": expected.terminal_step,
+                "upstream_identity": trust.upstream_identity,
+                "artifact_identity": trust.artifact_identity,
+                "checkpoint_sha256": report["checkpoint_sha256"],
+                "checkpoint_size": report["checkpoint_size"],
+                "provenance_sha256": report["provenance_sha256"],
+                "source_sha256": report["source_sha256"],
+                "environment_sha256": report["environment_sha256"],
+                "prior_sha256": report["prior_sha256"],
+                "architecture_sha256": report["architecture_sha256"],
+                "optimizer_sha256": report["optimizer_sha256"],
+                "seed_sha256": report["seed_sha256"],
+                "treatment_sha256": report["treatment_sha256"],
+                "scientific_sha256": report["scientific_sha256"],
+                "cohort_protocol_sha256": report["cohort_protocol_sha256"],
+                "arm_protocol_sha256": report["arm_protocol_sha256"],
+                "cuda_device_count": expected.cuda_device_count,
+                "max_checkpoint_bytes": expected.max_checkpoint_bytes,
+            },
+        )
+        return manifest, parent_fd, final_name, expected_final
+    except BaseException:
+        os.close(parent_fd)
+        raise
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -1955,35 +3010,64 @@ def _write_all(fd: int, payload: bytes) -> None:
         view = view[written:]
 
 
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
+def _strict_json_load_at(
+    parent_fd: int, name: str, *, where: str, max_bytes: int = 32 << 20
+) -> tuple[Any, str]:
+    flags = os.O_RDONLY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags)
     try:
-        if not stat.S_ISDIR(os.fstat(fd).st_mode):
-            raise ValueError(f"finalization parent must be a directory: {path}")
-        os.fsync(fd)
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        raise ValueError(f"{where} is a symlink or invalid regular file") from error
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
+        os.close(fd)
+        raise ValueError(f"{where} must be a regular file")
+    try:
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(fd, min(1 << 20, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > max_bytes:
+            raise ValueError(f"{where} exceeds {max_bytes} bytes")
+        _same_file_snapshot(before, os.fstat(fd), where=where)
     finally:
         os.close(fd)
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_strict_object_pairs,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON constant: {token}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid strict JSON in {where}: {error}") from error
+    return value, hashlib.sha256(raw).hexdigest()
 
 
-def _publish_json_no_replace(path: Path, value: Mapping[str, Any]) -> None:
-    """Publish complete bytes with link(2), never exposing a partial final file."""
-    parent = path.parent.resolve(strict=True)
-    final_path = parent / path.name
+def _publish_json_no_replace_at(
+    parent_fd: int,
+    final_name: str,
+    value: Mapping[str, Any],
+    *,
+    display_path: Path,
+) -> None:
+    """Publish complete bytes relative to one verified, held parent directory."""
+    if not _LINK_SUPPORTS_DIR_FD or not _UNLINK_SUPPORTS_DIR_FD:
+        raise ValueError("dirfd no-replace publication is unavailable")
     payload = canonical_json_bytes(value) + b"\n"
-    temp_path = parent / (f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    temp_name = f".{final_name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(temp_path, flags, 0o600)
+    fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
     fd_open = True
     published = False
     try:
@@ -1992,20 +3076,26 @@ def _publish_json_no_replace(path: Path, value: Mapping[str, Any]) -> None:
         os.close(fd)
         fd_open = False
         try:
-            os.link(temp_path, final_path, follow_symlinks=False)
+            os.link(
+                temp_name,
+                final_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError as error:
             raise ValueError(
-                f"finalized manifest already exists: {final_path}"
+                f"finalized manifest already exists: {display_path}"
             ) from error
         published = True
-        _fsync_directory(parent)
-        os.unlink(temp_path)
-        _fsync_directory(parent)
+        os.fsync(parent_fd)
+        os.unlink(temp_name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
     except BaseException:
         if fd_open:
             os.close(fd)
         try:
-            os.unlink(temp_path)
+            os.unlink(temp_name, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
         # If publication already happened, the final name refers only to the
@@ -2013,7 +3103,7 @@ def _publish_json_no_replace(path: Path, value: Mapping[str, Any]) -> None:
         # explicit recovery call can verify identical bytes and fsync the dir.
         if not published:
             try:
-                _fsync_directory(parent)
+                os.fsync(parent_fd)
             except OSError:
                 pass
         raise
@@ -2026,13 +3116,21 @@ def finalize_identity_checkpoint(
     finalized_manifest_path: str | os.PathLike[str],
     trust: FinalizationTrust,
 ) -> dict[str, Any]:
-    manifest = _prepare_finalized_manifest(
+    manifest, parent_fd, final_name, display_path = _prepare_finalized_manifest(
         checkpoint_path,
         expected,
         finalized_manifest_path=finalized_manifest_path,
         trust=trust,
     )
-    _publish_json_no_replace(Path(finalized_manifest_path), manifest)
+    try:
+        _publish_json_no_replace_at(
+            parent_fd,
+            final_name,
+            manifest,
+            display_path=display_path,
+        )
+    finally:
+        os.close(parent_fd)
     return manifest
 
 
@@ -2044,16 +3142,27 @@ def recover_finalized_checkpoint_manifest(
     trust: FinalizationTrust,
 ) -> dict[str, Any]:
     """Recover only an identical complete final after a directory-fsync error."""
-    manifest = _prepare_finalized_manifest(
+    manifest, parent_fd, final_name, _display_path = _prepare_finalized_manifest(
         checkpoint_path,
         expected,
         finalized_manifest_path=finalized_manifest_path,
         trust=trust,
     )
-    existing, _raw_sha = strict_json_load_nofollow(finalized_manifest_path)
-    if existing != manifest:
-        raise ValueError(
-            "existing finalized manifest is not the exact expected manifest"
+    try:
+        existing, raw_sha = _strict_json_load_at(
+            parent_fd,
+            final_name,
+            where="existing finalized manifest",
         )
-    _fsync_directory(Path(finalized_manifest_path).parent.resolve(strict=True))
+        expected_bytes = canonical_json_bytes(manifest) + b"\n"
+        if (
+            existing != manifest
+            or raw_sha != hashlib.sha256(expected_bytes).hexdigest()
+        ):
+            raise ValueError(
+                "existing finalized manifest is not the exact expected manifest"
+            )
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
     return manifest

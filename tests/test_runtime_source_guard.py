@@ -12,6 +12,7 @@ import pytest
 from tabicl.train._provenance import (
     build_source_manifest_from_files,
     canonical_json_bytes,
+    make_manifest,
 )
 
 
@@ -49,6 +50,9 @@ def _run(
     tree=None,
     extra_env=None,
     bytecode_disabled=True,
+    trainer_args=None,
+    bootstrap_args=None,
+    script=SCRIPT,
 ):
     env = os.environ.copy()
     env["PYTHONPATH"] = str(root / "src") if pythonpath is None else str(pythonpath)
@@ -57,21 +61,25 @@ def _run(
     interpreter = [sys.executable, "-I"]
     if bytecode_disabled:
         interpreter.append("-B")
+    command = [
+        *interpreter,
+        str(script),
+        "--archive-root",
+        str(root),
+        "--source-manifest",
+        str(manifest_path),
+        "--expected-manifest-sha256",
+        manifest["sha256"],
+        "--expected-commit-sha",
+        commit or "1" * 40,
+        "--expected-tree-sha",
+        tree or "2" * 40,
+    ]
+    command.extend(bootstrap_args or [])
+    if trainer_args is not None:
+        command.extend(["--run-trainer", "--", *trainer_args])
     return subprocess.run(
-        [
-            *interpreter,
-            str(SCRIPT),
-            "--archive-root",
-            str(root),
-            "--source-manifest",
-            str(manifest_path),
-            "--expected-manifest-sha256",
-            manifest["sha256"],
-            "--expected-commit-sha",
-            commit or "1" * 40,
-            "--expected-tree-sha",
-            tree or "2" * 40,
-        ],
+        command,
         text=True,
         capture_output=True,
         env=env,
@@ -107,6 +115,142 @@ def test_isolated_guard_manual_prepend_wins_over_visible_editable_install(tmp_pa
     result = _run(root, manifest, manifest_path)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["import_relative_path"] == "src/tabicl/__init__.py"
+
+
+def test_restricted_bootstrap_runs_exact_candidate_trainer_in_same_process(tmp_path):
+    root = tmp_path / "candidate"
+    package = root / "src" / "tabicl"
+    train = package / "train"
+    train.mkdir(parents=True)
+    (package / "__init__.py").write_text("SOURCE = 'candidate'\n")
+    (train / "__init__.py").write_text("")
+    (train / "_provenance.py").write_text("SOURCE = 'candidate-provenance'\n")
+    (train / "_train_config.py").write_text(
+        "import argparse\n"
+        "def _bool(value):\n"
+        "    return value.lower() == 'true'\n"
+        "def build_parser():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('--marker', required=True)\n"
+        "    parser.add_argument('--formal_training', type=_bool, required=True)\n"
+        "    parser.add_argument('--formal_source_manifest', required=True)\n"
+        "    parser.add_argument('--formal_source_sha256', required=True)\n"
+        "    parser.add_argument('--formal_source_commit_sha', required=True)\n"
+        "    parser.add_argument('--formal_source_tree_sha', required=True)\n"
+        "    return parser\n"
+    )
+    (train / "_run.py").write_text(
+        "from pathlib import Path\n"
+        "import __main__\n"
+        "from tabicl.train._provenance import SOURCE\n"
+        "class Trainer:\n"
+        "    def __init__(self, config):\n"
+        "        self.config = config\n"
+        "    def train(self):\n"
+        "        Path(self.config.marker).write_text(\n"
+        "            SOURCE + ':' + __file__ + ':' + __main__.__file__\n"
+        "        )\n"
+    )
+    bootstrap = root / "scripts" / "verify_runtime_source.py"
+    bootstrap.parent.mkdir()
+    bootstrap.write_bytes(SCRIPT.read_bytes())
+    bootstrap.chmod(0o755)
+    tracked = {
+        path.relative_to(root).as_posix(): "100644"
+        for path in sorted(package.rglob("*.py"))
+    }
+    tracked["scripts/verify_runtime_source.py"] = "100755"
+    manifest = build_source_manifest_from_files(
+        root,
+        commit_sha="1" * 40,
+        tree_sha="2" * 40,
+        tracked=tracked,
+        code_roots=("scripts", "src/tabicl"),
+    )
+    manifest_path = tmp_path / "trusted-source.json"
+    manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+    marker = tmp_path / "trainer-ran"
+
+    visible = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            "import pathlib,tabicl; print(pathlib.Path(tabicl.__file__).resolve())",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert visible.returncode == 0, visible.stderr
+    assert Path(visible.stdout.strip()) != (package / "__init__.py").resolve()
+
+    stale_bootstrap = _run(
+        root,
+        manifest,
+        manifest_path,
+        trainer_args=[
+            "--marker",
+            str(marker),
+            "--formal_training",
+            "true",
+            "--formal_source_manifest",
+            str(manifest_path),
+            "--formal_source_sha256",
+            manifest["sha256"],
+            "--formal_source_commit_sha",
+            "1" * 40,
+            "--formal_source_tree_sha",
+            "2" * 40,
+        ],
+    )
+    assert stale_bootstrap.returncode != 0
+    assert "tracked exact-T verifier" in stale_bootstrap.stderr
+    assert not marker.exists()
+
+    result = _run(
+        root,
+        manifest,
+        manifest_path,
+        script=bootstrap,
+        trainer_args=[
+            "--marker",
+            str(marker),
+            "--formal_training",
+            "true",
+            "--formal_source_manifest",
+            str(manifest_path),
+            "--formal_source_sha256",
+            manifest["sha256"],
+            "--formal_source_commit_sha",
+            "1" * 40,
+            "--formal_source_tree_sha",
+            "2" * 40,
+        ],
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text().startswith("candidate-provenance:")
+    assert str(train.resolve()) in marker.read_text()
+    assert str(bootstrap.resolve()) in marker.read_text()
+    assert json.loads(result.stdout)["compute"] == "completed"
+
+
+@pytest.mark.parametrize("option", ["--module", "--command"])
+def test_restricted_bootstrap_rejects_arbitrary_execution_options(tmp_path, option):
+    root, manifest, manifest_path = _archive(tmp_path)
+    marker = tmp_path / "must-not-run"
+
+    result = _run(
+        root,
+        manifest,
+        manifest_path,
+        bootstrap_args=[option, f"touch {marker}"],
+    )
+
+    assert result.returncode != 0
+    assert "unrecognized arguments" in result.stderr
+    assert not marker.exists()
 
 
 def test_tracked_byte_edit_is_rejected(tmp_path):
@@ -146,6 +290,117 @@ def test_symlink_escape_is_rejected_before_import(tmp_path):
     result = _run(root, manifest, manifest_path)
     assert result.returncode != 0
     assert "symlink" in result.stderr
+
+
+def test_archive_root_parent_symlink_is_rejected(tmp_path):
+    actual_parent = tmp_path / "actual"
+    root, manifest, manifest_path = _archive(actual_parent)
+    alias = tmp_path / "alias"
+    alias.symlink_to(actual_parent, target_is_directory=True)
+
+    result = _run(alias / root.name, manifest, manifest_path)
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+
+
+def test_source_manifest_parent_symlink_is_rejected(tmp_path):
+    root, manifest, _manifest_path = _archive(tmp_path)
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    manifest_path = trusted / "source.json"
+    manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+    alias = tmp_path / "trusted-alias"
+    alias.symlink_to(trusted, target_is_directory=True)
+
+    result = _run(root, manifest, alias / manifest_path.name)
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+
+
+def test_regular_entry_parent_symlink_escape_is_rejected(tmp_path):
+    root, _manifest, _manifest_path = _archive(tmp_path)
+    docs = root / "docs"
+    docs.mkdir()
+    (docs / "note.txt").write_text("trusted bytes\n")
+    manifest = build_source_manifest_from_files(
+        root,
+        commit_sha="1" * 40,
+        tree_sha="2" * 40,
+        tracked={
+            "docs/note.txt": "100644",
+            "src/tabicl/__init__.py": "100644",
+            "src/tabicl/module.py": "100644",
+        },
+        code_roots=("src/tabicl",),
+    )
+    manifest_path = tmp_path / "parent-symlink-source.json"
+    manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+
+    outside = tmp_path / "outside-docs"
+    outside.mkdir()
+    (outside / "note.txt").write_text("trusted bytes\n")
+    (docs / "note.txt").unlink()
+    docs.rmdir()
+    docs.symlink_to(outside, target_is_directory=True)
+
+    result = _run(root, manifest, manifest_path)
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+
+
+def test_tracked_code_symlink_to_untracked_internal_payload_is_rejected_before_execution(
+    tmp_path,
+):
+    root, _manifest, _manifest_path = _archive(tmp_path)
+    marker = tmp_path / "tracked-symlink-executed"
+    payload = root / "src/payload.txt"
+    payload.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['SYMLINK_MARKER']).write_text('executed')\n"
+    )
+    module = root / "src/tabicl/module.py"
+    module.unlink()
+    module.symlink_to("../payload.txt")
+    (root / "src/tabicl/__init__.py").write_text("from . import module\n")
+    init_bytes = (root / "src/tabicl/__init__.py").read_bytes()
+    link_bytes = os.fsencode("../payload.txt")
+    manifest = make_manifest(
+        "source",
+        {
+            "commit_sha": "1" * 40,
+            "tree_sha": "2" * 40,
+            "code_roots": ["src/tabicl"],
+            "entries": [
+                {
+                    "path": "src/tabicl/__init__.py",
+                    "mode": "100644",
+                    "size": len(init_bytes),
+                    "sha256": hashlib.sha256(init_bytes).hexdigest(),
+                },
+                {
+                    "path": "src/tabicl/module.py",
+                    "mode": "120000",
+                    "size": len(link_bytes),
+                    "sha256": hashlib.sha256(link_bytes).hexdigest(),
+                },
+            ],
+        },
+    )
+    manifest_path = tmp_path / "tracked-symlink-source.json"
+    manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+
+    result = _run(
+        root,
+        manifest,
+        manifest_path,
+        extra_env={"SYMLINK_MARKER": str(marker)},
+    )
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert not marker.exists()
 
 
 def test_inherited_or_multi_entry_pythonpath_is_rejected(tmp_path):

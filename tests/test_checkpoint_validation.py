@@ -13,12 +13,13 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import torch
 
-from tabicl.train._identity_rng import TrainerIdentityRNG
+from tabicl.train._identity_rng import TrainerIdentityRNG, build_checkpoint_bundle
 from tabicl.train._provenance import (
     CheckpointExpectations,
     FinalizationTrust,
     ParentTrust,
     build_checkpoint_provenance,
+    build_optimizer_protocol,
     canonical_json_bytes,
     canonical_sha256,
     checkpoint_sha256,
@@ -26,6 +27,7 @@ from tabicl.train._provenance import (
     make_manifest,
     recover_finalized_checkpoint_manifest,
     validate_identity_checkpoint,
+    validate_parent_trust,
 )
 from tabicl.train._rng_state import capture_rank_rng_state, make_all_rank_rng_bundle
 
@@ -66,13 +68,79 @@ def _source_manifest(tag="a"):
 
 
 def _identity_fields(mode: str, *, seed: int, world_size: int):
-    controller = TrainerIdentityRNG(
-        identity_mode=mode, base_seed=seed, rank=0, world_size=world_size
-    )
-    fields = {"identity_treatment": controller.treatment_manifest()}
+    controllers = [
+        TrainerIdentityRNG(
+            identity_mode=mode,
+            base_seed=seed,
+            rank=rank,
+            world_size=world_size,
+        )
+        for rank in range(world_size)
+    ]
+    fields = {"identity_treatment": controllers[0].treatment_manifest()}
     if mode == "temporary":
-        fields.update(controller.checkpoint_fields())
+        fields["identity_sampler"] = build_checkpoint_bundle(
+            [controller.state_dict() for controller in controllers]
+        )
     return fields
+
+
+def _optimization_checkpoint_fields(
+    *,
+    terminal_step: int,
+    muon: bool = False,
+    amp: bool = False,
+    freeze_bias: bool = False,
+):
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(3, 2)
+
+    model = TinyModel()
+    if freeze_bias:
+        model.linear.bias.requires_grad_(False)
+    with torch.no_grad():
+        model.linear.weight.copy_(torch.arange(6, dtype=torch.float32).reshape(2, 3))
+        model.linear.bias.zero_()
+    if muon:
+        from tabicl.train._muon import Muon
+
+        optimizer = Muon(
+            [dict(params=list(model.parameters()), use_muon=True)],
+            lr=1e-4,
+            weight_decay=0.0,
+            momentum=0.9,
+            adamw_betas=(0.9, 0.999),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=0.0
+        )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    scaler = torch.GradScaler("cpu" if amp else "cuda", enabled=amp)
+    for _ in range(terminal_step):
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
+    protocol = build_optimizer_protocol(
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        scheduler_algorithm="constant",
+        scheduler_config={"max_steps": terminal_step},
+    )
+    return {
+        "state_dict": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "scaler_state": scaler.state_dict(),
+        "optimizer_protocol": protocol,
+    }
 
 
 def _checkpoint(
@@ -86,11 +154,17 @@ def _checkpoint(
     world_size=1,
     parent_manifest=None,
     environment=None,
+    muon=False,
+    amp=False,
+    freeze_bias=False,
 ):
-    state_dict = {
-        "linear.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
-        "linear.bias": torch.zeros(2),
-    }
+    optimization = _optimization_checkpoint_fields(
+        terminal_step=terminal_step,
+        muon=muon,
+        amp=amp,
+        freeze_bias=freeze_bias,
+    )
+    state_dict = optimization["state_dict"]
     model_config = {
         "embed_dim": 16,
         "row_nhead": 4,
@@ -103,15 +177,9 @@ def _checkpoint(
     checkpoint = {
         "config": model_config,
         "state_dict": state_dict,
-        "optimizer_state": {
-            "state": {0: {"exp_avg": torch.zeros(2), "step": torch.tensor(1.0)}},
-            "param_groups": [{"lr": 1e-4, "params": [0]}],
-        },
-        "scheduler_state": {
-            "last_epoch": terminal_step,
-            "_step_count": terminal_step + 1,
-        },
-        "scaler_state": {},
+        "optimizer_state": optimization["optimizer_state"],
+        "scheduler_state": optimization["scheduler_state"],
+        "scaler_state": optimization["scaler_state"],
         "curr_step": terminal_step,
         "rng_state": make_all_rank_rng_bundle(
             [capture_rank_rng_state(rank=rank) for rank in range(world_size)],
@@ -132,7 +200,7 @@ def _checkpoint(
         model_config=model_config,
         state_dict=state_dict,
         prior_stream=prior_stream,
-        optimizer_config={"name": "AdamW", "lr": 1e-4, "betas": [0.9, 0.999]},
+        optimizer_config=optimization["optimizer_protocol"],
         stage=stage,
         terminal_step=terminal_step,
         np_seed=np_seed,
@@ -146,7 +214,8 @@ def _checkpoint(
             "torch_seed": torch_seed,
             "identity_rng_seed": identity_seed,
             "lr": 1e-4,
-            "amp": False,
+            "amp": amp,
+            "muon": muon,
             "checkpoint_dir": f"outputs/study-a-{mode}",
             "wandb_name": f"study-a-{mode}",
         },
@@ -183,6 +252,7 @@ def _expectations(checkpoint, *, parent_trust=None):
         cuda_device_count=checkpoint["rng_state"]["rank_states"]["0"][
             "cuda_device_count"
         ],
+        max_checkpoint_bytes=64 << 20,
         parent_trust=parent_trust,
     )
 
@@ -232,6 +302,8 @@ def _validator_args(path: Path, expected: CheckpointExpectations) -> list[str]:
         str(expected.world_size),
         "--cuda-device-count",
         str(expected.cuda_device_count),
+        "--max-checkpoint-bytes",
+        str(expected.max_checkpoint_bytes),
     ]
 
 
@@ -356,6 +428,61 @@ def test_valid_formal_checkpoint_passes_weights_only_validation(tmp_path, mode):
     assert report["terminal_step"] == 10
 
 
+def test_checkpoint_byte_ceiling_is_external_and_checked_before_deserialization(
+    tmp_path, monkeypatch
+):
+    import tabicl.train._provenance as provenance_module
+
+    checkpoint = _checkpoint(mode="rope")
+    path = _save(tmp_path, checkpoint)
+    exact = replace(_expectations(checkpoint), max_checkpoint_bytes=path.stat().st_size)
+    assert (
+        validate_identity_checkpoint(path, exact)["checkpoint_size"]
+        == path.stat().st_size
+    )
+
+    called = False
+
+    def forbidden_load(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("torch.load must not run for oversized checkpoints")
+
+    monkeypatch.setattr(provenance_module.torch, "load", forbidden_load)
+    too_small = replace(exact, max_checkpoint_bytes=path.stat().st_size - 1)
+    with pytest.raises(ValueError, match="byte ceiling"):
+        validate_identity_checkpoint(path, too_small)
+    assert called is False
+
+
+@pytest.mark.parametrize("ceiling", [0, True])
+def test_checkpoint_byte_ceiling_must_be_a_positive_nonbool_integer(tmp_path, ceiling):
+    checkpoint = _checkpoint(mode="rope")
+    path = _save(tmp_path, checkpoint)
+    expected = replace(_expectations(checkpoint), max_checkpoint_bytes=ceiling)
+    with pytest.raises(ValueError, match="positive integer"):
+        validate_identity_checkpoint(path, expected)
+
+
+def test_empty_checkpoint_is_rejected_before_deserialization(tmp_path, monkeypatch):
+    import tabicl.train._provenance as provenance_module
+
+    checkpoint = _checkpoint(mode="rope")
+    path = tmp_path / "step-10.ckpt"
+    path.write_bytes(b"")
+    called = False
+
+    def forbidden_load(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("torch.load must not run for an empty checkpoint")
+
+    monkeypatch.setattr(provenance_module.torch, "load", forbidden_load)
+    with pytest.raises(ValueError, match="at least one byte"):
+        validate_identity_checkpoint(path, _expectations(checkpoint))
+    assert called is False
+
+
 def test_checkpoint_validator_cli_requires_all_external_expectations(tmp_path):
     checkpoint = _checkpoint(mode="temporary")
     expected = _expectations(checkpoint)
@@ -367,6 +494,13 @@ def test_checkpoint_validator_cli_requires_all_external_expectations(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["checkpoint_sha256"] == checkpoint_sha256(path)
+
+    missing_ceiling = _validator_args(path, expected)
+    index = missing_ceiling.index("--max-checkpoint-bytes")
+    del missing_ceiling[index : index + 2]
+    rejected = subprocess.run(missing_ceiling, text=True, capture_output=True)
+    assert rejected.returncode != 0
+    assert "--max-checkpoint-bytes" in rejected.stderr
 
 
 @pytest.mark.parametrize(
@@ -437,13 +571,27 @@ def test_protocol_budget_mutation_and_full_rehash_fails_external_protocol(tmp_pa
         validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
 
 
+def test_rehashed_stage_payload_rejects_unknown_field_by_exact_schema(tmp_path):
+    checkpoint = _checkpoint(mode="rope")
+    expected = _expectations(checkpoint)
+    stage = copy.deepcopy(checkpoint["provenance"]["manifests"]["stage"]["payload"])
+    stage["unexpected"] = "self-consistent"
+    _resign_bundle(checkpoint, "stage", stage)
+    _sync_protocol_manifests(checkpoint)
+
+    with pytest.raises(ValueError, match="stage payload keys mismatch"):
+        validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+
 def test_protocol_optimizer_mutation_and_full_rehash_fails_external_protocol(
     tmp_path,
 ):
     checkpoint = _checkpoint()
     expected = _expectations(checkpoint)
-    optimizer = dict(checkpoint["provenance"]["manifests"]["optimizer"]["payload"])
-    optimizer["lr"] = 2e-4
+    optimizer = copy.deepcopy(
+        checkpoint["provenance"]["manifests"]["optimizer"]["payload"]
+    )
+    optimizer["optimizer"]["groups"][0]["base_lr"] = 2e-4
     _resign_bundle(checkpoint, "optimizer", optimizer)
     _sync_protocol_manifests(checkpoint)
     expected = replace(
@@ -452,6 +600,29 @@ def test_protocol_optimizer_mutation_and_full_rehash_fails_external_protocol(
     )
 
     with pytest.raises(ValueError, match="cohort_protocol"):
+        validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+
+@pytest.mark.parametrize("component", ["optimizer", "scheduler", "scaler"])
+def test_rehashed_optimizer_protocol_rejects_unsupported_component_type(
+    tmp_path, component
+):
+    checkpoint = _checkpoint(mode="rope")
+    protocol = copy.deepcopy(
+        checkpoint["provenance"]["manifests"]["optimizer"]["payload"]
+    )
+    protocol[component]["type"] = "attacker.Unsupported"
+    _resign_bundle(checkpoint, "optimizer", protocol)
+    _sync_protocol_manifests(checkpoint)
+    manifests = checkpoint["provenance"]["manifests"]
+    expected = replace(
+        _expectations(checkpoint),
+        optimizer_sha256=manifests["optimizer"]["sha256"],
+        cohort_protocol_sha256=manifests["cohort_protocol"]["sha256"],
+        arm_protocol_sha256=manifests["arm_protocol"]["sha256"],
+    )
+
+    with pytest.raises(ValueError, match=f"{component} type.*unsupported"):
         validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
 
 
@@ -510,6 +681,17 @@ def test_sampler_rank_coverage_rng_rank_coverage_and_world_size_are_strict(tmp_p
         validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
 
 
+def test_world_size_two_formal_checkpoint_with_all_rank_state_passes(tmp_path):
+    checkpoint = _checkpoint(mode="temporary", world_size=2)
+    expected = _expectations(checkpoint)
+
+    report = validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+    assert report["mode"] == "temporary"
+    assert set(checkpoint["rng_state"]["rank_states"]) == {"0", "1"}
+    assert set(checkpoint["identity_sampler"]["rank_states"]) == {"0", "1"}
+
+
 def test_offline_rng_validation_uses_external_cuda_device_count_not_local_runtime(
     tmp_path,
 ):
@@ -565,16 +747,201 @@ def test_optimizer_param_id_integrity_is_strict(tmp_path, mutation, match):
     checkpoint = _checkpoint()
     expected = _expectations(checkpoint)
     optimizer = checkpoint["optimizer_state"]
+    parameter_ids = optimizer["param_groups"][0]["params"]
     if mutation == "foreign_state":
         optimizer["state"][99] = {"step": torch.tensor(1.0)}
     elif mutation == "duplicate_param":
-        optimizer["param_groups"].append({"lr": 1e-4, "params": [0]})
+        optimizer["param_groups"][0]["params"] = [
+            parameter_ids[0],
+            parameter_ids[0],
+        ]
     elif mutation == "bool_param":
-        optimizer["param_groups"][0]["params"] = [True]
+        optimizer["param_groups"][0]["params"] = [True, parameter_ids[1]]
     else:
         del optimizer["param_groups"][0]["params"]
     with pytest.raises(ValueError, match=match):
         validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+
+def test_optimizer_static_beta_drift_is_rejected_after_coherent_id_renumber(
+    tmp_path,
+):
+    checkpoint = _checkpoint(mode="rope")
+    expected = _expectations(checkpoint)
+    optimizer = checkpoint["optimizer_state"]
+    old_ids = optimizer["param_groups"][0]["params"]
+    new_ids = [41 + index for index in range(len(old_ids))]
+    optimizer["state"] = {
+        new: optimizer["state"][old] for old, new in zip(old_ids, new_ids)
+    }
+    optimizer["param_groups"][0]["params"] = new_ids
+    path = _save(tmp_path, checkpoint)
+    validate_identity_checkpoint(path, expected)
+
+    optimizer["param_groups"][0]["betas"] = (0.8, 0.999)
+
+    with pytest.raises(ValueError, match="betas"):
+        validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+
+def test_real_muon_optimizer_state_roundtrip_and_static_drift(tmp_path):
+    checkpoint = _checkpoint(mode="rope", muon=True)
+    expected = _expectations(checkpoint)
+    validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+    checkpoint["optimizer_state"]["param_groups"][0]["adamw_betas"] = (
+        0.8,
+        0.999,
+    )
+    with pytest.raises(ValueError, match="adamw_betas"):
+        validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+
+def test_frozen_parameter_without_optimizer_slot_is_accepted_end_to_end(tmp_path):
+    checkpoint = _checkpoint(mode="rope", freeze_bias=True)
+    protocol_group = checkpoint["provenance"]["manifests"]["optimizer"]["payload"][
+        "optimizer"
+    ]["groups"][0]
+    frozen = [
+        parameter
+        for parameter in protocol_group["parameters"]
+        if not parameter["requires_grad"]
+    ]
+
+    assert [parameter["name"] for parameter in frozen] == ["linear.bias"]
+    assert len(checkpoint["optimizer_state"]["state"]) == 1
+    validate_identity_checkpoint(_save(tmp_path, checkpoint), _expectations(checkpoint))
+
+
+def test_optimizer_protocol_excludes_dynamic_step_state():
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    scaler = torch.GradScaler("cpu", enabled=True)
+    arguments = {
+        "scheduler_algorithm": "constant",
+        "scheduler_config": {"max_steps": 10},
+    }
+    before = build_optimizer_protocol(model, optimizer, scheduler, scaler, **arguments)
+
+    loss = model(torch.ones((2, 3))).sum()
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    scheduler.step()
+    after = build_optimizer_protocol(model, optimizer, scheduler, scaler, **arguments)
+
+    assert after == before
+    assert after["scaler"]["static"]["device"] == "cpu"
+
+
+def test_adamw_pre_29_static_schema_without_decoupled_flag_is_accepted(tmp_path):
+    checkpoint = _checkpoint(mode="rope")
+    protocol = copy.deepcopy(
+        checkpoint["provenance"]["manifests"]["optimizer"]["payload"]
+    )
+    protocol_static = protocol["optimizer"]["groups"][0]["static"]
+    state_group = checkpoint["optimizer_state"]["param_groups"][0]
+    protocol_static.pop("decoupled_weight_decay", None)
+    state_group.pop("decoupled_weight_decay", None)
+    _resign_bundle(checkpoint, "optimizer", protocol)
+    _sync_protocol_manifests(checkpoint)
+
+    validate_identity_checkpoint(_save(tmp_path, checkpoint), _expectations(checkpoint))
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("use_muon", False, "use_muon"),
+        ("ns_steps", 0, "ns_steps"),
+        ("momentum", 1.0, "momentum"),
+        ("adamw_betas", [0.9, 1.0], "adamw_betas"),
+        ("adamw_eps", 0.0, "adamw_eps"),
+    ],
+)
+def test_muon_protocol_rejects_invalid_static_semantics(tmp_path, field, value, match):
+    checkpoint = _checkpoint(mode="rope", muon=True)
+    protocol = copy.deepcopy(
+        checkpoint["provenance"]["manifests"]["optimizer"]["payload"]
+    )
+    protocol["optimizer"]["groups"][0]["static"][field] = value
+    checkpoint["optimizer_state"]["param_groups"][0][field] = value
+    _resign_bundle(checkpoint, "optimizer", protocol)
+    _sync_protocol_manifests(checkpoint)
+
+    with pytest.raises(ValueError, match=match):
+        validate_identity_checkpoint(
+            _save(tmp_path, checkpoint), _expectations(checkpoint)
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        ("missing", "keys"),
+        ("extra", "keys"),
+        ("shape", "shape"),
+        ("dtype", "dtype"),
+    ],
+)
+def test_optimizer_moment_schema_is_strict(tmp_path, mutation, match):
+    checkpoint = _checkpoint(mode="rope")
+    expected = _expectations(checkpoint)
+    slot = next(iter(checkpoint["optimizer_state"]["state"].values()))
+    if mutation == "missing":
+        del slot["exp_avg_sq"]
+    elif mutation == "extra":
+        slot["attacker"] = torch.zeros(())
+    elif mutation == "shape":
+        slot["exp_avg"] = torch.zeros(1)
+    else:
+        slot["exp_avg"] = slot["exp_avg"].double()
+
+    with pytest.raises(ValueError, match=match):
+        validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+
+def test_adamw_step_rejects_bool_tensor_even_when_numeric_value_matches(tmp_path):
+    checkpoint = _checkpoint(mode="rope", terminal_step=1)
+    slot = next(iter(checkpoint["optimizer_state"]["state"].values()))
+    slot["step"] = torch.tensor(True)
+
+    with pytest.raises(ValueError, match="AdamW optimizer step tensor dtype"):
+        validate_identity_checkpoint(
+            _save(tmp_path, checkpoint), _expectations(checkpoint)
+        )
+
+
+@pytest.mark.parametrize("muon", [False, True])
+def test_configure_optimizer_keeps_frozen_parameters_in_ordinary_param_groups(muon):
+    from tabicl.train._run import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.raw_model = torch.nn.Linear(3, 2)
+    trainer.raw_model.bias.requires_grad = False
+    trainer.master_process = False
+    trainer.config = SimpleNamespace(
+        muon=muon,
+        lr=1e-4,
+        weight_decay=0.0,
+        beta1=0.9,
+        beta2=0.999,
+        use_cautious_wd=False,
+        scheduler="constant",
+        warmup_proportion=0.0,
+        warmup_steps=0,
+        max_steps=10,
+    )
+
+    trainer.configure_optimizer()
+
+    grouped = [
+        parameter
+        for group in trainer.optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    assert grouped == list(trainer.raw_model.parameters())
 
 
 def test_scheduler_and_enabled_scaler_structures_are_validated(tmp_path):
@@ -585,18 +952,19 @@ def test_scheduler_and_enabled_scaler_structures_are_validated(tmp_path):
         validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
 
     checkpoint = _checkpoint()
-    scientific = checkpoint["provenance"]["manifests"]["scientific_config"]["payload"]
+    optimizer_protocol = copy.deepcopy(
+        checkpoint["provenance"]["manifests"]["optimizer"]["payload"]
+    )
+    optimizer_protocol["scaler"]["enabled"] = True
     _resign_bundle(
         checkpoint,
-        "scientific_config",
-        {**scientific, "amp": True},
+        "optimizer",
+        optimizer_protocol,
     )
     _sync_protocol_manifests(checkpoint)
     expected = replace(
         _expectations(checkpoint),
-        scientific_sha256=checkpoint["provenance"]["manifests"]["scientific_config"][
-            "sha256"
-        ],
+        optimizer_sha256=checkpoint["provenance"]["manifests"]["optimizer"]["sha256"],
         cohort_protocol_sha256=checkpoint["provenance"]["manifests"]["cohort_protocol"][
             "sha256"
         ],
@@ -606,6 +974,192 @@ def test_scheduler_and_enabled_scaler_structures_are_validated(tmp_path):
     )
     with pytest.raises(ValueError, match="scaler_state"):
         validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+
+def test_enabled_scaler_roundtrip_and_static_corruption(tmp_path):
+    checkpoint = _checkpoint(mode="rope", amp=True)
+    expected = _expectations(checkpoint)
+    validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+    checkpoint["scaler_state"]["growth_factor"] = 3.0
+    with pytest.raises(ValueError, match="growth_factor"):
+        validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+
+def test_enabled_scaler_rejects_unusable_growth_tracker(tmp_path):
+    checkpoint = _checkpoint(mode="rope", amp=True)
+    checkpoint["scaler_state"]["_growth_tracker"] = 2**100
+
+    with pytest.raises(ValueError, match="scaler_state.*growth tracker"):
+        validate_identity_checkpoint(
+            _save(tmp_path, checkpoint), _expectations(checkpoint)
+        )
+
+
+def test_disabled_scaler_protocol_rejects_malformed_static_value(tmp_path):
+    checkpoint = _checkpoint(mode="rope")
+    protocol = copy.deepcopy(
+        checkpoint["provenance"]["manifests"]["optimizer"]["payload"]
+    )
+    protocol["scaler"]["static"]["init_scale"] = "not-a-number"
+    _resign_bundle(checkpoint, "optimizer", protocol)
+    _sync_protocol_manifests(checkpoint)
+
+    with pytest.raises(ValueError, match="scaler static init_scale"):
+        validate_identity_checkpoint(
+            _save(tmp_path, checkpoint), _expectations(checkpoint)
+        )
+
+
+def test_scaler_protocol_rejects_unknown_device(tmp_path):
+    checkpoint = _checkpoint(mode="rope")
+    protocol = copy.deepcopy(
+        checkpoint["provenance"]["manifests"]["optimizer"]["payload"]
+    )
+    protocol["scaler"]["static"]["device"] = "attacker"
+    _resign_bundle(checkpoint, "optimizer", protocol)
+    _sync_protocol_manifests(checkpoint)
+
+    with pytest.raises(ValueError, match="scaler static device"):
+        validate_identity_checkpoint(
+            _save(tmp_path, checkpoint), _expectations(checkpoint)
+        )
+
+
+def test_adamw_protocol_requires_betas_when_checkpoint_matches_omission(tmp_path):
+    checkpoint = _checkpoint(mode="rope")
+    protocol = copy.deepcopy(
+        checkpoint["provenance"]["manifests"]["optimizer"]["payload"]
+    )
+    del protocol["optimizer"]["groups"][0]["static"]["betas"]
+    del checkpoint["optimizer_state"]["param_groups"][0]["betas"]
+    _resign_bundle(checkpoint, "optimizer", protocol)
+    _sync_protocol_manifests(checkpoint)
+
+    with pytest.raises(ValueError, match="AdamW static.*betas"):
+        validate_identity_checkpoint(
+            _save(tmp_path, checkpoint), _expectations(checkpoint)
+        )
+
+
+@pytest.mark.parametrize("mutation", ["base", "current", "coherent_terminal"])
+def test_scheduler_lr_binding_rejects_drift(tmp_path, mutation):
+    checkpoint = _checkpoint(mode="rope")
+    expected = _expectations(checkpoint)
+    if mutation == "base":
+        checkpoint["scheduler_state"]["base_lrs"][0] = 2e-4
+    elif mutation == "current":
+        checkpoint["optimizer_state"]["param_groups"][0]["lr"] = 2e-4
+    else:
+        checkpoint["optimizer_state"]["param_groups"][0]["lr"] = 2e-4
+        checkpoint["scheduler_state"]["_last_lr"][0] = 2e-4
+
+    with pytest.raises(ValueError, match="scheduler_state"):
+        validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
+
+
+@pytest.mark.parametrize(
+    "algorithm",
+    [
+        "constant",
+        "linear_warmup",
+        "cosine_warmup",
+        "cosine_with_restarts",
+        "polynomial_decay_warmup",
+    ],
+)
+def test_real_supported_scheduler_state_roundtrips(algorithm):
+    import tabicl.train._provenance as provenance_module
+    from tabicl.train._optim import get_scheduler
+
+    max_steps = 4
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    config = SimpleNamespace(
+        scheduler=algorithm,
+        max_steps=max_steps,
+        warmup_proportion=-1.0,
+        warmup_steps=1,
+        cosine_num_cycles=1,
+        cosine_amplitude_decay=1.0,
+        cosine_lr_end=0.0,
+        poly_decay_lr_end=0.0,
+        poly_decay_power=1.0,
+    )
+    scheduler = get_scheduler(config, optimizer)
+    static = {"max_steps": max_steps}
+    if algorithm != "constant":
+        static["warmup_steps"] = 1
+    if algorithm == "cosine_with_restarts":
+        static.update({"num_cycles": 1, "amplitude_decay": 1.0, "lr_end": 0.0})
+    elif algorithm == "polynomial_decay_warmup":
+        static.update({"lr_end": 0.0, "power": 1.0})
+    scaler = torch.GradScaler("cuda", enabled=False)
+    protocol = build_optimizer_protocol(
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        scheduler_algorithm=algorithm,
+        scheduler_config=static,
+    )
+    for _ in range(max_steps):
+        for parameter in model.parameters():
+            parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
+
+    provenance_module._validate_optimizer_protocol(protocol)
+    provenance_module._validate_scheduler_state(
+        scheduler.state_dict(),
+        terminal_step=max_steps,
+        protocol=protocol,
+        current_lrs=[group["lr"] for group in optimizer.param_groups],
+        base_lrs=[group["base_lr"] for group in protocol["optimizer"]["groups"]],
+    )
+
+
+def test_legacy_scheduler_private_state_schema_is_accepted(tmp_path):
+    checkpoint = _checkpoint(mode="rope")
+    checkpoint["scheduler_state"].pop("_is_initial", None)
+    checkpoint["scheduler_state"]["verbose"] = False
+
+    validate_identity_checkpoint(_save(tmp_path, checkpoint), _expectations(checkpoint))
+
+
+@pytest.mark.parametrize(
+    "algorithm,field,value,match",
+    [
+        ("linear_warmup", "warmup_steps", 11, "warmup_steps"),
+        ("cosine_with_restarts", "num_cycles", 0, "num_cycles"),
+        ("cosine_with_restarts", "amplitude_decay", 1.1, "amplitude_decay"),
+        ("cosine_with_restarts", "lr_end", -1e-5, "lr_end"),
+        ("polynomial_decay_warmup", "power", 0.0, "power"),
+    ],
+)
+def test_scheduler_protocol_rejects_invalid_static_semantics(
+    tmp_path, algorithm, field, value, match
+):
+    checkpoint = _checkpoint(mode="rope")
+    protocol = copy.deepcopy(
+        checkpoint["provenance"]["manifests"]["optimizer"]["payload"]
+    )
+    protocol["scheduler"]["algorithm"] = algorithm
+    static = {"max_steps": 10, "warmup_steps": 1}
+    if algorithm == "cosine_with_restarts":
+        static.update({"num_cycles": 1, "amplitude_decay": 1.0, "lr_end": 0.0})
+    elif algorithm == "polynomial_decay_warmup":
+        static.update({"lr_end": 0.0, "power": 1.0})
+    static[field] = value
+    protocol["scheduler"]["static"] = static
+    _resign_bundle(checkpoint, "optimizer", protocol)
+    _sync_protocol_manifests(checkpoint)
+
+    with pytest.raises(ValueError, match=match):
+        validate_identity_checkpoint(
+            _save(tmp_path, checkpoint), _expectations(checkpoint)
+        )
 
 
 @pytest.mark.parametrize(
@@ -698,6 +1252,8 @@ def _finalization_setup(tmp_path: Path):
                     "torch_seed": 13,
                     "identity_rng_seed": 17,
                     "world_size": 1,
+                    "cuda_device_count": 0,
+                    "max_checkpoint_bytes": expected.max_checkpoint_bytes,
                     "source_sha256": manifests["source"]["sha256"],
                     "environment_sha256": manifests["environment"]["sha256"],
                     "prior_sha256": manifests["prior"]["sha256"],
@@ -721,6 +1277,14 @@ def _finalization_setup(tmp_path: Path):
         artifact_identity="temporary-stage1-final",
     )
     return checkpoint_path, final_path, checkpoint, expected, trust
+
+
+def _rewrite_finalization_ledger_entry(trust: FinalizationTrust, **updates):
+    ledger = json.loads(trust.transaction_ledger_path.read_text())
+    ledger["payload"]["entries"][0].update(updates)
+    ledger = make_manifest("transaction_ledger", ledger["payload"])
+    _write_json(trust.transaction_ledger_path, ledger)
+    return replace(trust, transaction_ledger_sha256=ledger["sha256"])
 
 
 def _finalization_cli_args(
@@ -783,6 +1347,7 @@ def test_finalized_manifest_is_write_once_durable_and_records_exact_checkpoint(
         checkpoint_path
     )
     assert manifest["payload"]["checkpoint_size"] == checkpoint_path.stat().st_size
+    assert manifest["payload"]["max_checkpoint_bytes"] == expected.max_checkpoint_bytes
     assert (
         manifest["payload"]["provenance_sha256"]
         == checkpoint["provenance"]["bundle_sha256"]
@@ -797,6 +1362,37 @@ def test_finalized_manifest_is_write_once_durable_and_records_exact_checkpoint(
             trust=trust,
         )
     assert final_path.read_bytes() == original
+
+
+def test_fd_published_final_is_consumable_as_exact_parent(tmp_path):
+    checkpoint_path, final_path, _checkpoint_value, expected, trust = (
+        _finalization_setup(tmp_path)
+    )
+    finalized = finalize_identity_checkpoint(
+        checkpoint_path,
+        expected,
+        finalized_manifest_path=final_path,
+        trust=trust,
+    )
+    parent_trust = ParentTrust(
+        checkpoint_path=checkpoint_path,
+        finalized_manifest_path=final_path,
+        transaction_ledger_path=trust.transaction_ledger_path,
+        transaction_ledger_sha256=trust.transaction_ledger_sha256,
+        study_id=trust.study_id,
+        arm=expected.mode,
+        parent_stage=expected.stage,
+        upstream_identity=trust.upstream_identity,
+        artifact_identity=trust.artifact_identity,
+        artifact_root=trust.artifact_root,
+    )
+
+    validated = validate_parent_trust(parent_trust)
+
+    assert validated.checkpoint_sha256 == finalized["payload"]["checkpoint_sha256"]
+    assert validated.manifest["payload"]["parent"]["finalized_manifest_sha256"] == (
+        finalized["sha256"]
+    )
 
 
 def test_finalization_study_must_match_checkpoint_operational_provenance(tmp_path):
@@ -822,6 +1418,88 @@ def test_finalization_study_must_match_checkpoint_operational_provenance(tmp_pat
             trust=attacker_trust,
         )
     assert not final_path.exists()
+
+
+def test_finalization_rejects_symlinked_artifact_root(tmp_path):
+    checkpoint_path, final_path, _checkpoint_value, expected, trust = (
+        _finalization_setup(tmp_path)
+    )
+    alias = tmp_path / "artifact-root-alias"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    trust = replace(trust, artifact_root=alias)
+
+    with pytest.raises(ValueError, match="symlink"):
+        finalize_identity_checkpoint(
+            checkpoint_path,
+            expected,
+            finalized_manifest_path=alias / final_path.name,
+            trust=trust,
+        )
+    assert not final_path.exists()
+
+
+def test_finalization_rejects_symlinked_ledger_parent(tmp_path):
+    checkpoint_path, _final_path, _checkpoint_value, expected, trust = (
+        _finalization_setup(tmp_path)
+    )
+    real_parent = tmp_path / "real-final-parent"
+    real_parent.mkdir()
+    alias = tmp_path / "ledger-parent-alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    final_path = alias / "final.json"
+    trust = _rewrite_finalization_ledger_entry(
+        trust, finalized_manifest_relpath=f"{alias.name}/{final_path.name}"
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        finalize_identity_checkpoint(
+            checkpoint_path,
+            expected,
+            finalized_manifest_path=final_path,
+            trust=trust,
+        )
+    assert not (real_parent / final_path.name).exists()
+
+
+def test_finalization_rejects_symlinked_actual_parent_alias(tmp_path):
+    checkpoint_path, _final_path, _checkpoint_value, expected, trust = (
+        _finalization_setup(tmp_path)
+    )
+    real_parent = tmp_path / "real-final-parent"
+    real_parent.mkdir()
+    alias = tmp_path / "actual-parent-alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    final_path = alias / "final.json"
+    trust = _rewrite_finalization_ledger_entry(
+        trust, finalized_manifest_relpath=f"{real_parent.name}/{final_path.name}"
+    )
+
+    with pytest.raises(ValueError, match="symlink|path"):
+        finalize_identity_checkpoint(
+            checkpoint_path,
+            expected,
+            finalized_manifest_path=final_path,
+            trust=trust,
+        )
+    assert not (real_parent / final_path.name).exists()
+
+
+def test_finalization_rejects_existing_final_symlink_without_touching_target(tmp_path):
+    checkpoint_path, final_path, _checkpoint_value, expected, trust = (
+        _finalization_setup(tmp_path)
+    )
+    target = tmp_path / "must-not-change"
+    target.write_text("sentinel")
+    final_path.symlink_to(target)
+
+    with pytest.raises(ValueError, match="already exists|symlink"):
+        finalize_identity_checkpoint(
+            checkpoint_path,
+            expected,
+            finalized_manifest_path=final_path,
+            trust=trust,
+        )
+    assert target.read_text() == "sentinel"
 
 
 def test_finalization_race_has_exactly_one_winner(tmp_path):
@@ -979,7 +1657,41 @@ def _parent_trust(
         np_seed=np_seed,
         environment=environment,
     )
-    parent_path = _save(tmp_path, parent, name=f"parent-{mode}.ckpt")
+    if parent_stage != "stage1":
+        manifests = parent["provenance"]["manifests"]
+        predecessor = "stage1" if parent_stage == "stage2" else "stage2"
+        _resign_bundle(
+            parent,
+            "parent",
+            {
+                "parent": {
+                    "checkpoint_sha256": "0" * 64,
+                    "finalized_manifest_sha256": "1" * 64,
+                    "transaction_ledger_sha256": "2" * 64,
+                    "study_id": "study-a",
+                    "arm": mode,
+                    "stage": predecessor,
+                    "terminal_step": max(1, terminal_step - 10),
+                    "upstream_identity": f"study-a:{mode}:{predecessor}",
+                    "artifact_identity": f"{mode}-{predecessor}-final",
+                    "np_seed": np_seed,
+                    "torch_seed": 13,
+                    "identity_rng_seed": 17,
+                    "world_size": 1,
+                    "cuda_device_count": 0,
+                    "max_checkpoint_bytes": 64 << 20,
+                    "source_sha256": manifests["source"]["sha256"],
+                    "environment_sha256": manifests["environment"]["sha256"],
+                    "prior_sha256": manifests["prior"]["sha256"],
+                    "architecture_sha256": manifests["architecture"]["sha256"],
+                    "optimizer_sha256": manifests["optimizer"]["sha256"],
+                    "scientific_sha256": manifests["scientific_config"]["sha256"],
+                    "cohort_protocol_sha256": manifests["cohort_protocol"]["sha256"],
+                    "arm_protocol_sha256": manifests["arm_protocol"]["sha256"],
+                }
+            },
+        )
+    parent_path = _save(tmp_path, parent, name=f"step-{terminal_step}.ckpt")
     parent_digest = checkpoint_sha256(parent_path)
     manifests = parent["provenance"]["manifests"]
     final = make_manifest(
@@ -1004,6 +1716,8 @@ def _parent_trust(
             "scientific_sha256": manifests["scientific_config"]["sha256"],
             "cohort_protocol_sha256": manifests["cohort_protocol"]["sha256"],
             "arm_protocol_sha256": manifests["arm_protocol"]["sha256"],
+            "cuda_device_count": 0,
+            "max_checkpoint_bytes": 64 << 20,
         },
     )
     final_path = tmp_path / f"final-{mode}.json"
@@ -1025,6 +1739,8 @@ def _parent_trust(
                     "torch_seed": 13,
                     "identity_rng_seed": 17,
                     "world_size": 1,
+                    "cuda_device_count": 0,
+                    "max_checkpoint_bytes": 64 << 20,
                     "source_sha256": manifests["source"]["sha256"],
                     "environment_sha256": manifests["environment"]["sha256"],
                     "prior_sha256": manifests["prior"]["sha256"],
@@ -1068,6 +1784,8 @@ def _parent_trust(
                 "torch_seed": 13,
                 "identity_rng_seed": 17,
                 "world_size": 1,
+                "cuda_device_count": 0,
+                "max_checkpoint_bytes": 64 << 20,
                 "source_sha256": manifests["source"]["sha256"],
                 "environment_sha256": manifests["environment"]["sha256"],
                 "prior_sha256": manifests["prior"]["sha256"],
@@ -1090,6 +1808,69 @@ def test_stage1_requires_explicit_null_parent(tmp_path):
     with pytest.raises(ValueError, match="Stage 1.*null parent"):
         validate_identity_checkpoint(_save(tmp_path, checkpoint), expected)
     assert parent["payload"] == {"parent": None}
+
+
+def test_parent_ledger_ceiling_is_enforced_before_deserialization(
+    tmp_path, monkeypatch
+):
+    import tabicl.train._provenance as provenance_module
+
+    trust, _parent_manifest = _parent_trust(tmp_path)
+    ledger = json.loads(trust.transaction_ledger_path.read_text())
+    ledger["payload"]["entries"][0]["max_checkpoint_bytes"] = (
+        trust.checkpoint_path.stat().st_size - 1
+    )
+    ledger = make_manifest("transaction_ledger", ledger["payload"])
+    _write_json(trust.transaction_ledger_path, ledger)
+    final_payload = json.loads(trust.finalized_manifest_path.read_text())["payload"]
+    final_payload["max_checkpoint_bytes"] = ledger["payload"]["entries"][0][
+        "max_checkpoint_bytes"
+    ]
+    _write_json(
+        trust.finalized_manifest_path,
+        make_manifest("finalized_checkpoint", final_payload),
+    )
+    trust = replace(trust, transaction_ledger_sha256=ledger["sha256"])
+    called = False
+
+    def forbidden_load(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("parent torch.load must not run above the ceiling")
+
+    monkeypatch.setattr(provenance_module.torch, "load", forbidden_load)
+    with pytest.raises(ValueError, match="byte ceiling"):
+        validate_parent_trust(trust)
+    assert called is False
+
+
+def test_parent_final_ceiling_must_equal_immutable_ledger(tmp_path):
+    trust, _parent_manifest = _parent_trust(tmp_path)
+    finalized = json.loads(trust.finalized_manifest_path.read_text())
+    finalized["payload"]["max_checkpoint_bytes"] -= 1
+    _write_json(
+        trust.finalized_manifest_path,
+        make_manifest("finalized_checkpoint", finalized["payload"]),
+    )
+
+    with pytest.raises(ValueError, match="max_checkpoint_bytes"):
+        validate_parent_trust(trust)
+
+
+def test_parent_ledger_relative_path_rejects_symlink_component(tmp_path):
+    trust, _parent_manifest = _parent_trust(tmp_path)
+    alias = tmp_path / "artifact-alias"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    ledger = json.loads(trust.transaction_ledger_path.read_text())
+    ledger["payload"]["entries"][0][
+        "checkpoint_relpath"
+    ] = f"{alias.name}/{trust.checkpoint_path.name}"
+    ledger = make_manifest("transaction_ledger", ledger["payload"])
+    _write_json(trust.transaction_ledger_path, ledger)
+    trust = replace(trust, transaction_ledger_sha256=ledger["sha256"])
+
+    with pytest.raises(ValueError, match="symlink"):
+        validate_parent_trust(trust)
 
 
 def test_formal_stage1_rejects_implicit_checkpoint_discovery(tmp_path):
@@ -1115,6 +1896,42 @@ def test_stage2_parent_is_bound_to_exact_bytes_ledger_and_final_manifest(tmp_pat
     )
     expected = _expectations(child, parent_trust=trust)
     validate_identity_checkpoint(_save(tmp_path, child), expected)
+
+
+def test_parent_strict_core_rejects_rehashed_prior_cursor_attack(tmp_path):
+    trust, parent_manifest = _parent_trust(tmp_path)
+    child = _checkpoint(
+        stage="stage2", terminal_step=20, parent_manifest=parent_manifest
+    )
+
+    parent = torch.load(trust.checkpoint_path, map_location="cpu", weights_only=True)
+    parent["prior_stream"]["cursor"] = 9
+    prior_without_hash = {
+        key: value
+        for key, value in parent["prior_stream"].items()
+        if key != "manifest_sha256"
+    }
+    parent["prior_stream"]["manifest_sha256"] = hashlib.sha256(
+        repr(
+            {key: prior_without_hash[key] for key in sorted(prior_without_hash)}
+        ).encode()
+    ).hexdigest()
+    torch.save(parent, trust.checkpoint_path)
+
+    final_payload = json.loads(trust.finalized_manifest_path.read_text())["payload"]
+    final_payload["checkpoint_sha256"] = checkpoint_sha256(trust.checkpoint_path)
+    final_payload["checkpoint_size"] = trust.checkpoint_path.stat().st_size
+    finalized = make_manifest("finalized_checkpoint", final_payload)
+    _write_json(trust.finalized_manifest_path, finalized)
+
+    parent_record = copy.deepcopy(parent_manifest["payload"]["parent"])
+    parent_record["checkpoint_sha256"] = final_payload["checkpoint_sha256"]
+    parent_record["finalized_manifest_sha256"] = finalized["sha256"]
+    _resign_bundle(child, "parent", {"parent": parent_record})
+    expected = _expectations(child, parent_trust=trust)
+
+    with pytest.raises(ValueError, match="prior cursor"):
+        validate_identity_checkpoint(_save(tmp_path, child), expected)
 
 
 @pytest.mark.parametrize(
@@ -1228,6 +2045,104 @@ def test_real_trainer_stage_transition_consumes_ledger_derived_parent_fields(
 
 
 @pytest.mark.parametrize(
+    "field,trust_attribute",
+    [
+        ("checkpoint_path", "checkpoint_path"),
+        ("formal_transaction_ledger", "transaction_ledger_path"),
+    ],
+)
+def test_formal_trainer_rejects_symlinked_parent_trust_input(
+    tmp_path, field, trust_attribute
+):
+    from tabicl.train._run import Trainer
+
+    trust, _parent_manifest = _parent_trust(tmp_path)
+    alias = tmp_path / "trust-alias"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    values = {
+        "formal_stage": "stage2",
+        "formal_transaction_ledger": str(trust.transaction_ledger_path),
+        "formal_transaction_ledger_sha256": trust.transaction_ledger_sha256,
+        "formal_parent_finalized_manifest": str(trust.finalized_manifest_path),
+        "formal_parent_stage": "stage1",
+        "formal_parent_upstream_identity": trust.upstream_identity,
+        "formal_parent_artifact_identity": trust.artifact_identity,
+        "formal_artifact_root": str(trust.artifact_root),
+        "formal_study_id": "study-a",
+        "checkpoint_path": str(trust.checkpoint_path),
+        "only_load_model": True,
+        "row_identity_mode": "temporary",
+        "np_seed": 11,
+        "torch_seed": 13,
+        "identity_rng_seed": 17,
+    }
+    values[field] = str(alias / getattr(trust, trust_attribute).name)
+    trainer = Trainer.__new__(Trainer)
+    trainer.ddp_world_size = 1
+    trainer.config = SimpleNamespace(**values)
+
+    with pytest.raises(ValueError, match="symlink"):
+        trainer._formal_parent_manifest()
+
+
+def test_formal_trainer_consumes_same_fd_validated_parent_after_path_swap(
+    tmp_path, monkeypatch
+):
+    import tabicl.train._run as run_module
+
+    trust, expected_parent = _parent_trust(tmp_path)
+    original = torch.load(trust.checkpoint_path, map_location="cpu", weights_only=True)
+    trainer = run_module.Trainer.__new__(run_module.Trainer)
+    trainer.ddp_world_size = 1
+    trainer.ddp_rank = 0
+    trainer.config = SimpleNamespace(
+        formal_stage="stage2",
+        formal_training=True,
+        formal_transaction_ledger=str(trust.transaction_ledger_path),
+        formal_transaction_ledger_sha256=trust.transaction_ledger_sha256,
+        formal_parent_finalized_manifest=str(trust.finalized_manifest_path),
+        formal_parent_stage="stage1",
+        formal_parent_upstream_identity=trust.upstream_identity,
+        formal_parent_artifact_identity=trust.artifact_identity,
+        formal_artifact_root=str(trust.artifact_root),
+        formal_study_id="study-a",
+        checkpoint_path=str(trust.checkpoint_path),
+        checkpoint_dir=None,
+        only_load_model=True,
+        row_identity_mode="temporary",
+        np_seed=11,
+        torch_seed=13,
+        identity_rng_seed=17,
+        device="cpu",
+    )
+    trainer.identity_rng = SimpleNamespace(
+        restore_checkpoint=lambda *args, **kwargs: None
+    )
+    loaded = {}
+    trainer.raw_model = SimpleNamespace(
+        load_state_dict=lambda state: loaded.update(copy.deepcopy(state))
+    )
+
+    assert trainer._formal_parent_manifest() == expected_parent
+    attacker = copy.deepcopy(original)
+    attacker["state_dict"]["linear.weight"] = torch.full((2, 3), 999.0)
+    replacement = tmp_path / "replacement.ckpt"
+    torch.save(attacker, replacement)
+    replacement.replace(trust.checkpoint_path)
+
+    monkeypatch.setattr(
+        run_module.torch,
+        "load",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("formal parent pathname was reopened")
+        ),
+    )
+    trainer.load_checkpoint()
+
+    assert torch.equal(loaded["linear.weight"], original["state_dict"]["linear.weight"])
+
+
+@pytest.mark.parametrize(
     "child_stage,parent_stage,parent_step,child_step",
     [("stage2", "stage1", 10, 20), ("stage3", "stage2", 20, 30)],
 )
@@ -1311,9 +2226,12 @@ def test_real_trainer_builds_formal_stage2_and_stage3_provenance(
     trainer.config = config
     trainer.ddp_world_size = 1
     trainer.model_config = parent_checkpoint["config"]
-    trainer.raw_model = SimpleNamespace(
-        state_dict=lambda: parent_checkpoint["state_dict"]
-    )
+    trainer.raw_model = torch.nn.Module()
+    trainer.raw_model.linear = torch.nn.Linear(3, 2)
+    trainer.raw_model.load_state_dict(parent_checkpoint["state_dict"])
+    trainer.master_process = False
+    trainer.configure_optimizer()
+    trainer.configure_amp()
     trainer.identity_rng = TrainerIdentityRNG(
         identity_mode="temporary", base_seed=17, rank=0, world_size=1
     )
@@ -1374,3 +2292,33 @@ def test_parent_rejects_swapped_valid_checkpoint_redirected_sidecar_and_self_rep
         handle.write(b"attacker")
     with pytest.raises(ValueError, match="parent checkpoint sha256"):
         validate_identity_checkpoint(child_path, expected)
+
+
+def test_parent_finite_weight_mutation_with_unchanged_final_fails(tmp_path):
+    trust, parent_manifest = _parent_trust(tmp_path)
+    child = _checkpoint(
+        stage="stage2", terminal_step=20, parent_manifest=parent_manifest
+    )
+    expected = _expectations(child, parent_trust=trust)
+    parent = torch.load(trust.checkpoint_path, map_location="cpu", weights_only=True)
+    parent["state_dict"]["linear.weight"][0, 0] += 1.0
+    torch.save(parent, trust.checkpoint_path)
+
+    with pytest.raises(ValueError, match="parent checkpoint sha256"):
+        validate_identity_checkpoint(_save(tmp_path, child), expected)
+
+
+def test_child_parent_checkpoint_digest_one_nibble_drift_fails(tmp_path):
+    trust, parent_manifest = _parent_trust(tmp_path)
+    child = _checkpoint(
+        stage="stage2", terminal_step=20, parent_manifest=parent_manifest
+    )
+    parent_record = copy.deepcopy(parent_manifest["payload"]["parent"])
+    digest = parent_record["checkpoint_sha256"]
+    parent_record["checkpoint_sha256"] = ("0" if digest[0] != "0" else "1") + digest[1:]
+    _resign_bundle(child, "parent", {"parent": parent_record})
+
+    with pytest.raises(ValueError, match="parent manifest"):
+        validate_identity_checkpoint(
+            _save(tmp_path, child), _expectations(child, parent_trust=trust)
+        )
