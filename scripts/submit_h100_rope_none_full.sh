@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GPU_COUNT="${1:?usage: $0 {1|2|4}}"
+GPU_COUNT="${1:?usage: $0 GPU_COUNT}"
 case "$GPU_COUNT" in 1|2|4) ;; *) echo "invalid GPU_COUNT=$GPU_COUNT" >&2; exit 2 ;; esac
 CPU_COUNT=$((GPU_COUNT * 64))
 MEMORY_GB=$((GPU_COUNT * 128))
 if [[ "$GPU_COUNT" -le 2 ]]; then
   QOS=long
-  TIME_ARGS=()
+  TIME_LIMIT=""
 else
   QOS=medium
-  TIME_ARGS=(--time=23:30:00)
+  TIME_LIMIT="23:30:00"
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +22,10 @@ submit_stage() {
   local stage="$2"
   local dependency="${3:-}"
   local args=(--parsable --qos="$QOS" --gres="gpu:$GPU_COUNT" \
-    --cpus-per-task="$CPU_COUNT" --mem="${MEMORY_GB}G" "${TIME_ARGS[@]}")
+    --cpus-per-task="$CPU_COUNT" --mem="${MEMORY_GB}G")
+  if [[ -n "$TIME_LIMIT" ]]; then
+    args+=(--time="$TIME_LIMIT")
+  fi
   if [[ -n "$dependency" ]]; then
     args+=(--dependency="afterok:$dependency")
   fi
