@@ -16,7 +16,9 @@ an infinite stream of synthetic datasets with diverse characteristics.
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
+import random
 
 import sys
 import math
@@ -34,7 +36,7 @@ import torch.nn.functional as F
 from sklearn.ensemble import ExtraTreesRegressor
 from torch import Tensor
 from torch.nested import nested_tensor
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 from .graph_lib._config import PriorConfig
 from ._mlp_scm import MLPSCM
@@ -208,6 +210,12 @@ class Prior:
             The sampled sequence length
         """
         if min_seq_len is None:
+            return max_seq_len
+
+        # Equal bounds intentionally express a fixed sequence length.  This is
+        # also used by maximum-sequence smoke tests and must not reach randint,
+        # whose upper bound is exclusive.
+        if min_seq_len == max_seq_len:
             return max_seq_len
 
         if log:
@@ -1440,6 +1448,131 @@ class PriorDataset(IterableDataset):
         self.max_train_size = max_train_size
         self.device = device
         self.prior_type = prior_type
+        self._logical_stream = None
+
+    def configure_logical_stream(
+        self,
+        *,
+        schema: str,
+        experiment_seed: int,
+        ddp_rank: int,
+        world_size: int,
+        cursor: int = 0,
+    ) -> None:
+        """Make every generated batch a pure function of its logical index."""
+        if not isinstance(schema, str) or not schema:
+            raise ValueError("prior stream schema must be a non-empty string")
+        if isinstance(experiment_seed, bool) or not isinstance(experiment_seed, int):
+            raise TypeError("prior stream experiment_seed must be an integer")
+        if world_size < 1:
+            raise ValueError("prior stream world_size must be positive")
+        if ddp_rank < 0 or ddp_rank >= world_size:
+            raise ValueError("prior stream ddp_rank must be within world_size")
+        if cursor < 0:
+            raise ValueError("prior stream cursor must be non-negative")
+        self._logical_stream = {
+            "schema_version": 1,
+            "algorithm": "sha256-schema-seed-rank-logical-step-v1",
+            "schema": schema,
+            "schema_sha256": hashlib.sha256(schema.encode("utf-8")).hexdigest(),
+            "experiment_seed": experiment_seed,
+            "ddp_rank": ddp_rank,
+            "world_size": world_size,
+            "cursor": cursor,
+        }
+
+    def set_logical_stream_cursor(self, cursor: int) -> None:
+        if self._logical_stream is None:
+            raise RuntimeError("logical prior stream has not been configured")
+        if cursor < 0:
+            raise ValueError("prior stream cursor must be non-negative")
+        self._logical_stream["cursor"] = cursor
+
+    def logical_stream_state_dict(self, *, cursor: Optional[int] = None) -> Dict[str, Any]:
+        if self._logical_stream is None:
+            raise RuntimeError("logical prior stream has not been configured")
+        state = dict(self._logical_stream)
+        if cursor is not None:
+            if cursor < 0:
+                raise ValueError("prior stream cursor must be non-negative")
+            state["cursor"] = cursor
+        manifest = {key: state[key] for key in sorted(state)}
+        payload = repr(manifest).encode("utf-8")
+        state["manifest_sha256"] = hashlib.sha256(payload).hexdigest()
+        return state
+
+    def load_logical_stream_state_dict(self, state: Dict[str, Any]) -> None:
+        if self._logical_stream is None:
+            raise RuntimeError("logical prior stream has not been configured")
+        payload_state = {key: value for key, value in state.items() if key != "manifest_sha256"}
+        actual_hash = hashlib.sha256(
+            repr({key: payload_state[key] for key in sorted(payload_state)}).encode("utf-8")
+        ).hexdigest()
+        if actual_hash != state.get("manifest_sha256"):
+            raise ValueError("prior stream manifest hash mismatch")
+        locked = (
+            "schema_version",
+            "algorithm",
+            "schema",
+            "schema_sha256",
+            "experiment_seed",
+            "world_size",
+        )
+        for field in locked:
+            if payload_state.get(field) != self._logical_stream.get(field):
+                raise ValueError(
+                    f"prior stream {field} mismatch: expected {self._logical_stream.get(field)!r}, "
+                    f"got {payload_state.get(field)!r}"
+                )
+        self.set_logical_stream_cursor(int(payload_state["cursor"]))
+
+    def logical_batch_seed(self, logical_step: int) -> int:
+        if self._logical_stream is None:
+            raise RuntimeError("logical prior stream has not been configured")
+        stream = self._logical_stream
+        payload = (
+            f"{stream['algorithm']}\0{stream['schema_sha256']}\0"
+            f"seed={stream['experiment_seed']}\0rank={stream['ddp_rank']}\0step={logical_step}"
+        ).encode("utf-8")
+        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
+
+    def dataloader_seed(self) -> int:
+        if self._logical_stream is None:
+            raise RuntimeError("logical prior stream has not been configured")
+        payload = (
+            f"tabicl-prior-dataloader-v1\0{self._logical_stream['schema_sha256']}\0"
+            f"seed={self._logical_stream['experiment_seed']}\0rank={self._logical_stream['ddp_rank']}"
+        ).encode("utf-8")
+        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
+
+    def _get_logical_batch(self, logical_step: int):
+        seed = self.logical_batch_seed(logical_step)
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        torch_state = torch.get_rng_state()
+        use_cuda_rng = torch.device(self.device).type == "cuda"
+        cuda_states = None
+        if use_cuda_rng:
+            if get_worker_info() is not None:
+                raise RuntimeError("CUDA prior generation is not supported in a DataLoader worker")
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA prior generation requested but CUDA is unavailable")
+            cuda_states = torch.cuda.get_rng_state_all()
+        try:
+            random.seed(seed)
+            np.random.seed(seed % (2**32))
+            seeded_cpu = torch.Generator(device="cpu")
+            seeded_cpu.manual_seed(seed)
+            torch.set_rng_state(seeded_cpu.get_state())
+            if use_cuda_rng:
+                torch.cuda.manual_seed_all(seed)
+            return self.get_batch()
+        finally:
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
+            torch.set_rng_state(torch_state)
+            if use_cuda_rng:
+                torch.cuda.set_rng_state_all(cuda_states)
 
     def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
@@ -1486,7 +1619,21 @@ class PriorDataset(IterableDataset):
         self
             Returns self as an iterator
         """
-        return self
+        if self._logical_stream is None:
+            return self
+
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
+        logical_step = int(self._logical_stream["cursor"]) + worker_id
+
+        def logical_iterator():
+            nonlocal logical_step
+            while True:
+                yield self._get_logical_batch(logical_step)
+                logical_step += num_workers
+
+        return logical_iterator()
 
     def __next__(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """

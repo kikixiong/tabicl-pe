@@ -122,9 +122,31 @@ class RowInteraction(nn.Module):
 
         self.out_ln = nn.LayerNorm(embed_dim, bias=not bias_free_ln) if norm_first else nn.Identity()
         self.inference_mgr = InferenceManager(enc_name="tf_row", out_dim=embed_dim * self.num_cls, out_no_seq=True)
+        # This fallback exists for direct model use outside Trainer. Formal
+        # training injects permutations from TrainerIdentityRNG explicitly.
+        self._identity_generator = torch.Generator(device="cpu")
+        self._identity_generator.manual_seed(torch.initial_seed())
+
+    def sample_row_identity_permutation(
+        self, *, batch_size: int, num_features: int, device: torch.device | str
+    ) -> Optional[Tensor]:
+        """Sample using the module-local fallback generator, never a global RNG."""
+        if self.identity_mode != "temporary":
+            return None
+        if num_features < 1:
+            raise ValueError("num_features must be positive")
+        return torch.stack(
+            [
+                torch.randperm(num_features, generator=self._identity_generator)
+                for _ in range(batch_size)
+            ]
+        ).to(device=device)
 
     def _apply_temporary_feature_identity(
-        self, embeddings: Tensor, key_mask: Optional[Tensor] = None
+        self,
+        embeddings: Tensor,
+        key_mask: Optional[Tensor] = None,
+        row_identity_permutation: Optional[Tensor] = None,
     ) -> tuple[Tensor, Optional[Tensor]]:
         """Randomly assign RoPE positions to features for this forward pass.
 
@@ -140,7 +162,22 @@ class RowInteraction(nn.Module):
         if num_features <= 1:
             return embeddings, key_mask
 
-        permutations = torch.rand(batch_size, num_features, device=embeddings.device).argsort(dim=-1)
+        if row_identity_permutation is None:
+            permutations = self.sample_row_identity_permutation(
+                batch_size=batch_size,
+                num_features=num_features,
+                device=embeddings.device,
+            )
+        else:
+            if row_identity_permutation.shape != (batch_size, num_features):
+                raise ValueError(
+                    "row_identity_permutation must have shape "
+                    f"{(batch_size, num_features)}, got {tuple(row_identity_permutation.shape)}"
+                )
+            permutations = row_identity_permutation.to(device=embeddings.device, dtype=torch.long)
+            expected = torch.arange(num_features, device=embeddings.device).expand(batch_size, -1)
+            if not torch.equal(permutations.sort(dim=-1).values, expected):
+                raise ValueError("row_identity_permutation rows must each be a feature permutation")
         feature_index = permutations[:, None, :, None].expand(batch_size, num_rows, num_features, embed_dim)
         permuted_features = embeddings[:, :, self.num_cls :].gather(2, feature_index)
         embeddings = torch.cat((embeddings[:, :, : self.num_cls], permuted_features), dim=2)
@@ -211,7 +248,12 @@ class RowInteraction(nn.Module):
 
         return cls_outputs.flatten(-2)  # (B, T, C*E)
 
-    def _train_forward(self, embeddings: Tensor, d: Optional[Tensor] = None) -> Tensor:
+    def _train_forward(
+        self,
+        embeddings: Tensor,
+        d: Optional[Tensor] = None,
+        row_identity_permutation: Optional[Tensor] = None,
+    ) -> Tensor:
         """Transform feature embeddings into row representations for training.
 
         Parameters
@@ -247,12 +289,19 @@ class RowInteraction(nn.Module):
             indices = torch.arange(HC, device=device).view(1, 1, HC).expand(B, T, HC)
             key_mask = indices >= d.view(B, 1, 1)  # (B, T, HC)
 
-        embeddings, key_mask = self._apply_temporary_feature_identity(embeddings, key_mask)
+        embeddings, key_mask = self._apply_temporary_feature_identity(
+            embeddings, key_mask, row_identity_permutation
+        )
         representations = self._aggregate_embeddings(embeddings, key_mask)  # (B, T, C*E)
 
         return representations  # (B, T, C*E)
 
-    def _inference_forward(self, embeddings: Tensor, mgr_config: MgrConfig = None) -> Tensor:
+    def _inference_forward(
+        self,
+        embeddings: Tensor,
+        mgr_config: MgrConfig = None,
+        row_identity_permutation: Optional[Tensor] = None,
+    ) -> Tensor:
         """Transform feature embeddings into row representations for inference.
 
         Parameters
@@ -281,14 +330,22 @@ class RowInteraction(nn.Module):
         B, T = embeddings.shape[:2]
         cls_tokens = self.cls_tokens.expand(B, T, self.num_cls, self.embed_dim)
         embeddings[:, :, : self.num_cls] = cls_tokens.to(embeddings.device)
-        embeddings, _ = self._apply_temporary_feature_identity(embeddings)
+        embeddings, _ = self._apply_temporary_feature_identity(
+            embeddings, row_identity_permutation=row_identity_permutation
+        )
         representations = self.inference_mgr(
             self._aggregate_embeddings, inputs=OrderedDict([("embeddings", embeddings)])
         )
 
         return representations  # (B, T, C*E)
 
-    def forward(self, embeddings: Tensor, d: Optional[Tensor] = None, mgr_config: MgrConfig = None) -> Tensor:
+    def forward(
+        self,
+        embeddings: Tensor,
+        d: Optional[Tensor] = None,
+        mgr_config: MgrConfig = None,
+        row_identity_permutation: Optional[Tensor] = None,
+    ) -> Tensor:
         """Transform feature embeddings into row representations.
 
         Parameters
@@ -314,8 +371,10 @@ class RowInteraction(nn.Module):
         """
 
         if self.training:
-            representations = self._train_forward(embeddings, d)
+            representations = self._train_forward(embeddings, d, row_identity_permutation)
         else:
-            representations = self._inference_forward(embeddings, mgr_config)
+            representations = self._inference_forward(
+                embeddings, mgr_config, row_identity_permutation
+            )
 
         return representations  # (B, T, C*E)

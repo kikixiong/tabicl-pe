@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Optional, List, Union, Literal
+import math
 
 import torch
 from torch import nn, Tensor
@@ -310,8 +311,20 @@ class TabICL(nn.Module):
         """Clear the stored cache."""
         self._cache = None
 
+    def _num_row_identity_tokens(self, num_input_features: int) -> int:
+        """Return feature-token count emitted by the configured column grouping."""
+        mode = "same" if self.col_feature_group is True else self.col_feature_group
+        if mode == "valid":
+            return math.ceil(num_input_features / self.col_feature_group_size)
+        return num_input_features
+
     def _train_forward(
-        self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        d: Optional[Tensor] = None,
+        embed_with_test: bool = False,
+        row_identity_permutation: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning for training.
 
@@ -361,6 +374,7 @@ class TabICL(nn.Module):
                 embed_with_test=embed_with_test,
             ),
             d=d,
+            row_identity_permutation=row_identity_permutation,
         )
 
         # Dataset-wise in-context learning
@@ -375,6 +389,7 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
+        row_identity_permutation: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -436,6 +451,7 @@ class TabICL(nn.Module):
                 mgr_config=inference_config.COL_CONFIG,
             ),
             mgr_config=inference_config.ROW_CONFIG,
+            row_identity_permutation=row_identity_permutation,
         )
 
         # Dataset-wise in-context learning
@@ -459,6 +475,7 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
+        row_identity_permutation: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -515,7 +532,13 @@ class TabICL(nn.Module):
         """
 
         if self.training:
-            out = self._train_forward(X, y_train, d=d, embed_with_test=embed_with_test)
+            out = self._train_forward(
+                X,
+                y_train,
+                d=d,
+                embed_with_test=embed_with_test,
+                row_identity_permutation=row_identity_permutation,
+            )
         else:
             out = self._inference_forward(
                 X,
@@ -525,6 +548,7 @@ class TabICL(nn.Module):
                 return_logits=return_logits,
                 softmax_temperature=softmax_temperature,
                 inference_config=inference_config,
+                row_identity_permutation=row_identity_permutation,
             )
 
         return out
@@ -750,16 +774,32 @@ class TabICL(nn.Module):
             y_train = None
 
         # Column-wise embedding with cache support -> Row-wise interaction
+        col_embeddings = self.col_embedder.forward_with_cache(
+            X,
+            col_cache=self._cache.col_cache,
+            y_train=y_train,
+            use_cache=use_cache,
+            store_cache=store_cache,
+            mgr_config=inference_config.COL_CONFIG,
+        )
+        row_identity_permutation = None
+        if self.row_identity_mode == "temporary":
+            if store_cache:
+                row_identity_permutation = self.row_interactor.sample_row_identity_permutation(
+                    batch_size=col_embeddings.shape[0],
+                    num_features=col_embeddings.shape[2] - self.row_num_cls,
+                    device=col_embeddings.device,
+                )
+                self._cache.row_identity_permutation = row_identity_permutation
+            else:
+                row_identity_permutation = self._cache.row_identity_permutation
+                if row_identity_permutation is None:
+                    raise ValueError("Temporary Identity cache is missing row_identity_permutation")
+
         representations = self.row_interactor(
-            self.col_embedder.forward_with_cache(
-                X,
-                col_cache=self._cache.col_cache,
-                y_train=y_train,
-                use_cache=use_cache,
-                store_cache=store_cache,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
+            col_embeddings,
             mgr_config=inference_config.ROW_CONFIG,
+            row_identity_permutation=row_identity_permutation,
         )
 
         # Dataset-wise in-context learning

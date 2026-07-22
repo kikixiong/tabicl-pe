@@ -55,6 +55,35 @@ def seed_worker(worker_id: int):
     np.random.seed(s)
 
 
+def make_prior_dataloader(
+    dataset: PriorDataset,
+    *,
+    num_workers: int,
+    prefetch_factor: int = 2,
+    pin_memory: bool = False,
+    pin_memory_device: str = "",
+    persistent_workers: bool = False,
+) -> DataLoader:
+    """Create a prior loader whose worker bootstrap never consumes global RNG."""
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(dataset.dataloader_seed())
+    kwargs = {
+        "dataset": dataset,
+        "batch_size": None,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "worker_init_fn": seed_worker,
+        "generator": generator,
+    }
+    if pin_memory_device:
+        kwargs["pin_memory_device"] = pin_memory_device
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = prefetch_factor
+        kwargs["persistent_workers"] = persistent_workers
+    return DataLoader(**kwargs)
+
+
 def dense2sparse(
     dense_tensor: torch.Tensor, row_lengths: torch.Tensor, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:

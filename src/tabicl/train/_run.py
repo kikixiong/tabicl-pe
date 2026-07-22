@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import random
+import json
 import timeit
 import warnings
 import functools
 from contextlib import nullcontext
+from dataclasses import asdict
 
 import math
 import numpy as np
@@ -25,11 +28,19 @@ import wandb
 from tabicl._model.tabicl import TabICL
 from tabicl._model.attention import set_flash_attn3_enabled
 from tabicl.prior._dataset import PriorDataset
-from tabicl.prior._genload import LoadPriorDataset, seed_worker
+from tabicl.prior._genload import LoadPriorDataset, make_prior_dataloader, seed_worker
 from tabicl.prior.graph_lib._config import PriorConfig
 from tabicl.train._optim import get_scheduler
 from tabicl.train._muon import Muon
 from tabicl.train._train_config import build_parser
+from tabicl.train._checkpoint_io import atomic_torch_save
+from tabicl.train._identity_rng import SAMPLER_VERSION, TrainerIdentityRNG
+from tabicl.train._rng_state import (
+    gather_all_rank_rng_state,
+    restore_all_rank_rng_state,
+    select_rank_rng_state,
+    validate_full_resume_checkpoint,
+)
 
 warnings.filterwarnings(
     "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
@@ -86,13 +97,19 @@ class Trainer:
     def __init__(self, config):
         self.config = config
         self.configure_ddp()
+        self.configure_identity_rng()
         self.configure_wandb()
+        # W&B initialization is outside the model-initialization RNG boundary.
+        # Re-seed here so all treatment arms start from matched parameters.
+        self.seed()
         self.build_model()
         self.configure_prior()
         self.configure_optimizer()
         self.configure_amp()
+        self._loaded_full_resume = False
         self.load_checkpoint()
-        self.seed()
+        if not self._loaded_full_resume:
+            self.seed()
 
     def configure_ddp(self):
         """Set up distributed training and system configuration.
@@ -141,9 +158,26 @@ class Trainer:
         # Set random seeds
         seed_offset = self.ddp_rank if self.ddp else 0
         np.random.seed(self.config.np_seed + seed_offset)
+        random.seed(self.config.np_seed + seed_offset)
         torch.manual_seed(self.config.torch_seed + seed_offset)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+
+    def configure_identity_rng(self):
+        """Create the rank-local Temporary Identity stream."""
+        identity_seed = getattr(self.config, "identity_rng_seed", None)
+        if identity_seed is None:
+            identity_seed = self.config.torch_seed
+        self.config.identity_rng_seed = identity_seed
+        self.config.identity_sampler_version = (
+            SAMPLER_VERSION if self.config.row_identity_mode == "temporary" else None
+        )
+        self.identity_rng = TrainerIdentityRNG(
+            identity_mode=self.config.row_identity_mode,
+            base_seed=identity_seed,
+            rank=self.ddp_rank,
+            world_size=self.ddp_world_size,
+        )
 
     def configure_wandb(self):
         """Set up Weights & Biases logging."""
@@ -268,8 +302,10 @@ class Trainer:
     def configure_prior(self):
         """Set up a tabular dataset generator for synthetic data during training."""
 
+        self.prior_cursor = 0
         if self.config.prior_dir is None:
             # Generate prior data on the fly
+            prior_config = PriorConfig.from_args(self.config)
             dataset = PriorDataset(
                 regression=self.regression,
                 batch_size=self.config.batch_size,
@@ -286,9 +322,40 @@ class Trainer:
                 max_train_size=self.config.max_train_size,
                 replay_small=self.config.replay_small,
                 prior_type=self.config.prior_type,
-                config=PriorConfig.from_args(self.config),  # graph_scm prior options
+                config=prior_config,  # graph_scm prior options
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism; the DataLoader parallelizes across batches
+            )
+            prior_schema = {
+                "schema_version": 1,
+                "regression": self.regression,
+                "batch_size": self.config.batch_size,
+                "batch_size_per_gp": self.config.batch_size_per_gp,
+                "min_features": self.config.min_features,
+                "max_features": self.config.max_features,
+                "max_classes": self.config.max_classes,
+                "min_seq_len": self.config.min_seq_len,
+                "max_seq_len": self.config.max_seq_len,
+                "log_seq_len": self.config.log_seq_len,
+                "log_n_features": self.config.log_n_features,
+                "seq_len_per_gp": self.config.seq_len_per_gp,
+                "min_train_size": self.config.min_train_size,
+                "max_train_size": self.config.max_train_size,
+                "replay_small": self.config.replay_small,
+                "prior_type": self.config.prior_type,
+                "prior_device": self.config.prior_device,
+                "graph_config": (
+                    asdict(prior_config)
+                    if self.config.prior_type == "graph_scm"
+                    else None
+                ),
+            }
+            dataset.configure_logical_stream(
+                schema=json.dumps(prior_schema, sort_keys=True, separators=(",", ":")),
+                experiment_seed=self.config.np_seed,
+                ddp_rank=self.ddp_rank,
+                world_size=self.ddp_world_size,
+                cursor=self.prior_cursor,
             )
         else:
             # Load pre-generated prior data from disk
@@ -318,17 +385,33 @@ class Trainer:
             prefetch_factor = 4
 
         # Create dataloader for efficient loading and prefetching
-        self.dataloader = DataLoader(
-            dataset,
-            batch_size=None,  # No additional batching since PriorDataset handles batching internally
-            shuffle=False,
-            num_workers=num_workers,
-            prefetch_factor=prefetch_factor,
-            pin_memory=True if self.config.prior_device == "cpu" else False,
-            pin_memory_device=self.config.device if self.config.prior_device == "cpu" else "",
-            worker_init_fn=seed_worker,
-            persistent_workers=True,
-        )
+        self.prior_dataset = dataset
+        pin_memory = self.config.prior_device == "cpu"
+        pin_memory_device = self.config.device if pin_memory else ""
+        if self.config.prior_dir is None:
+            self.dataloader = make_prior_dataloader(
+                dataset,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor,
+                pin_memory=pin_memory,
+                pin_memory_device=pin_memory_device,
+                persistent_workers=num_workers > 0,
+            )
+        else:
+            loader_generator = torch.Generator(device="cpu")
+            loader_generator.manual_seed(self.config.torch_seed + self.ddp_rank)
+            self.dataloader = DataLoader(
+                dataset,
+                batch_size=None,
+                shuffle=False,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor,
+                pin_memory=pin_memory,
+                pin_memory_device=pin_memory_device,
+                worker_init_fn=seed_worker,
+                persistent_workers=True,
+                generator=loader_generator,
+            )
 
     def configure_optimizer(self):
         """Configure optimizer and scheduler."""
@@ -420,6 +503,25 @@ class Trainer:
         if "state_dict" not in checkpoint:
             raise ValueError("Checkpoint does not contain model state")
 
+        # Validate the treatment and complete stochastic bundle before model
+        # state is touched. Intentional model-only stage transitions still
+        # require a matching treatment manifest but start fresh RNG streams.
+        if self.config.only_load_model:
+            self.identity_rng.restore_checkpoint(checkpoint, only_load_model=True)
+        else:
+            validate_full_resume_checkpoint(checkpoint)
+            self.identity_rng.restore_checkpoint(checkpoint, only_load_model=False)
+            select_rank_rng_state(
+                checkpoint["rng_state"],
+                rank=self.ddp_rank,
+                world_size=self.ddp_world_size,
+            )
+            if not hasattr(self.prior_dataset, "load_logical_stream_state_dict"):
+                raise ValueError("full resume requires a logical on-the-fly prior stream")
+            self.prior_dataset.load_logical_stream_state_dict(checkpoint["prior_stream"])
+            if checkpoint["prior_stream"]["cursor"] != checkpoint["curr_step"]:
+                raise ValueError("prior stream cursor must equal curr_step")
+
         self.raw_model.load_state_dict(checkpoint["state_dict"])
 
         # Optionally load optimizer and scheduler state
@@ -428,7 +530,15 @@ class Trainer:
         else:
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
             self.scheduler.load_state_dict(checkpoint["scheduler_state"])
+            self.scaler.load_state_dict(checkpoint["scaler_state"])
             self.curr_step = checkpoint["curr_step"]
+            self.prior_cursor = checkpoint["prior_stream"]["cursor"]
+            restore_all_rank_rng_state(
+                checkpoint["rng_state"],
+                rank=self.ddp_rank,
+                world_size=self.ddp_world_size,
+            )
+            self._loaded_full_resume = True
             print(f"Resuming training at step {self.curr_step}")
 
     def save_checkpoint(self, name: str):
@@ -440,16 +550,41 @@ class Trainer:
             Filename for the checkpoint
         """
 
+        identity_fields = self.identity_rng.checkpoint_fields()
+        rng_state = gather_all_rank_rng_state(
+            rank=self.ddp_rank, world_size=self.ddp_world_size
+        )
+        if not self.master_process:
+            return
+
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
         checkpoint_path = os.path.join(self.config.checkpoint_dir, name)
+        if hasattr(self.prior_dataset, "logical_stream_state_dict"):
+            prior_stream = self.prior_dataset.logical_stream_state_dict(
+                cursor=self.prior_cursor
+            )
+        else:
+            # Pre-generated priors remain saveable, but formal full resume is
+            # deliberately rejected by load_checkpoint because their worker-
+            # local file buffers are not a logical on-the-fly stream.
+            prior_stream = {
+                "schema_version": 1,
+                "kind": "pre_generated",
+                "cursor": self.prior_cursor,
+            }
+
         checkpoint = {
             "config": self.model_config,
             "state_dict": self.raw_model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "scheduler_state": self.scheduler.state_dict(),
+            "scaler_state": self.scaler.state_dict(),
             "curr_step": self.curr_step,
+            "rng_state": rng_state,
+            "prior_stream": prior_stream,
         }
-        torch.save(checkpoint, checkpoint_path)
+        checkpoint.update(identity_fields)
+        atomic_torch_save(checkpoint, checkpoint_path)
 
     def manage_checkpoint(self):
         """Manage temporary checkpoints by deleting the oldest when limit is exceeded."""
@@ -489,6 +624,7 @@ class Trainer:
         # Set random seeds
         seed_offset = self.ddp_rank if self.ddp else 0
         np.random.seed(self.config.np_seed + seed_offset + self.curr_step)
+        random.seed(self.config.np_seed + seed_offset + self.curr_step)
         torch.manual_seed(self.config.torch_seed + seed_offset + self.curr_step)
 
     @ddp_cleanup
@@ -517,8 +653,13 @@ class Trainer:
             train_time = train_timer.elapsed
 
             self.curr_step = step + 1
+            self.prior_cursor = self.curr_step
             if self.config.empty_cache_every > 0 and self.curr_step % self.config.empty_cache_every == 0:
                 torch.cuda.empty_cache()
+            is_temp_save = self.curr_step % self.config.save_temp_every == 0
+            is_perm_save = self.curr_step % self.config.save_perm_every == 0
+            should_save = is_temp_save or is_perm_save
+
             if self.master_process:
                 # Add timing information to results
                 results.update({"prior_time": prior_time, "train_time": train_time})
@@ -526,23 +667,23 @@ class Trainer:
                 # Update progress bar with rounded values for cleaner display
                 step_progress.set_postfix(**{k: round(v, 3) if isinstance(v, float) else v for k, v in results.items()})
 
-                # Save checkpoints
-                is_temp_save = self.curr_step % self.config.save_temp_every == 0
-                is_perm_save = self.curr_step % self.config.save_perm_every == 0
-
-                if is_temp_save or is_perm_save:
-                    ckpt_name = f"step-{self.curr_step}.ckpt"
-                    self.save_checkpoint(name=ckpt_name)
-
-                    # Manage checkpoint limit only for temporary checkpoints
-                    if is_temp_save and not is_perm_save and self.config.max_checkpoints > 0:
-                        self.manage_checkpoint()
-
             # Logging to Weights & Biases
             if self.wandb_run is not None:
                 # Add learning rate to results
                 results["lr"] = self.scheduler.get_last_lr()[0]
                 wandb.log(results, step=self.curr_step)
+
+            # Capture stochastic state at the true end-of-step boundary, after
+            # progress/logging hooks that may themselves consume a global RNG.
+            if should_save:
+                self.save_checkpoint(name=f"step-{self.curr_step}.ckpt")
+                if (
+                    self.master_process
+                    and is_temp_save
+                    and not is_perm_save
+                    and self.config.max_checkpoints > 0
+                ):
+                    self.manage_checkpoint()
 
     def validate_micro_batch(self, micro_seq_len, micro_train_size):
         """Validate consistent sequence length and train size within a micro batch.
@@ -668,18 +809,34 @@ class Trainer:
         # variable-feature priors (e.g. graph_scm).
         model_d = None if self.config.ignore_d else micro_d
 
+        row_identity_permutation = self.identity_rng.sample_for_micro_batch(
+            batch_size=micro_X.shape[0],
+            num_identity_tokens=self.raw_model._num_row_identity_tokens(micro_X.shape[-1]),
+            device=self.config.device,
+        )
+
         with self.amp_ctx:
             if self.regression:
                 # (B, test_size, num_quantiles) predicted quantiles at levels
                 # linspace(0, 1, num_quantiles + 2)[1:-1] (matches inference / QuantileDistribution)
-                pred = self.model(micro_X, y_train, model_d)
+                pred = self.model(
+                    micro_X,
+                    y_train,
+                    model_d,
+                    row_identity_permutation=row_identity_permutation,
+                )
                 alphas = torch.linspace(
                     0.0, 1.0, self.config.num_quantiles + 2, device=pred.device, dtype=pred.dtype
                 )[1:-1].view(1, 1, -1)
                 errors = y_test.unsqueeze(-1) - pred
                 loss = torch.maximum(alphas * errors, (alphas - 1) * errors).mean()
             else:
-                pred = self.model(micro_X, y_train, model_d)  # (B, test_size, max_classes)
+                pred = self.model(
+                    micro_X,
+                    y_train,
+                    model_d,
+                    row_identity_permutation=row_identity_permutation,
+                )  # (B, test_size, max_classes)
                 pred = pred.flatten(end_dim=-2)
                 true = y_test.long().flatten()
                 loss = F.cross_entropy(pred, true)

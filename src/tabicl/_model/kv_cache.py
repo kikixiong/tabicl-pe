@@ -229,6 +229,7 @@ class TabICLCache:
     icl_cache: Optional[KVCache] = None
     train_shape: Tuple[int, int, int] = (0, 0, 0)
     num_classes: Optional[int] = None
+    row_identity_permutation: Optional[Tensor] = None
 
     def __post_init__(self):
         """Initialize sub-caches if not provided."""
@@ -261,6 +262,11 @@ class TabICLCache:
         # Count memory from row representations
         if self.row_repr is not None:
             total += self.row_repr.numel() * self.row_repr.element_size()
+        if self.row_identity_permutation is not None:
+            total += (
+                self.row_identity_permutation.numel()
+                * self.row_identity_permutation.element_size()
+            )
         # Count memory from ICLearning
         if self.icl_cache:
             for kv in self.icl_cache.kv.values():
@@ -302,6 +308,11 @@ class TabICLCache:
             icl_cache=self.icl_cache[indices] if self.icl_cache else KVCache(),
             train_shape=(end - start, self.train_shape[1], self.train_shape[2]),
             num_classes=self.num_classes,
+            row_identity_permutation=(
+                self.row_identity_permutation[indices]
+                if self.row_identity_permutation is not None
+                else None
+            ),
         )
 
     def to(self, device, dtype=None) -> TabICLCache:
@@ -326,6 +337,11 @@ class TabICLCache:
             icl_cache=self.icl_cache.to(device, dtype=dtype) if self.icl_cache else KVCache(),
             train_shape=self.train_shape,
             num_classes=self.num_classes,
+            row_identity_permutation=(
+                self.row_identity_permutation.to(device=device)
+                if self.row_identity_permutation is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -345,9 +361,20 @@ class TabICLCache:
         TabICLCache
             New cache with concatenated ``col_cache`` and ``icl_cache`` tensors.
         """
+        identity_presence = [c.row_identity_permutation is not None for c in caches]
+        if any(identity_presence) and not all(identity_presence):
+            raise ValueError(
+                "cannot concat caches with partial row_identity_permutation state"
+            )
+
         col_caches = [c.col_cache for c in caches if c.col_cache is not None]
         row_reprs = [c.row_repr for c in caches if c.row_repr is not None]
         icl_caches = [c.icl_cache for c in caches if c.icl_cache is not None]
+        identity_permutations = [
+            c.row_identity_permutation
+            for c in caches
+            if c.row_identity_permutation is not None
+        ]
 
         total_batch = sum(c.train_shape[0] for c in caches)
         train_size = caches[0].train_shape[1]
@@ -359,4 +386,9 @@ class TabICLCache:
             icl_cache=KVCache.concat(icl_caches, dim=dim) if icl_caches else KVCache(),
             train_shape=(total_batch, train_size, n_features),
             num_classes=caches[0].num_classes,
+            row_identity_permutation=(
+                torch.cat(identity_permutations, dim=dim)
+                if identity_permutations
+                else None
+            ),
         )
