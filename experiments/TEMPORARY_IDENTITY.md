@@ -1,81 +1,55 @@
-# Position vs. Temporary Identity
+# Do Tabular Foundation Models Need Position, or Just Temporary Identity?
 
-This branch supports pre-training-aligned tests of the feature-position signal
-in TabICLv2's row interaction transformer. The signal is applied across the
-feature-token sequence inside each table row; it is not a sample-row position.
+This experiment tests the feature-position signal in TabICLv2's row
+interaction transformer. “Row” here names the architectural block; the token
+sequence being treated is the table's feature sequence, not the order of data
+samples.
 
-## Matched training arms
+## Matched pre-training arms
 
-| `--row_identity_mode` | RoPE | Feature assignment | Interpretation |
-| --- | --- | --- | --- |
-| `rope` | yes | input order | standard TabICLv2 baseline |
-| `temporary` | yes | fresh random assignment per table and forward | identity without stable ordinal meaning |
-| `none` | no | set aggregation only | no explicit symmetry-breaking identity |
+| `row_identity_mode` | Treatment | Interpretation |
+| --- | --- | --- |
+| `rope` | Standard RoPE follows input feature order | Stable ordinal position |
+| `temporary` | RoPE identities are randomly reassigned per table/forward pass | Temporary identity without stable order |
+| `none` | Row RoPE is disabled | No explicit positional identity |
 
-Temporary assignments are shared across every sample row in a table. CLS
-tokens remain fixed, and padding masks are permuted with their feature tokens.
-The transform is otherwise the same parameter-free, norm-preserving RoPE used
-by the baseline.
+Temporary assignments are shared across the sample rows of a table. CLS tokens
+remain fixed, and padding masks move with their feature tokens. The assignment
+stream has an independent, checkpointed RNG so resume does not perturb or
+depend on the global training RNG.
 
-All three arms must be trained from scratch with identical prior settings,
-optimizer, architecture, step budget, and seeds. Do not compare a modified
-inference path against an unmodified pre-trained checkpoint as primary evidence.
+All three arms are trained from scratch with the same source, prior,
+architecture, optimizer, stage settings, budgets, and non-treatment seeds. The
+fixed stage budgets are 500,000, 40,000, and 10,000 steps. A shared cohort hash
+excludes only `row_identity_mode`; a separate arm hash binds the corresponding
+identity treatment. Inference-only removal of position from an otherwise
+pretrained checkpoint is not primary evidence for this study.
 
-## Reproducibility gates
+## Formal evidence boundary
 
-1. Unit tests:
+The public candidate contains the training treatment, exact stochastic resume,
+strict checkpoint/parent provenance, capacity and retention gates, the fixed
+twelve-case H100 validation harness, a fresh-only nine-job submit transaction,
+and a read-only anomaly monitor. `docs/FORMAL_STATUS.md` records readiness and
+`docs/FORMAL_HANDOFF.md` defines the remaining hardware gates.
 
-   ```bash
-   .venv/bin/python -m pytest -q tests/test_row_identity.py
-   ```
+At the current status, CPU/Gloo and hermetic scheduler tests are ready, while
+H100/CUDA/NCCL/utilization evidence is pending. No result from the formal
+three-arm training comparison is claimed yet.
 
-2. One-step end-to-end smoke tests on one GPU:
+## Evaluation plan (separate candidate)
 
-   ```bash
-   for mode in rope temporary none; do
-     CUDA_VISIBLE_DEVICES=3 scripts/run_identity_smoke.sh "$mode"
-   done
-   ```
+After all three formal training arms finish, evaluate their terminal
+checkpoints under one frozen downstream protocol:
 
-3. Run sequential 500-step `none` preflights with 1, 2, and 4 H100s while
-   keeping the global batch at 64. Each job records only its allocated GPUs
-   every five seconds and checks every GPU for at least 80% mean utilization:
-
-   ```bash
-   scripts/submit_h100_scaling_preflights.sh
-   ```
-
-4. Select the largest GPU count for which every allocated card passes. Submit
-   matched `rope` and `none` full runs with that count. Each arm runs the
-   official 500k + 40k + 10k stages; downstream stages start only after the
-   preceding checkpoint and utilization gate pass:
-
-   ```bash
-   scripts/submit_h100_rope_none_full.sh GPU_COUNT
-   ```
-
-The full jobs use FP32 to match the official recipe. Stages 2 and 3 require
-FlashAttention-3 on Hopper; Stage 3 enables activation recomputation for H100
-memory headroom. On-the-fly prior workers are capped per DDP rank, and the CUDA
-caching allocator is retained between steps to prevent avoidable GPU stalls.
-
-## Required evaluation matrix
-
-Evaluate every checkpoint on the same datasets and preprocessing under:
-
-- canonical feature order;
-- multiple random feature permutations (report mean and worst case);
-- train/test-consistent renaming of feature identities;
-- feature-count buckets, including counts outside the pilot's common range;
+- canonical feature order and repeated random feature permutations;
+- train/test-consistent feature renaming;
+- feature-count buckets, including out-of-prior counts;
 - in-prior synthetic tasks and held-out real classification tasks;
-- calibration and log loss in addition to rank/accuracy metrics.
+- calibration and log loss in addition to rank and accuracy metrics;
+- for `temporary`, multiple independently sampled identities at inference and
+  performance versus ensemble size.
 
-For `temporary`, average multiple independently sampled identities at inference
-and plot performance against ensemble size. This distinguishes a useful
-temporary binding mechanism from variance caused by a single random draw.
-
-## Current execution scope
-
-The first full allocation covers `rope` and `none`. `temporary` remains tested
-and checkpoint-compatible but is not submitted at full scale until the first
-matched comparison is reviewed.
+Evaluation implementation, datasets, raw predictions, and result artifacts are
+deliberately outside the formal training candidate so they cannot change its
+source identity.

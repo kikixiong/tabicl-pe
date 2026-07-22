@@ -875,12 +875,29 @@ class Trainer:
         # Remove oldest temporary checkpoints if limit is exceeded
         num_to_delete = len(temp_checkpoints) - limit
         if num_to_delete > 0:
+            formal_training = getattr(self.config, "formal_training", False)
+            removed_any = False
             for step, ckpt_name in temp_checkpoints[:num_to_delete]:
                 ckpt_path = os.path.join(ckpt_dir, ckpt_name)
                 try:
                     os.remove(ckpt_path)
-                except Exception as e:
-                    print(f"Error removing checkpoint {ckpt_path}: {e}")
+                    removed_any = True
+                except Exception as error:
+                    if formal_training:
+                        # Retention is part of the formal disk-safety protocol.
+                        # The coordinated caller makes every rank stop here.
+                        raise
+                    print(f"Error removing checkpoint {ckpt_path}: {error}")
+
+            if formal_training and removed_any:
+                flags = os.O_RDONLY
+                for name in ("O_DIRECTORY", "O_CLOEXEC", "O_NOFOLLOW"):
+                    flags |= getattr(os, name, 0)
+                directory_fd = os.open(ckpt_dir, flags)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
 
     def seed(self):
         """Reset global seeds with the current step. This avoids regenerating
