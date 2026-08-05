@@ -72,17 +72,20 @@ does not authorize applying or deleting them.
 
 ## Evidence classification
 
-The existing `249092`--`249097` chains are infrastructure pilots only:
+The resumed `253081`--`253086` chains are infrastructure pilots only:
 
 | Arm | Stage 1 | Stage 2 | Stage 3 |
 |---|---:|---:|---:|
-| No-PE | 249092 | 249093 | 249094 |
-| Stable RoPE | 249095 | 249096 | 249097 |
+| No-PE | 253081 | 253082 | 253083 |
+| Stable RoPE | 253084 | 253085 | 253086 |
 
-The No-PE pilot resumed from `step-6000.ckpt` without exact RNG/DataLoader
-state. Its W&B run had already advanced to step 6824, so duplicate log steps
-6001--6823 were ignored after resume. These limitations prevent causal pairing
-even if all three stages complete.
+These chains continue the older pilot lineage. No-PE resumed from
+`step-149000.ckpt`; Stable RoPE resumed from `step-129000.ckpt`. The preceding
+jobs `252749` and `252752` had advanced approximately 483 and 426 additional
+unsaved steps before simultaneously stalling, so the replacement jobs repeat
+those ranges and W&B ignores the duplicate non-monotonic logs. Neither
+checkpoint captures exact RNG/DataLoader state. These limitations prevent
+causal pairing even if all three stages complete.
 
 The first formal cohort is the immutable namespace
 `position-identity-v1-seed42`. It requires three fresh one-H100 chains (nine
@@ -98,12 +101,12 @@ Do not reuse a pilot namespace or checkpoint for formal evidence.
 - Stable handoff: `docs/NOETHER_HANDOFF.md`
 - Volatile state: `docs/NOETHER_STATUS.md`
 
-Known pilot files include:
+Current pilot files include:
 
-- `artifacts/logs/tabicl-identity-full-249092.{out,err}`
-- `artifacts/logs/tabicl-identity-full-249095.{out,err}`
-- `artifacts/gpu-monitor/none-stage1-249092.csv`
-- `artifacts/gpu-monitor/rope-stage1-249095.csv`
+- `artifacts/logs/tabicl-identity-full-253081.{out,err}`
+- `artifacts/logs/tabicl-identity-full-253084.{out,err}`
+- `artifacts/gpu-monitor/none-stage1-253081.csv`
+- `artifacts/gpu-monitor/rope-stage1-253084.csv`
 
 ## Overlay and implementation state
 
