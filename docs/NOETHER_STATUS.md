@@ -1,6 +1,6 @@
 # Noether TabICL operational status
 
-**As of:** 2026-08-05 10:48:14 BST (`Europe/London`)
+**As of:** 2026-08-06 08:34:42 BST (`Europe/London`)
 
 This is a time-stamped snapshot, not a live dashboard. Rerun the refresh
 commands at the end of this document before changing jobs or drawing current
@@ -10,7 +10,7 @@ conclusions.
 
 - Host: `noether.cs.ox.ac.uk`
 - Phase: final pre-submission hardening; no formal three-arm cohort submitted
-- Current raw checkout HEAD: `953339565c090f3fc67f4127f19a775962624b86`
+- Current raw checkout HEAD: `80714179ee792fbc39cb62591073b41f8da96042`
   on `codex/h100-rope-none-full`
 - Branch: `codex/h100-rope-none-full`
 - Public research repository: `https://github.com/kikixiong/tabicl-pe`
@@ -19,26 +19,28 @@ conclusions.
   branch `codex/h100-rope-none-full` at `8513d8a`
 - Publication scope: sanitized source and tests only; Noether context documents,
   six historical root-level `tabicl-*.bundle` files, and artifacts are excluded
-- Shared filesystem: 3.4T total, 3.1T used, approximately 184G available,
-  reported as 95% used
+- Shared filesystem: 3.4T total, 3.2T used, approximately 106G available,
+  reported as 97% used. It reached zero free bytes on 2026-08-05 and later
+  recovered; capacity remains a hard live gate.
 - Formal namespace `position-identity-v1-seed42`: not present
 - Access: Noether-native Slurm queries succeeded at this timestamp. The
   external SSH path was separately reported to be timing out during banner
   exchange; do not infer one access path's health from the other.
-- Current disposition: the resumed RoPE/No-RoPE chains are running as pilot
-  infrastructure only. They are not formal evidence because they resume old
-  checkpoints without exact prior/DataLoader state or immutable provenance.
+- Current disposition: the replacement RoPE/No-RoPE chains are running as
+  pilot infrastructure only. They are not formal evidence because they resume
+  old checkpoints without exact prior/DataLoader state or immutable
+  provenance.
 
 ## Slurm snapshot
 
 | Job | Role | State | Node/reason | Elapsed at snapshot |
 |---|---|---|---|---:|
-| 253081 | No-PE Stage 1 resumed pilot | RUNNING | hopper | 00:02:40 |
-| 253082 | No-PE Stage 2 pilot | PENDING | Dependency | 00:00:00 |
-| 253083 | No-PE Stage 3 pilot | PENDING | Dependency | 00:00:00 |
-| 253084 | RoPE Stage 1 resumed pilot | RUNNING | hopper | 00:02:40 |
-| 253085 | RoPE Stage 2 pilot | PENDING | Dependency | 00:00:00 |
-| 253086 | RoPE Stage 3 pilot | PENDING | Dependency | 00:00:00 |
+| 253196 | No-PE Stage 1 replacement pilot | RUNNING | hopper | 00:04:54 |
+| 253197 | No-PE Stage 2 pilot | PENDING | Dependency | 00:00:00 |
+| 253198 | No-PE Stage 3 pilot | PENDING | Dependency | 00:00:00 |
+| 253199 | RoPE Stage 1 replacement pilot | RUNNING | hopper | 00:04:54 |
+| 253200 | RoPE Stage 2 pilot | PENDING | Dependency | 00:00:00 |
+| 253201 | RoPE Stage 3 pilot | PENDING | Dependency | 00:00:00 |
 
 Historical Slurm accounting was also reconfirmed:
 
@@ -50,37 +52,43 @@ Historical Slurm accounting was also reconfirmed:
 
 ## Pilot health
 
-Both newly resumed Stage 1 logs were advancing at the snapshot:
+Both replacement Stage 1 jobs started on hopper at 2026-08-06 08:29:48 BST,
+loaded the intended checkpoints, and were advancing at the snapshot:
 
-- No-PE `253081`: loaded `step-149000.ckpt` with full model, optimizer,
-  scheduler, and step state, then advanced to approximately global step 149030.
-- Stable RoPE `253084`: loaded `step-129000.ckpt` with full model, optimizer,
-  scheduler, and step state, then advanced to approximately global step 129026.
+- No-PE `253196`: loaded `step-164000.ckpt` and advanced to approximately
+  global step 164097.
+- Stable RoPE `253199`: loaded `step-143000.ckpt` and advanced to approximately
+  global step 143094.
 
-The most recent GPU-monitor samples were 100% utilization on both allocated
-H100s. This is an initial-start check, not yet a complete active-window mean.
-No OOM, `ENOSPC`, traceback, fatal error, non-finite loss, or NaN signature was
-found in the current logs.
+Recent GPU-monitor samples were active, reaching 100% utilization on both
+allocated H100s. This is an initial-start check, not yet a complete
+active-window mean. No OOM, `ENOSPC`, traceback, fatal CUDA/NCCL error,
+non-finite loss, or NaN signature was found in the replacement logs. The W&B
+non-monotonic-step warnings are expected pilot provenance noise: each reused
+remote run is ahead of the restored checkpoint.
 
-Jobs `252749` and `252752` had previously remained Slurm-RUNNING while both
-training processes were stalled from 2026-08-04 06:17 BST: GPU utilization was
-continuously 0%, logs/checkpoints stopped, and 65--67 GiB remained allocated.
-With explicit user authorization, both stale Stage 1 jobs and their four old
-dependencies (`252749`--`252754`) were cancelled at 2026-08-05 10:45 BST and
-replaced by the current chains.
+On 2026-08-05 the shared filesystem fell from tens of GiB free to zero. Jobs
+`253081` and `253084` then stopped advancing at approximately global steps
+164373 and 143809: logs stopped, GPU utilization became persistently 0%, and
+allocated memory remained resident. Free space later recovered, but the
+workers did not. With explicit user authorization, both stalled Stage 1 jobs
+and their four dependencies (`253081`--`253086`) were cancelled at
+2026-08-06 08:28:47 BST and replaced by the current chains. No artifact was
+deleted.
 
 ## Checkpoints at snapshot
 
 | Arm | Retained files | Size each | Latest verified |
 |---|---|---:|---|
-| No-PE | `step-148000.ckpt`, `step-149000.ckpt` | 220,697,839 bytes | step 149000 |
-| Stable RoPE | `step-128000.ckpt`, `step-129000.ckpt` | 220,698,225 bytes | step 129000 |
+| No-PE | `step-163000.ckpt`, `step-164000.ckpt` | 220,697,839 bytes | step 164000 |
+| Stable RoPE | `step-142000.ckpt`, `step-143000.ckpt` | 220,698,225 bytes | step 143000 |
 
-The latest checkpoint in each arm passed ZIP CRC, full `torch.load`, mode/step,
-optimizer/scheduler, and finite-tensor checks. The files remain pilot artifacts,
-not formal evidence. The resume discarded the unsaved ranges 149001--149483
-and 129001--129426; the reused W&B runs will ignore those duplicate step logs
-until the new training passes the old remote step.
+The latest checkpoint in each arm was previously validated for full model,
+optimizer, scheduler, step state, finite tensors, and expected mode; ZIP CRC
+was reconfirmed at this snapshot. The files remain pilot artifacts, not formal
+evidence. The resume repeats the unsaved ranges 164001--164373 and
+143001--143809; reused W&B runs will ignore duplicate step logs until the new
+training passes the old remote step.
 
 ## Reported upstream/local hardening state
 
@@ -101,8 +109,9 @@ six-case H100 maximum-sequence evidence.
 
 ## Current blockers
 
-1. The shared filesystem has approximately 184G free and reports 95% usage.
-   This clears the old immediate 20G reserve failure but does not replace a
+1. The shared filesystem has approximately 106G free and reports 97% usage.
+   It reached zero free bytes on 2026-08-05 and stalled both predecessor
+   workers. The recovered space does not replace continuous monitoring or a
    full worst-case capacity calculation before formal submission.
 2. External SSH was reported to have a banner-exchange timeout, although the
    native Noether task could query Slurm at this snapshot.
@@ -117,46 +126,28 @@ six-case H100 maximum-sequence evidence.
    been proved; only the identity stream is reported exactly recoverable.
 7. CUDA identity-RNG, NCCL, tiny uninterrupted-versus-resume, and all six H100
    maximum-sequence gates remain outstanding.
-8. No-PE W&B resumed from a run whose remote step was ahead of the restored
-   checkpoint; steps 6001--6823 were ignored as non-monotonic. This is an
-   additional pilot-only provenance limitation.
+8. Both replacement W&B runs resumed from remote steps ahead of their restored
+   checkpoints. Duplicate steps are ignored as non-monotonic until the workers
+   pass approximately 164373 and 143809. This is an additional pilot-only
+   provenance limitation.
 9. The locked arms directly support the narrower ordinal Row-RoPE comparison.
    Broader temporary-identity conclusions need `cls_only`, non-ordinal
    temporary phase, and row-wise resampling controls.
 
 ## Recent actions
 
-- At 2026-08-05 10:45 BST, confirmed that `252749` and `252752` had been
-  stalled for about 28 hours with persistent 0% GPU utilization. After
-  validating `none/step-149000.ckpt` and `rope/step-129000.ckpt`, cancelled the
-  exact old chains `252749`--`252754` with user authorization.
-- Submitted replacement pilot chains `253081`--`253086`. Both Stage 1 jobs
-  started immediately on hopper, loaded the intended complete training states,
-  advanced multiple steps, and produced non-zero/100% GPU-utilization samples.
+- On 2026-08-05, detected that shared storage reached zero free bytes and that
+  Stage 1 jobs `253081` and `253084` became stuck with 0% GPU utilization,
+  frozen logs, and resident GPU memory. They did not recover when space
+  returned.
+- On 2026-08-06, after explicit user authorization, reconfirmed ZIP integrity
+  of `none/step-164000.ckpt` and `rope/step-143000.ckpt`, then cancelled the
+  exact stalled chains `253081`--`253086` at 08:28:47 BST.
+- Submitted replacement pilot chains `253196`--`253201`. Stage 1 jobs `253196`
+  and `253199` started at 08:29:48 BST, loaded the intended checkpoints,
+  advanced multiple steps, and produced active GPU-utilization samples.
 - Did not delete or alter any checkpoint, log, W&B state, bundle, or source
-  code. These resumed jobs remain pilot-only and are not formal evidence.
-- At 2026-07-22 17:28 BST, atomically published the full official baseline as
-  public `main` and a sanitized experiment snapshot as public
-  `codex/h100-rope-none-full` (`8513d8a`). The publication passed shell tests,
-  focused Python tests (9 passed), syntax/whitespace checks, secret/internal-
-  metadata scans, and a full Git object-integrity check.
-- Recorded the provenance mapping from the pilots' raw source `69e6d3d` and
-  local documentation descendant `3d70a17` to public sanitized `8513d8a`.
-  These commits are not interchangeable: the public snapshot is squashed,
-  omits operational documents, and parameterizes three Slurm paths.
-- Refreshed the native Noether job, log, GPU, checkpoint, and disk snapshot at
-  2026-07-22 17:13 BST; no pilot job was modified.
-- Verified the existing Noether SSH key authenticates to GitHub as `kikixiong`.
-  The user explicitly selected the public `kikixiong/tabicl-pe` repository for
-  ongoing source and evidence publication without `gh`.
-- Performed a read-only repository, Slurm, disk, log, checkpoint, and GPU CSV
-  audit on 2026-07-22.
-- Did not cancel, submit, requeue, or modify any Slurm job.
-- Did not deploy any overlay or alter checkpoints/artifacts.
-- Added the repository context-management documents requested by the user:
-  `AGENTS.md`, `docs/NOETHER_HANDOFF.md`, and `docs/NOETHER_STATUS.md`.
-- Reconciled the user's later external-SSH handoff with a newer Noether-native
-  snapshot. No pilot was cancelled or resubmitted.
+  code. These replacement jobs remain pilot-only and are not formal evidence.
 
 ## Refresh commands
 
@@ -170,16 +161,16 @@ git rev-parse HEAD
 git branch --show-current
 git status --short
 squeue -u jiaxio
-sacct -j 253081,253082,253083,253084,253085,253086 \
+sacct -j 253196,253197,253198,253199,253200,253201 \
   --format=JobIDRaw,JobName,State,ExitCode,Elapsed,Start,End,NodeList
 df -h /slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain
-tail -c 65536 artifacts/logs/tabicl-identity-full-253081.err | tr '\r' '\n' | tail
-tail -c 65536 artifacts/logs/tabicl-identity-full-253084.err | tr '\r' '\n' | tail
+tail -c 65536 artifacts/logs/tabicl-identity-full-253196.err | tr '\r' '\n' | tail
+tail -c 65536 artifacts/logs/tabicl-identity-full-253199.err | tr '\r' '\n' | tail
 python3 scripts/summarize_gpu_usage.py \
-  artifacts/gpu-monitor/none-stage1-253081.csv \
+  artifacts/gpu-monitor/none-stage1-253196.csv \
   --expected-gpus 1 --start-after-active --end-after-active
 python3 scripts/summarize_gpu_usage.py \
-  artifacts/gpu-monitor/rope-stage1-253084.csv \
+  artifacts/gpu-monitor/rope-stage1-253199.csv \
   --expected-gpus 1 --start-after-active --end-after-active
 find artifacts/tabiclv2-clf-identity -maxdepth 5 -type f -name '*.ckpt' -print
 ```

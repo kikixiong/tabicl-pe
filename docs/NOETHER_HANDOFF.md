@@ -40,7 +40,7 @@ within the actual controls and evidence.
 - Real path: `/mnt/data/slurm-storage/jiaxio/ws/TabFM/train/tabicl-v2-pretrain`
 - Working branch: `codex/h100-rope-none-full`
 - Baseline handoff commit: `69e6d3d961e16a9b33bc2c9f9107c382df469d2f`
-- Local operational-doc commit: `3d70a17f42efaea65e7800cdce21fd2e2e7028da`
+- Local operational-doc commit: `80714179ee792fbc39cb62591073b41f8da96042`
 - Public research repository: `https://github.com/kikixiong/tabicl-pe`
 - Research push URL: `git@github.com:kikixiong/tabicl-pe.git`
 - Public branch: `codex/h100-rope-none-full`
@@ -72,20 +72,28 @@ does not authorize applying or deleting them.
 
 ## Evidence classification
 
-The resumed `253081`--`253086` chains are infrastructure pilots only:
+The replacement `253196`--`253201` chains are infrastructure pilots only:
 
 | Arm | Stage 1 | Stage 2 | Stage 3 |
 |---|---:|---:|---:|
-| No-PE | 253081 | 253082 | 253083 |
-| Stable RoPE | 253084 | 253085 | 253086 |
+| No-PE | 253196 | 253197 | 253198 |
+| Stable RoPE | 253199 | 253200 | 253201 |
 
-These chains continue the older pilot lineage. No-PE resumed from
-`step-149000.ckpt`; Stable RoPE resumed from `step-129000.ckpt`. The preceding
-jobs `252749` and `252752` had advanced approximately 483 and 426 additional
-unsaved steps before simultaneously stalling, so the replacement jobs repeat
-those ranges and W&B ignores the duplicate non-monotonic logs. Neither
-checkpoint captures exact RNG/DataLoader state. These limitations prevent
-causal pairing even if all three stages complete.
+These chains continue the older pilot lineage. No-PE resumes from the verified
+`step-164000.ckpt`; Stable RoPE resumes from the verified
+`step-143000.ckpt`. On 2026-08-05 the shared filesystem reached zero free
+bytes, after which predecessor Stage 1 jobs `253081` and `253084` stopped
+advancing while Slurm still reported them as running. After space returned,
+their GPU utilization remained at 0% and their logs did not recover. With
+explicit user authorization, all six predecessor jobs `253081`--`253086` were
+cancelled on 2026-08-06 and replaced by the current chains.
+
+The stalled jobs had advanced to approximately global steps 164373 and 143809
+without another complete checkpoint. The replacement jobs therefore repeat
+those unsaved ranges, and the reused W&B runs ignore duplicate non-monotonic
+steps until the new workers pass the old remote step. Neither checkpoint
+captures exact RNG/DataLoader state. These limitations prevent exact-resume or
+causal-pairing claims even if all three stages complete.
 
 The first formal cohort is the immutable namespace
 `position-identity-v1-seed42`. It requires three fresh one-H100 chains (nine
@@ -103,10 +111,10 @@ Do not reuse a pilot namespace or checkpoint for formal evidence.
 
 Current pilot files include:
 
-- `artifacts/logs/tabicl-identity-full-253081.{out,err}`
-- `artifacts/logs/tabicl-identity-full-253084.{out,err}`
-- `artifacts/gpu-monitor/none-stage1-253081.csv`
-- `artifacts/gpu-monitor/rope-stage1-253084.csv`
+- `artifacts/logs/tabicl-identity-full-253196.{out,err}`
+- `artifacts/logs/tabicl-identity-full-253199.{out,err}`
+- `artifacts/gpu-monitor/none-stage1-253196.csv`
+- `artifacts/gpu-monitor/rope-stage1-253199.csv`
 
 ## Overlay and implementation state
 
@@ -159,9 +167,11 @@ but the archive was already stale when the handoff was written.
 
 1. Run a read-only audit: HEAD/worktree, `squeue`, `sacct`, `df -h`, pilot
    logs, current checkpoints, GPU CSVs, and W&B state.
-2. Let the current pilots continue as throughput/infrastructure evidence while
-   they are healthy. A recommendation to replace them later is not immediate
-   authorization to cancel them.
+2. Let the current replacement pilots continue as throughput/infrastructure
+   evidence only while logs, steps, GPU utilization, and storage remain
+   healthy. The prior disk-exhaustion stall is evidence that free-space checks
+   are a live safety requirement. A recommendation to replace these jobs later
+   is not authorization to cancel them.
 3. Obtain the newly fixed source commit or a newly generated complete overlay
    after upstream writes stop.
    Verify its digest and manifest before applying it.
@@ -176,9 +186,9 @@ but the archive was already stale when the handoff was written.
    active-window utilization at least 80% per GPU.
 7. Re-audit storage and calculate checkpoint/log/raw-prediction capacity for
    the entire requested cohort, not only seed 42.
-8. Only after every gate passes and the user authorizes the cutover, audit and
-   cancel the old pilots/dependents, then atomically submit a fresh immutable
-   seed-42 three-arm cohort with `RUN_POLICY=fresh`.
+8. Only after every gate passes and the user authorizes the formal cutover,
+   audit and cancel any then-current pilots/dependents, then atomically submit
+   a fresh immutable seed-42 three-arm cohort with `RUN_POLICY=fresh`.
 9. Repeat the unchanged protocol for seeds 43 and 44, then run the locked
    evaluation and paired statistical analysis.
 
