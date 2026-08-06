@@ -72,28 +72,32 @@ does not authorize applying or deleting them.
 
 ## Evidence classification
 
-The replacement `253196`--`253201` chains are infrastructure pilots only:
+The replacement `253251`--`253256` chains are infrastructure pilots only:
 
 | Arm | Stage 1 | Stage 2 | Stage 3 |
 |---|---:|---:|---:|
-| No-PE | 253196 | 253197 | 253198 |
-| Stable RoPE | 253199 | 253200 | 253201 |
+| No-PE | 253251 | 253252 | 253253 |
+| Stable RoPE | 253254 | 253255 | 253256 |
 
 These chains continue the older pilot lineage. No-PE resumes from the verified
-`step-164000.ckpt`; Stable RoPE resumes from the verified
-`step-143000.ckpt`. On 2026-08-05 the shared filesystem reached zero free
-bytes, after which predecessor Stage 1 jobs `253081` and `253084` stopped
-advancing while Slurm still reported them as running. After space returned,
-their GPU utilization remained at 0% and their logs did not recover. With
-explicit user authorization, all six predecessor jobs `253081`--`253086` were
-cancelled on 2026-08-06 and replaced by the current chains.
+`step-175000.ckpt`; Stable RoPE resumes from the verified
+`step-153000.ckpt`. On 2026-08-05 the shared filesystem reached zero free
+bytes, after which Stage 1 jobs `253081` and `253084` stopped advancing while
+Slurm still reported them as running. After space returned, their GPU
+utilization remained at 0% and their logs did not recover. With explicit user
+authorization, all six jobs `253081`--`253086` were cancelled and replaced by
+`253196`--`253201` on 2026-08-06. Those replacement Stage 1 jobs were healthy,
+but the user later explicitly requested another cancel and resubmit. The six
+jobs `253196`--`253201` were therefore cancelled at 2026-08-06 14:54 BST and
+replaced by the current chains; no artifact was deleted.
 
-The stalled jobs had advanced to approximately global steps 164373 and 143809
-without another complete checkpoint. The replacement jobs therefore repeat
-those unsaved ranges, and the reused W&B runs ignore duplicate non-monotonic
-steps until the new workers pass the old remote step. Neither checkpoint
-captures exact RNG/DataLoader state. These limitations prevent exact-resume or
-causal-pairing claims even if all three stages complete.
+The reused W&B runs were ahead of the latest complete files when the preceding
+workers stopped. The current jobs therefore repeat unsaved ranges after
+approximately global steps 175000 and 153000, and W&B ignores the duplicate
+non-monotonic records until the new workers pass remote steps approximately
+175395 and 153700. Neither checkpoint captures exact RNG/DataLoader state.
+These limitations prevent exact-resume or causal-pairing claims even if all
+three stages complete.
 
 The first formal cohort is the immutable namespace
 `position-identity-v1-seed42`. It requires three fresh one-H100 chains (nine
@@ -111,10 +115,10 @@ Do not reuse a pilot namespace or checkpoint for formal evidence.
 
 Current pilot files include:
 
-- `artifacts/logs/tabicl-identity-full-253196.{out,err}`
-- `artifacts/logs/tabicl-identity-full-253199.{out,err}`
-- `artifacts/gpu-monitor/none-stage1-253196.csv`
-- `artifacts/gpu-monitor/rope-stage1-253199.csv`
+- `artifacts/logs/tabicl-identity-full-253251.{out,err}`
+- `artifacts/logs/tabicl-identity-full-253254.{out,err}`
+- `artifacts/gpu-monitor/none-stage1-253251.csv`
+- `artifacts/gpu-monitor/rope-stage1-253254.csv`
 
 ## Overlay and implementation state
 
