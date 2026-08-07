@@ -5,10 +5,11 @@
 ## Current phase
 
 Implementation is CPU-complete on descendant branch
-`codex/pe-mechanism-sae-v1`. The formal training candidate is being replaced
-because the checkpoint consumer now enforces a canonical three-arm by
-three-stage ledger; all earlier H100 gate evidence is therefore stale for the
-new candidate. Running exploratory jobs remain untouched.
+`codex/pe-mechanism-sae-v1`. Its immutable training ancestor is
+`f50f095858b500f100b0c3e79132e81868dee64b` on
+`codex/position-identity-v1`. That candidate enforces a canonical three-arm by
+three-stage ledger, so all earlier H100 gate evidence is stale and must be
+rerun for this exact SHA. Running exploratory jobs remain untouched.
 
 Implemented and regression tested:
 
@@ -32,7 +33,7 @@ Implemented and regression tested:
   outputs, storage gates, and public-safe provenance;
 - version-specific TabICLv2 and TabPFN v2.6 instrumentation tests.
 
-The current CPU regression totals are 454 passed (2 skipped) for the root
+The current CPU regression totals are 844 passed (2 skipped) for the root
 package and 297 passed for the mechanism package. Both source distributions
 and wheels build successfully. These are implementation checks, not scientific
 results.
