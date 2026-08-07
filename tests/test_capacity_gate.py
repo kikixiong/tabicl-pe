@@ -20,6 +20,7 @@ from tabicl.train._run import Trainer
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "check_formal_capacity.py"
 LOG_SCRIPT = Path(__file__).parents[1] / "scripts" / "reject_nonfinite_log.py"
+DURABLE_LOG_WRAPPER = Path(__file__).parents[1] / "scripts" / "run_with_durable_log.sh"
 PRUNE_SCRIPT = (
     Path(__file__).parents[1] / "scripts" / "prune_identity_stage_checkpoints.py"
 )
@@ -501,6 +502,95 @@ def test_durable_capture_is_bounded_and_rejects_nonfinite_or_oom(tmp_path):
             command=[sys.executable, "-c", "print('x' * 10000)"],
         )
     assert overflow.stat().st_size == 11
+
+
+def test_durable_log_wrapper_keeps_capture_command_out_of_scan_position(tmp_path):
+    output = tmp_path / "run.log"
+    result = subprocess.run(
+        [
+            DURABLE_LOG_WRAPPER,
+            output,
+            "1024",
+            sys.executable,
+            "-c",
+            "import json,sys; print(json.dumps(sys.argv[1:]))",
+            "--capture",
+            "child-output",
+            "--max-bytes",
+            "7",
+        ],
+        env={"PATH": "/usr/bin:/bin", "PYTHON": sys.executable},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected = '["--capture", "child-output", "--max-bytes", "7"]\n'
+    assert json.loads(result.stdout) == {
+        "bytes": len(expected),
+        "ok": True,
+        "schema_version": 1,
+    }
+    assert output.read_text() == expected
+
+    scanned = subprocess.run(
+        [sys.executable, LOG_SCRIPT, output, "--max-bytes", "1024"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert scanned.returncode == 0, scanned.stderr
+    assert scanned.stdout == f"log accepted: {output.stat().st_size} bytes\n"
+
+
+def test_durable_log_wrapper_preserves_child_failure_and_publishes_log(tmp_path):
+    output = tmp_path / "failed.log"
+    result = subprocess.run(
+        [
+            DURABLE_LOG_WRAPPER,
+            output,
+            "1024",
+            sys.executable,
+            "-c",
+            "print('child stopped'); raise SystemExit(7)",
+        ],
+        env={"PATH": "/usr/bin:/bin", "PYTHON": sys.executable},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 7, result.stderr
+    assert json.loads(result.stdout)["ok"] is True
+    assert output.read_text() == "child stopped\n"
+    assert not output.with_name(output.name + ".live").exists()
+
+
+@pytest.mark.parametrize("tail", [[], ["--"]])
+def test_capture_cli_rejects_missing_separator_or_empty_command(tmp_path, tail):
+    output = tmp_path / f"invalid-{len(tail)}.log"
+    result = subprocess.run(
+        [
+            sys.executable,
+            LOG_SCRIPT,
+            "--max-bytes",
+            "1024",
+            "--capture",
+            output,
+            *tail,
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert not output.exists()
 
 
 def test_durable_capture_overflow_kills_stubborn_process_group_descendants(

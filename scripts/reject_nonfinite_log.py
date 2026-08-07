@@ -251,25 +251,36 @@ def capture_durable_log(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("log", nargs="?", type=Path)
-    parser.add_argument("--max-bytes", type=int, required=True)
-    parser.add_argument("--capture", type=Path)
-    parser.add_argument("command", nargs=argparse.REMAINDER)
-    args = parser.parse_args(argv)
-    if args.capture is not None:
-        if args.log is not None:
-            raise ValueError("capture mode does not accept a positional log")
-        command = args.command
-        if command[:1] == ["--"]:
-            command = command[1:]
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        separator = raw_args.index("--")
+    except ValueError:
+        separator = None
+    control_args = raw_args if separator is None else raw_args[:separator]
+    capture_requested = any(
+        token == "--capture" or token.startswith("--capture=") for token in control_args
+    )
+
+    if capture_requested:
+        if separator is None:
+            raise ValueError("capture mode requires '--' before the command")
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--max-bytes", type=int, required=True)
+        parser.add_argument("--capture", type=Path, required=True)
+        args = parser.parse_args(control_args)
+        command = raw_args[separator + 1 :]
         report, status = capture_durable_log(
             args.capture, max_bytes=args.max_bytes, command=command
         )
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))
         return status
-    if args.log is None or args.command:
-        raise ValueError("scan mode requires exactly one log path")
+
+    if separator is not None:
+        raise ValueError("scan mode does not accept a command separator")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("log", type=Path)
+    parser.add_argument("--max-bytes", type=int, required=True)
+    args = parser.parse_args(raw_args)
     report = scan_log(args.log, max_bytes=args.max_bytes)
     print(f"log accepted: {report['bytes']} bytes")
     return 0
