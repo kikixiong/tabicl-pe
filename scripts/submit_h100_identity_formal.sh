@@ -33,4 +33,13 @@ ARGS=(
 if [[ -n "${FORMAL_FAULT_LEDGER_STAGE:-}" ]]; then
   ARGS+=(--fault-ledger-stage "$FORMAL_FAULT_LEDGER_STAGE")
 fi
+if [[ -n "${FORMAL_FAULT_JOURNAL_SEAL_STAGE:-}" ]]; then
+  ARGS+=(--fault-journal-seal-stage "$FORMAL_FAULT_JOURNAL_SEAL_STAGE")
+fi
+if [[ -n "${FORMAL_FAULT_COMMIT_STAGE:-}" ]]; then
+  ARGS+=(--fault-commit-stage "$FORMAL_FAULT_COMMIT_STAGE")
+fi
+if [[ -n "${FORMAL_TEST_SIGNAL_AFTER_COMMIT:-}" ]]; then
+  ARGS+=(--test-signal-after-commit)
+fi
 exec "$PYTHON" -I -B "$ROOT/scripts/verify_formal_overlay.py" "${ARGS[@]}"

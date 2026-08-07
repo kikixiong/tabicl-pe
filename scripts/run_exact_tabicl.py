@@ -9,19 +9,18 @@ before the fixed action begins, under isolated/no-bytecode Python.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import secrets
 import sys
-import tempfile
 from types import SimpleNamespace
 
 
-def _open_directory_nofollow(path: Path) -> int:
+def _open_directory_nofollow(path: Path, *, label: str = "archive root") -> int:
     if not path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts[1:]):
-        raise ValueError("archive root must be a normalized absolute path")
+        raise ValueError(f"{label} must be a normalized absolute path")
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         raise ValueError("no-follow directory traversal is unavailable")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
@@ -34,7 +33,7 @@ def _open_directory_nofollow(path: Path) -> int:
         return fd
     except OSError as error:
         os.close(fd)
-        raise ValueError("archive root contains a symlink or invalid component") from error
+        raise ValueError(f"{label} contains a symlink or invalid component") from error
 
 
 def _load_fixed_module(name: str, path: Path):
@@ -50,34 +49,78 @@ def _load_fixed_module(name: str, path: Path):
 def _publish_no_replace(path: Path, raw: bytes, *, max_bytes: int) -> None:
     if max_bytes < 1 or len(raw) > max_bytes:
         raise ValueError("source attestation exceeds configured byte ceiling")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
+    if path.name in {"", ".", ".."}:
+        raise ValueError("publication output must name a file")
+    parent_fd = _open_directory_nofollow(path.parent, label="publication parent")
+    temporary_name: str | None = None
+    temporary_fd: int | None = None
     try:
-        fd, raw_path = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
         )
-        temporary = Path(raw_path)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(temporary, path, follow_symlinks=False)
-        temporary.unlink()
-        temporary = None
-        flags = os.O_RDONLY
-        for name in ("O_DIRECTORY", "O_CLOEXEC", "O_NOFOLLOW"):
-            flags |= getattr(os, name, 0)
-        directory_fd = os.open(path.parent, flags)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        if temporary is not None:
+        for _ in range(128):
+            candidate = f".{path.name}.{secrets.token_hex(16)}.tmp"
             try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+                temporary_fd = os.open(
+                    candidate, flags, 0o600, dir_fd=parent_fd
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        else:
+            raise FileExistsError("could not allocate a unique publication temporary")
+
+        view = memoryview(raw)
+        while view:
+            written = os.write(temporary_fd, view)
+            if written < 1:
+                raise OSError("short write while publishing exact-T evidence")
+            view = view[written:]
+        os.fsync(temporary_fd)
+        temporary_stat = os.fstat(temporary_fd)
+        named_stat = os.stat(
+            temporary_name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if (named_stat.st_dev, named_stat.st_ino) != (
+            temporary_stat.st_dev,
+            temporary_stat.st_ino,
+        ):
+            raise RuntimeError("publication temporary identity changed")
+
+        os.link(
+            temporary_name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        published_stat = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (published_stat.st_dev, published_stat.st_ino) != (
+            temporary_stat.st_dev,
+            temporary_stat.st_ino,
+        ):
+            raise RuntimeError("published evidence identity changed")
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        temporary_name = None
+        os.fsync(parent_fd)
+    finally:
+        try:
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+        finally:
+            try:
+                if temporary_name is not None:
+                    try:
+                        os.unlink(temporary_name, dir_fd=parent_fd)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(parent_fd)
 
 
 def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -263,6 +306,13 @@ def main(argv: list[str] | None = None) -> int:
                 "tree_sha": manifest["payload"]["tree_sha"],
                 "source_manifest_sha256": manifest["sha256"],
                 "runtime_evidence_sha256": runtime_evidence["sha256"],
+                "slurm_job_id": runtime_evidence["payload"]["scheduler_binding"]["job_id"],
+                "requested_resource_sha256": runtime_evidence["payload"]["scheduler_binding"][
+                    "requested_resource_sha256"
+                ],
+                "scheduler_binding_sha256": runtime_evidence["payload"]["scheduler_binding"][
+                    "sha256"
+                ],
                 "final_tabicl_attested": True,
                 "completed": True,
             }

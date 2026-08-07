@@ -13,7 +13,11 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import torch
 
-from tabicl.train._identity_rng import TrainerIdentityRNG, build_checkpoint_bundle
+from tabicl.train._identity_rng import (
+    TrainerIdentityRNG,
+    build_checkpoint_bundle,
+    make_identity_treatment,
+)
 from tabicl.train._provenance import (
     CheckpointExpectations,
     FinalizationTrust,
@@ -36,9 +40,30 @@ from tabicl.train._rng_state import capture_rank_rng_state, make_all_rank_rng_bu
 VALIDATOR_SCRIPT = (
     Path(__file__).parents[1] / "scripts" / "validate_identity_checkpoint.py"
 )
+_CPU_VALIDATOR_BOOTSTRAP = (
+    "import runpy,sys;"
+    "import tabicl.train._provenance as provenance;"
+    "provenance._FORMAL_CUDA_DEVICE_COUNT=0;"
+    "script=sys.argv.pop(1);"
+    "runpy.run_path(script,run_name='__main__')"
+)
 
 
-def _prior_stream(*, cursor: int, seed: int = 11, world_size: int = 1):
+@pytest.fixture(autouse=True)
+def _cpu_only_checkpoint_validation(monkeypatch):
+    """Keep this CPU suite independent of GPUs visible on a login node."""
+    import tabicl.train._provenance as provenance_module
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    # Production formal jobs require exactly one visible H100.  CPU unit tests
+    # privately substitute only the validator's hardware constant; there is no
+    # runtime or environment-variable override in production code.
+    monkeypatch.setattr(provenance_module, "_FORMAL_CUDA_DEVICE_COUNT", 0)
+
+
+def _prior_stream(*, cursor: int, seed: int = 42, world_size: int = 1):
     schema = '{"max_seq_len":1024,"prior":"dummy"}'
     state = {
         "schema_version": 1,
@@ -120,9 +145,9 @@ def _optimization_checkpoint_fields(
         )
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
     scaler = torch.GradScaler("cpu" if amp else "cuda", enabled=amp)
-    # One real optimizer step materializes every slot tensor.  Formal tests use
-    # production-sized terminal budgets, so advance the scalar counters
-    # mechanically rather than performing 500k redundant tiny-model updates.
+    # One real optimizer step materializes every slot tensor.  Formal fixtures
+    # use production-sized terminal budgets, so advance scalar counters without
+    # performing 500k redundant tiny-model updates.
     for _ in range(min(terminal_step, 1)):
         for parameter in model.parameters():
             if parameter.requires_grad:
@@ -163,9 +188,9 @@ def _checkpoint(
     mode="temporary",
     stage="stage1",
     terminal_step=10,
-    np_seed=11,
-    torch_seed=13,
-    identity_seed=17,
+    np_seed=42,
+    torch_seed=42,
+    identity_seed=42,
     world_size=1,
     parent_manifest=None,
     environment=None,
@@ -285,6 +310,8 @@ def _save(tmp_path: Path, checkpoint, *, step=None, name=None):
 def _validator_args(path: Path, expected: CheckpointExpectations) -> list[str]:
     return [
         sys.executable,
+        "-c",
+        _CPU_VALIDATOR_BOOTSTRAP,
         str(VALIDATOR_SCRIPT),
         "--checkpoint",
         str(path),
@@ -1248,72 +1275,102 @@ def _write_json(path: Path, value):
 
 
 _FORMAL_TEST_ARMS = ("rope", "temporary", "none")
+_FORMAL_TEST_STAGES = ("stage1", "stage2", "stage3")
 _FORMAL_TEST_BUDGETS = {
     "stage1": 500_000,
     "stage2": 40_000,
     "stage3": 10_000,
 }
+_FORMAL_TEST_SEED = 42
+_FORMAL_TEST_WORLD_SIZE = 1
+_FORMAL_TEST_CUDA_DEVICE_COUNT = 0
 
 
-def _canonical_ledger_entries(target: dict) -> list[dict]:
-    """Expand one real test artifact into a canonical nine-entry cohort."""
+def _canonical_ledger_entries(
+    manifests: dict,
+    *,
+    max_checkpoint_bytes: int,
+    study_id: str = "study-a",
+) -> list[dict]:
+    """Build the exact production ledger shape with CPU-only test hardware."""
 
-    study_id = "study-a"
-    target_key = (target["arm"], target["stage"])
-    entries: list[dict] = [dict(target)]
-    for arm in _FORMAL_TEST_ARMS:
-        for stage, terminal_step in _FORMAL_TEST_BUDGETS.items():
-            if (arm, stage) == target_key:
-                continue
-            entry = {
-                **{
-                    name: target[name]
-                    for name in (
-                        "np_seed",
-                        "torch_seed",
-                        "identity_rng_seed",
-                        "world_size",
-                        "cuda_device_count",
-                        "max_checkpoint_bytes",
-                        "source_sha256",
-                        "environment_sha256",
-                        "prior_sha256",
-                        "architecture_sha256",
-                        "optimizer_sha256",
-                        "scientific_sha256",
-                        "cohort_protocol_sha256",
-                    )
-                },
-                "arm": arm,
+    seed_manifest = make_manifest(
+        "seed",
+        {
+            "np_seed": _FORMAL_TEST_SEED,
+            "torch_seed": _FORMAL_TEST_SEED,
+            "identity_rng_seed": _FORMAL_TEST_SEED,
+            "world_size": _FORMAL_TEST_WORLD_SIZE,
+        },
+    )
+    treatments = {
+        arm: make_manifest(
+            "treatment",
+            make_identity_treatment(
+                mode=arm,
+                seed=_FORMAL_TEST_SEED,
+                world_size=_FORMAL_TEST_WORLD_SIZE,
+            ),
+        )
+        for arm in _FORMAL_TEST_ARMS
+    }
+    entries = []
+    for stage in _FORMAL_TEST_STAGES:
+        terminal_step = _FORMAL_TEST_BUDGETS[stage]
+        cohort = make_manifest(
+            "cohort_protocol",
+            {
                 "stage": stage,
                 "terminal_step": terminal_step,
-                "upstream_identity": f"{study_id}:{arm}:{stage}",
-                "artifact_identity": f"{study_id}.{arm}.{stage}.final",
-                "checkpoint_relpath": (
-                    f"arms/{arm}/{stage}/step-{terminal_step}.ckpt"
-                ),
-                "finalized_manifest_relpath": (
-                    f"arms/{arm}/{stage}/finalized-checkpoint.json"
-                ),
-                "arm_protocol_sha256": hashlib.sha256(
-                    f"arm-protocol:{arm}:{stage}".encode("utf-8")
-                ).hexdigest(),
-            }
-            entries.append(entry)
-    # Preserve the real target arm protocol, then make the two controls unique
-    # even in the negligible event of a synthetic digest collision.
-    target_stage_entries = [
-        entry for entry in entries if entry["stage"] == target["stage"]
-    ]
-    used = {target["arm_protocol_sha256"]}
-    for entry in target_stage_entries:
-        if entry["arm"] == target["arm"]:
-            continue
-        while entry["arm_protocol_sha256"] in used:
-            entry["arm_protocol_sha256"] = hashlib.sha256(
-                (entry["arm_protocol_sha256"] + entry["arm"]).encode("utf-8")
-            ).hexdigest()
-        used.add(entry["arm_protocol_sha256"])
+                "source_sha256": manifests["source"]["sha256"],
+                "environment_sha256": manifests["environment"]["sha256"],
+                "architecture_sha256": manifests["architecture"]["sha256"],
+                "prior_sha256": manifests["prior"]["sha256"],
+                "optimizer_sha256": manifests["optimizer"]["sha256"],
+                "seed_sha256": seed_manifest["sha256"],
+                "scientific_config_sha256": manifests["scientific_config"][
+                    "sha256"
+                ],
+            },
+        )
+        for arm in _FORMAL_TEST_ARMS:
+            arm_protocol = make_manifest(
+                "arm_protocol",
+                {
+                    "cohort_protocol_sha256": cohort["sha256"],
+                    "mode": arm,
+                    "treatment_sha256": treatments[arm]["sha256"],
+                },
+            )
+            entries.append(
+                {
+                    "arm": arm,
+                    "stage": stage,
+                    "terminal_step": terminal_step,
+                    "upstream_identity": f"{study_id}:{arm}:{stage}",
+                    "artifact_identity": f"{study_id}.{arm}.{stage}.final",
+                    "checkpoint_relpath": (
+                        f"arms/{arm}/{stage}/step-{terminal_step}.ckpt"
+                    ),
+                    "finalized_manifest_relpath": (
+                        f"arms/{arm}/{stage}/finalized-checkpoint.json"
+                    ),
+                    "np_seed": _FORMAL_TEST_SEED,
+                    "torch_seed": _FORMAL_TEST_SEED,
+                    "identity_rng_seed": _FORMAL_TEST_SEED,
+                    "world_size": _FORMAL_TEST_WORLD_SIZE,
+                    "cuda_device_count": _FORMAL_TEST_CUDA_DEVICE_COUNT,
+                    "max_checkpoint_bytes": max_checkpoint_bytes,
+                    "source_sha256": manifests["source"]["sha256"],
+                    "environment_sha256": manifests["environment"]["sha256"],
+                    "prior_sha256": manifests["prior"]["sha256"],
+                    "architecture_sha256": manifests["architecture"]["sha256"],
+                    "optimizer_sha256": manifests["optimizer"]["sha256"],
+                    "scientific_sha256": manifests["scientific_config"]["sha256"],
+                    "cohort_protocol_sha256": cohort["sha256"],
+                    "arm_protocol_sha256": arm_protocol["sha256"],
+                }
+            )
     return entries
 
 
@@ -1330,39 +1387,26 @@ def _unique_ledger_entry(entries, *, arm: str, stage: str) -> dict:
 
 def _finalization_setup(tmp_path: Path):
     terminal_step = _FORMAL_TEST_BUDGETS["stage1"]
-    checkpoint = _checkpoint(stage="stage1", terminal_step=terminal_step)
-    checkpoint_path = _save(tmp_path, checkpoint)
+    checkpoint = _checkpoint(
+        stage="stage1",
+        terminal_step=terminal_step,
+        np_seed=_FORMAL_TEST_SEED,
+        torch_seed=_FORMAL_TEST_SEED,
+        identity_seed=_FORMAL_TEST_SEED,
+    )
+    stage_root = tmp_path / "arms" / "temporary" / "stage1"
+    stage_root.mkdir(parents=True)
+    checkpoint_path = _save(stage_root, checkpoint)
     expected = _expectations(checkpoint)
     manifests = checkpoint["provenance"]["manifests"]
-    final_path = tmp_path / "finalized-stage1.json"
+    final_path = stage_root / "finalized-checkpoint.json"
     ledger = make_manifest(
         "transaction_ledger",
         {
             "study_id": "study-a",
             "entries": _canonical_ledger_entries(
-                {
-                    "arm": "temporary",
-                    "stage": "stage1",
-                    "terminal_step": terminal_step,
-                    "upstream_identity": "study-a:temporary:stage1",
-                    "artifact_identity": "study-a.temporary.stage1.final",
-                    "checkpoint_relpath": checkpoint_path.name,
-                    "finalized_manifest_relpath": final_path.name,
-                    "np_seed": 11,
-                    "torch_seed": 13,
-                    "identity_rng_seed": 17,
-                    "world_size": 1,
-                    "cuda_device_count": expected.cuda_device_count,
-                    "max_checkpoint_bytes": expected.max_checkpoint_bytes,
-                    "source_sha256": manifests["source"]["sha256"],
-                    "environment_sha256": manifests["environment"]["sha256"],
-                    "prior_sha256": manifests["prior"]["sha256"],
-                    "architecture_sha256": manifests["architecture"]["sha256"],
-                    "optimizer_sha256": manifests["optimizer"]["sha256"],
-                    "scientific_sha256": manifests["scientific_config"]["sha256"],
-                    "cohort_protocol_sha256": manifests["cohort_protocol"]["sha256"],
-                    "arm_protocol_sha256": manifests["arm_protocol"]["sha256"],
-                }
+                manifests,
+                max_checkpoint_bytes=expected.max_checkpoint_bytes,
             ),
         },
     )
@@ -1381,87 +1425,116 @@ def _finalization_setup(tmp_path: Path):
 
 def _rewrite_finalization_ledger_entry(trust: FinalizationTrust, **updates):
     ledger = json.loads(trust.transaction_ledger_path.read_text())
-    matches = [
-        entry
-        for entry in ledger["payload"]["entries"]
-        if entry["upstream_identity"] == trust.upstream_identity
-        and entry["artifact_identity"] == trust.artifact_identity
-    ]
-    if len(matches) != 1:
-        raise AssertionError("test ledger does not contain one trusted entry")
-    matches[0].update(updates)
+    entry = _unique_ledger_entry(
+        ledger["payload"]["entries"], arm="temporary", stage="stage1"
+    )
+    entry.update(updates)
     ledger = make_manifest("transaction_ledger", ledger["payload"])
     _write_json(trust.transaction_ledger_path, ledger)
     return replace(trust, transaction_ledger_sha256=ledger["sha256"])
 
 
-def test_canonical_transaction_ledger_rejects_incomplete_duplicate_and_budget(
-    tmp_path,
-):
-    _checkpoint_path, _final_path, _checkpoint_value, _expected, trust = (
+def _canonical_ledger_payload(tmp_path: Path) -> dict:
+    _checkpoint_path, _final_path, _checkpoint, _expected, trust = (
         _finalization_setup(tmp_path)
     )
-    payload = json.loads(trust.transaction_ledger_path.read_text())["payload"]
-    assert len(
+    return json.loads(trust.transaction_ledger_path.read_text())["payload"]
+
+
+def test_canonical_transaction_ledger_accepts_exact_formal_matrix(tmp_path):
+    payload = _canonical_ledger_payload(tmp_path)
+
+    validated = validate_canonical_transaction_ledger(
+        payload, artifact_root=tmp_path
+    )
+
+    assert list(validated) == [
+        (arm, stage)
+        for stage in _FORMAL_TEST_STAGES
+        for arm in _FORMAL_TEST_ARMS
+    ]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "permutation"])
+def test_canonical_transaction_ledger_rejects_matrix_drift(tmp_path, mutation):
+    payload = _canonical_ledger_payload(tmp_path)
+    if mutation == "missing":
+        payload["entries"].pop()
+        match = "three arms by three stages"
+    elif mutation == "duplicate":
+        payload["entries"][-1] = copy.deepcopy(payload["entries"][0])
+        match = "canonical stage-major order"
+    else:
+        payload["entries"][0], payload["entries"][1] = (
+            payload["entries"][1],
+            payload["entries"][0],
+        )
+        match = "canonical stage-major order"
+
+    with pytest.raises(ValueError, match=match):
         validate_canonical_transaction_ledger(payload, artifact_root=tmp_path)
-    ) == 9
 
-    incomplete = copy.deepcopy(payload)
-    incomplete["entries"].pop()
-    with pytest.raises(ValueError, match="three arms by three stages"):
-        validate_canonical_transaction_ledger(
-            incomplete, artifact_root=tmp_path
-        )
 
-    duplicate_path = copy.deepcopy(payload)
-    duplicate_path["entries"][1]["checkpoint_relpath"] = duplicate_path[
-        "entries"
-    ][0]["checkpoint_relpath"]
-    with pytest.raises(ValueError, match="globally unique"):
-        validate_canonical_transaction_ledger(
-            duplicate_path, artifact_root=tmp_path
-        )
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        ("budget", "budget is not canonical"),
+        ("path", "artifact path is not canonical"),
+        ("unsupported_seed", "seed is not supported"),
+        ("seed", "global invariant np_seed"),
+        ("world", "global invariant world_size"),
+        ("cuda", "global invariant cuda_device_count"),
+        ("source", "global invariant source_sha256"),
+        ("environment", "global invariant environment_sha256"),
+        ("ceiling", "global invariant max_checkpoint_bytes"),
+        ("cohort", "cohort protocol digest is not derived"),
+        ("arm", "arm protocol digest is not derived"),
+    ],
+)
+def test_canonical_transaction_ledger_rejects_protocol_drift(
+    tmp_path, mutation, match
+):
+    payload = _canonical_ledger_payload(tmp_path)
+    stage2 = [
+        entry for entry in payload["entries"] if entry["stage"] == "stage2"
+    ]
+    if mutation == "budget":
+        payload["entries"][0]["terminal_step"] += 1
+    elif mutation == "path":
+        payload["entries"][0]["checkpoint_relpath"] = "other/checkpoint.ckpt"
+    elif mutation == "unsupported_seed":
+        for entry in payload["entries"]:
+            entry["np_seed"] = 41
+            entry["torch_seed"] = 41
+            entry["identity_rng_seed"] = 41
+    elif mutation == "seed":
+        for entry in stage2:
+            entry["np_seed"] = 43
+            entry["torch_seed"] = 43
+            entry["identity_rng_seed"] = 43
+    elif mutation == "world":
+        for entry in stage2:
+            entry["world_size"] = 2
+    elif mutation == "cuda":
+        for entry in stage2:
+            entry["cuda_device_count"] = 1
+    elif mutation == "source":
+        for entry in stage2:
+            entry["source_sha256"] = "e" * 64
+    elif mutation == "environment":
+        for entry in stage2:
+            entry["environment_sha256"] = "e" * 64
+    elif mutation == "ceiling":
+        for entry in stage2:
+            entry["max_checkpoint_bytes"] += 1
+    elif mutation == "cohort":
+        for entry in stage2:
+            entry["cohort_protocol_sha256"] = "e" * 64
+    else:
+        stage2[0]["arm_protocol_sha256"] = "e" * 64
 
-    wrong_budget = copy.deepcopy(payload)
-    wrong_budget["entries"][0]["terminal_step"] += 1
-    with pytest.raises(ValueError, match="budget is not canonical"):
-        validate_canonical_transaction_ledger(
-            wrong_budget, artifact_root=tmp_path
-        )
-
-    missing_arm = copy.deepcopy(payload)
-    missing_arm["entries"][0]["arm"] = "rope"
-    with pytest.raises(ValueError, match="unique and complete"):
-        validate_canonical_transaction_ledger(
-            missing_arm, artifact_root=tmp_path
-        )
-
-    shared_mismatch = copy.deepcopy(payload)
-    shared_mismatch["entries"][1]["np_seed"] += 1
-    with pytest.raises(ValueError, match="shared invariant np_seed"):
-        validate_canonical_transaction_ledger(
-            shared_mismatch, artifact_root=tmp_path
-        )
-
-    treatment_alias = copy.deepcopy(payload)
-    treatment_alias["entries"][1]["arm_protocol_sha256"] = treatment_alias[
-        "entries"
-    ][0]["arm_protocol_sha256"]
-    with pytest.raises(ValueError, match="treatment protocols must differ"):
-        validate_canonical_transaction_ledger(
-            treatment_alias, artifact_root=tmp_path
-        )
-
-    outside = tmp_path.parent / f"{tmp_path.name}-outside"
-    outside.mkdir()
-    escape = tmp_path / "escape"
-    escape.symlink_to(outside, target_is_directory=True)
-    escaping_path = copy.deepcopy(payload)
-    escaping_path["entries"][0]["checkpoint_relpath"] = "escape/checkpoint.ckpt"
-    with pytest.raises(ValueError, match="escapes artifact root"):
-        validate_canonical_transaction_ledger(
-            escaping_path, artifact_root=tmp_path
-        )
+    with pytest.raises(ValueError, match=match):
+        validate_canonical_transaction_ledger(payload, artifact_root=tmp_path)
 
 
 def _finalization_cli_args(
@@ -1577,7 +1650,7 @@ def test_finalization_study_must_match_checkpoint_operational_provenance(tmp_pat
         _finalization_setup(tmp_path)
     )
     ledger = json.loads(trust.transaction_ledger_path.read_text())
-    payload = dict(ledger["payload"])
+    payload = copy.deepcopy(ledger["payload"])
     payload["study_id"] = "study-b"
     for entry in payload["entries"]:
         entry["upstream_identity"] = entry["upstream_identity"].replace(
@@ -1629,17 +1702,13 @@ def test_finalization_rejects_symlinked_artifact_root(tmp_path):
 
 
 def test_finalization_rejects_symlinked_ledger_parent(tmp_path):
-    checkpoint_path, _final_path, _checkpoint_value, expected, trust = (
+    checkpoint_path, final_path, _checkpoint_value, expected, trust = (
         _finalization_setup(tmp_path)
     )
-    real_parent = tmp_path / "real-final-parent"
-    real_parent.mkdir()
-    alias = tmp_path / "ledger-parent-alias"
-    alias.symlink_to(real_parent, target_is_directory=True)
-    final_path = alias / "final.json"
-    trust = _rewrite_finalization_ledger_entry(
-        trust, finalized_manifest_relpath=f"{alias.name}/{final_path.name}"
-    )
+    canonical_parent = tmp_path / "arms" / "temporary"
+    real_parent = tmp_path / "real-temporary-parent"
+    canonical_parent.rename(real_parent)
+    canonical_parent.symlink_to(real_parent, target_is_directory=True)
 
     with pytest.raises(ValueError, match="symlink"):
         finalize_identity_checkpoint(
@@ -1834,7 +1903,7 @@ def _parent_trust(
     tmp_path: Path,
     *,
     mode="temporary",
-    np_seed=11,
+    np_seed=_FORMAL_TEST_SEED,
     ledger_np_seed=None,
     parent_stage="stage1",
     terminal_step=None,
@@ -1847,6 +1916,8 @@ def _parent_trust(
         stage=parent_stage,
         terminal_step=terminal_step,
         np_seed=np_seed,
+        torch_seed=_FORMAL_TEST_SEED,
+        identity_seed=_FORMAL_TEST_SEED,
         environment=environment,
     )
     cuda_device_count = parent["rng_state"]["rank_states"]["0"][
@@ -1868,12 +1939,10 @@ def _parent_trust(
                     "stage": predecessor,
                     "terminal_step": _FORMAL_TEST_BUDGETS[predecessor],
                     "upstream_identity": f"study-a:{mode}:{predecessor}",
-                    "artifact_identity": (
-                        f"study-a.{mode}.{predecessor}.final"
-                    ),
+                    "artifact_identity": f"study-a.{mode}.{predecessor}.final",
                     "np_seed": np_seed,
-                    "torch_seed": 13,
-                    "identity_rng_seed": 17,
+                    "torch_seed": _FORMAL_TEST_SEED,
+                    "identity_rng_seed": _FORMAL_TEST_SEED,
                     "world_size": 1,
                     "cuda_device_count": cuda_device_count,
                     "max_checkpoint_bytes": 64 << 20,
@@ -1888,7 +1957,9 @@ def _parent_trust(
                 }
             },
         )
-    parent_path = _save(tmp_path, parent, name=f"step-{terminal_step}.ckpt")
+    stage_root = tmp_path / "arms" / mode / parent_stage
+    stage_root.mkdir(parents=True)
+    parent_path = _save(stage_root, parent, name=f"step-{terminal_step}.ckpt")
     parent_digest = checkpoint_sha256(parent_path)
     manifests = parent["provenance"]["manifests"]
     final = make_manifest(
@@ -1917,42 +1988,24 @@ def _parent_trust(
             "max_checkpoint_bytes": 64 << 20,
         },
     )
-    final_path = tmp_path / f"final-{mode}.json"
+    final_path = stage_root / "finalized-checkpoint.json"
     _write_json(final_path, final)
+    ledger_entries = _canonical_ledger_entries(
+        manifests,
+        max_checkpoint_bytes=64 << 20,
+    )
+    if ledger_np_seed is not None:
+        _unique_ledger_entry(
+            ledger_entries, arm=mode, stage=parent_stage
+        )["np_seed"] = ledger_np_seed
     ledger = make_manifest(
         "transaction_ledger",
         {
             "study_id": "study-a",
-            "entries": _canonical_ledger_entries(
-                {
-                    "arm": mode,
-                    "stage": parent_stage,
-                    "upstream_identity": f"study-a:{mode}:{parent_stage}",
-                    "artifact_identity": (
-                        f"study-a.{mode}.{parent_stage}.final"
-                    ),
-                    "checkpoint_relpath": parent_path.name,
-                    "finalized_manifest_relpath": final_path.name,
-                    "terminal_step": terminal_step,
-                    "np_seed": np_seed if ledger_np_seed is None else ledger_np_seed,
-                    "torch_seed": 13,
-                    "identity_rng_seed": 17,
-                    "world_size": 1,
-                    "cuda_device_count": cuda_device_count,
-                    "max_checkpoint_bytes": 64 << 20,
-                    "source_sha256": manifests["source"]["sha256"],
-                    "environment_sha256": manifests["environment"]["sha256"],
-                    "prior_sha256": manifests["prior"]["sha256"],
-                    "architecture_sha256": manifests["architecture"]["sha256"],
-                    "optimizer_sha256": manifests["optimizer"]["sha256"],
-                    "scientific_sha256": manifests["scientific_config"]["sha256"],
-                    "cohort_protocol_sha256": manifests["cohort_protocol"]["sha256"],
-                    "arm_protocol_sha256": manifests["arm_protocol"]["sha256"],
-                }
-            ),
+            "entries": ledger_entries,
         },
     )
-    ledger_path = tmp_path / f"ledger-{mode}.json"
+    ledger_path = tmp_path / "transaction-ledger.json"
     _write_json(ledger_path, ledger)
     trust = ParentTrust(
         checkpoint_path=parent_path,
@@ -1980,8 +2033,8 @@ def _parent_trust(
                 "upstream_identity": f"study-a:{mode}:{parent_stage}",
                 "artifact_identity": f"study-a.{mode}.{parent_stage}.final",
                 "np_seed": np_seed,
-                "torch_seed": 13,
-                "identity_rng_seed": 17,
+                "torch_seed": _FORMAL_TEST_SEED,
+                "identity_rng_seed": _FORMAL_TEST_SEED,
                 "world_size": 1,
                 "cuda_device_count": cuda_device_count,
                 "max_checkpoint_bytes": 64 << 20,
@@ -2018,8 +2071,7 @@ def test_parent_ledger_ceiling_is_enforced_before_deserialization(
     ledger = json.loads(trust.transaction_ledger_path.read_text())
     reduced_ceiling = trust.checkpoint_path.stat().st_size - 1
     for entry in ledger["payload"]["entries"]:
-        if entry["stage"] == trust.parent_stage:
-            entry["max_checkpoint_bytes"] = reduced_ceiling
+        entry["max_checkpoint_bytes"] = reduced_ceiling
     ledger = make_manifest("transaction_ledger", ledger["payload"])
     _write_json(trust.transaction_ledger_path, ledger)
     final_payload = json.loads(trust.finalized_manifest_path.read_text())["payload"]
@@ -2060,17 +2112,14 @@ def test_parent_ledger_relative_path_rejects_symlink_component(tmp_path):
     alias = tmp_path / "artifact-alias"
     alias.symlink_to(tmp_path, target_is_directory=True)
     ledger = json.loads(trust.transaction_ledger_path.read_text())
-    target_entry = _unique_ledger_entry(
+    _unique_ledger_entry(
         ledger["payload"]["entries"], arm=trust.arm, stage=trust.parent_stage
-    )
-    target_entry["checkpoint_relpath"] = (
-        f"{alias.name}/{trust.checkpoint_path.name}"
-    )
+    )["checkpoint_relpath"] = f"{alias.name}/{trust.checkpoint_path.name}"
     ledger = make_manifest("transaction_ledger", ledger["payload"])
     _write_json(trust.transaction_ledger_path, ledger)
     trust = replace(trust, transaction_ledger_sha256=ledger["sha256"])
 
-    with pytest.raises(ValueError, match="symlink"):
+    with pytest.raises(ValueError, match="artifact path is not canonical"):
         validate_parent_trust(trust)
 
 
@@ -2192,7 +2241,7 @@ def test_stage2_validator_cli_constructs_complete_parent_trust(tmp_path):
 
 
 def test_parent_seed_and_world_are_validated_against_immutable_ledger(tmp_path):
-    trust, parent_manifest = _parent_trust(tmp_path, np_seed=99, ledger_np_seed=11)
+    trust, parent_manifest = _parent_trust(tmp_path, np_seed=99)
     child = _checkpoint(
         stage="stage2", terminal_step=20, parent_manifest=parent_manifest
     )
@@ -2230,10 +2279,16 @@ def test_real_trainer_stage_transition_consumes_ledger_derived_parent_fields(
         checkpoint_path=str(trust.checkpoint_path),
         only_load_model=True,
         row_identity_mode="temporary",
-        np_seed=11,
-        torch_seed=13,
-        identity_rng_seed=17,
+        np_seed=_FORMAL_TEST_SEED,
+        torch_seed=_FORMAL_TEST_SEED,
+        identity_rng_seed=_FORMAL_TEST_SEED,
+        max_checkpoint_bytes=64 << 20,
     )
+
+    trainer.config.max_checkpoint_bytes -= 1
+    with pytest.raises(ValueError, match="max_checkpoint_bytes"):
+        trainer._formal_parent_manifest()
+    trainer.config.max_checkpoint_bytes += 1
 
     parent = trainer._formal_parent_manifest()
 
@@ -2273,9 +2328,10 @@ def test_formal_trainer_rejects_symlinked_parent_trust_input(
         "checkpoint_path": str(trust.checkpoint_path),
         "only_load_model": True,
         "row_identity_mode": "temporary",
-        "np_seed": 11,
-        "torch_seed": 13,
-        "identity_rng_seed": 17,
+        "np_seed": _FORMAL_TEST_SEED,
+        "torch_seed": _FORMAL_TEST_SEED,
+        "identity_rng_seed": _FORMAL_TEST_SEED,
+        "max_checkpoint_bytes": 64 << 20,
     }
     values[field] = str(alias / getattr(trust, trust_attribute).name)
     trainer = Trainer.__new__(Trainer)
@@ -2311,9 +2367,10 @@ def test_formal_trainer_consumes_same_fd_validated_parent_after_path_swap(
         checkpoint_dir=None,
         only_load_model=True,
         row_identity_mode="temporary",
-        np_seed=11,
-        torch_seed=13,
-        identity_rng_seed=17,
+        np_seed=_FORMAL_TEST_SEED,
+        torch_seed=_FORMAL_TEST_SEED,
+        identity_rng_seed=_FORMAL_TEST_SEED,
+        max_checkpoint_bytes=64 << 20,
         device="cpu",
     )
     trainer.identity_rng = SimpleNamespace(
@@ -2381,13 +2438,15 @@ def test_real_trainer_builds_formal_stage2_and_stage3_provenance(
             "--row_identity_mode",
             "temporary",
             "--np_seed",
-            "11",
+            str(_FORMAL_TEST_SEED),
             "--torch_seed",
-            "13",
+            str(_FORMAL_TEST_SEED),
             "--identity_rng_seed",
-            "17",
+            str(_FORMAL_TEST_SEED),
             "--max_steps",
             str(child_step),
+            "--max_checkpoint_bytes",
+            str(64 << 20),
             "--checkpoint_path",
             str(trust.checkpoint_path),
             "--only_load_model",
@@ -2437,9 +2496,12 @@ def test_real_trainer_builds_formal_stage2_and_stage3_provenance(
     trainer.configure_optimizer()
     trainer.configure_amp()
     trainer.identity_rng = TrainerIdentityRNG(
-        identity_mode="temporary", base_seed=17, rank=0, world_size=1
+        identity_mode="temporary",
+        base_seed=_FORMAL_TEST_SEED,
+        rank=0,
+        world_size=1,
     )
-    child_prior = _prior_stream(cursor=0)
+    child_prior = _prior_stream(cursor=0, seed=_FORMAL_TEST_SEED)
     trainer.prior_dataset = SimpleNamespace(
         logical_stream_state_dict=lambda cursor=0: {
             **child_prior,

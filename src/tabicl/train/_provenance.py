@@ -39,18 +39,33 @@ PROVENANCE_SCHEMA_VERSION = 1
 FORMAL_MODES = frozenset({"rope", "temporary", "none"})
 FORMAL_STAGES = frozenset({"stage1", "stage2", "stage3"})
 _FORMAL_ARM_ORDER = ("rope", "temporary", "none")
+_FORMAL_STAGE_ORDER = ("stage1", "stage2", "stage3")
 _FORMAL_STAGE_BUDGETS = {
     "stage1": 500_000,
     "stage2": 40_000,
     "stage3": 10_000,
 }
+_FORMAL_LEDGER_ORDER = tuple(
+    (arm, stage) for stage in _FORMAL_STAGE_ORDER for arm in _FORMAL_ARM_ORDER
+)
+_FORMAL_SUPPORTED_SEEDS = frozenset({42, 43, 44})
+_FORMAL_WORLD_SIZE = 1
+_FORMAL_CUDA_DEVICE_COUNT = 1
+_FORMAL_MAX_CHECKPOINT_BYTES_LIMIT = 1 << 40
 ARCHITECTURE_TREATMENT_FIELD = "row_identity_mode"
 TREATMENT_CONFIG_FIELDS = frozenset({ARCHITECTURE_TREATMENT_FIELD})
 # These are the only run-config fields removed from the scientific manifest.
 # Runtime choices such as world size, precision, compilation, FA3, recompute,
 # prior device and worker count intentionally remain scientific.
 OPERATIONAL_CONFIG_FIELDS = frozenset(
-    {"checkpoint_dir", "checkpoint_path", "wandb_dir", "wandb_name", "wandb_id"}
+    {
+        "checkpoint_dir",
+        "checkpoint_path",
+        "progress_refresh_seconds",
+        "wandb_dir",
+        "wandb_name",
+        "wandb_id",
+    }
 )
 FORMAL_PROTOCOL_CONFIG_FIELDS = frozenset(
     {
@@ -1255,94 +1270,134 @@ def validate_canonical_transaction_ledger(
     study_id = payload["study_id"]
     if not isinstance(study_id, str) or _SAFE_ID.fullmatch(study_id) is None:
         raise ValueError("transaction ledger study_id is invalid")
+    _absolute_lexical_path(artifact_root, where="artifact root")
+
     raw_entries = payload["entries"]
-    if not isinstance(raw_entries, list) or len(raw_entries) != 9:
+    if not isinstance(raw_entries, list) or len(raw_entries) != len(
+        _FORMAL_LEDGER_ORDER
+    ):
         raise ValueError(
             "transaction ledger must contain exactly three arms by three stages"
         )
     entries = [dict(_validate_ledger_entry(entry)) for entry in raw_entries]
-    expected_keys = {
-        (arm, stage)
-        for arm in _FORMAL_ARM_ORDER
-        for stage in _FORMAL_STAGE_BUDGETS
-    }
-    keys = [(entry["arm"], entry["stage"]) for entry in entries]
-    if len(set(keys)) != len(keys) or set(keys) != expected_keys:
+    observed_order = [(entry["arm"], entry["stage"]) for entry in entries]
+    if observed_order != list(_FORMAL_LEDGER_ORDER):
         raise ValueError(
-            "transaction ledger arm/stage entries must be unique and complete"
+            "transaction ledger entries must use canonical stage-major order"
         )
 
-    root = os.path.realpath(
-        os.fspath(_absolute_lexical_path(artifact_root, where="artifact root"))
-    )
-    checkpoint_paths: list[str] = []
-    finalized_paths: list[str] = []
-    by_key: dict[tuple[str, str], Mapping[str, Any]] = {}
-    for entry in entries:
-        arm = entry["arm"]
-        stage = entry["stage"]
-        if entry["terminal_step"] != _FORMAL_STAGE_BUDGETS[stage]:
-            raise ValueError(f"transaction ledger {stage} budget is not canonical")
-        if entry["upstream_identity"] != f"{study_id}:{arm}:{stage}" or entry[
-            "artifact_identity"
-        ] != f"{study_id}.{arm}.{stage}.final":
-            raise ValueError("transaction ledger producer identity is not canonical")
-        for field, destination in (
-            ("checkpoint_relpath", checkpoint_paths),
-            ("finalized_manifest_relpath", finalized_paths),
-        ):
-            relative = _validate_relative_path(
-                entry[field], where=f"transaction ledger {field}"
-            )
-            resolved = os.path.realpath(
-                os.path.join(root, *PurePosixPath(relative).parts)
-            )
-            try:
-                contained = os.path.commonpath((root, resolved)) == root
-            except ValueError:
-                contained = False
-            if not contained:
-                raise ValueError(
-                    f"transaction ledger {field} escapes artifact root"
-                )
-            destination.append(resolved)
-        by_key[(arm, stage)] = entry
-    all_paths = checkpoint_paths + finalized_paths
-    if len(set(checkpoint_paths)) != 9 or len(set(finalized_paths)) != 9 or len(
-        set(all_paths)
-    ) != 18:
-        raise ValueError("transaction ledger artifact paths must be globally unique")
+    seed = entries[0]["np_seed"]
+    if seed not in _FORMAL_SUPPORTED_SEEDS:
+        raise ValueError("transaction ledger seed is not supported")
+    max_checkpoint_bytes = entries[0]["max_checkpoint_bytes"]
+    if max_checkpoint_bytes > _FORMAL_MAX_CHECKPOINT_BYTES_LIMIT:
+        raise ValueError("transaction ledger checkpoint ceiling is too large")
+    source_sha256 = entries[0]["source_sha256"]
+    environment_sha256 = entries[0]["environment_sha256"]
+    global_fields = {
+        "np_seed": seed,
+        "torch_seed": seed,
+        "identity_rng_seed": seed,
+        "world_size": _FORMAL_WORLD_SIZE,
+        "cuda_device_count": _FORMAL_CUDA_DEVICE_COUNT,
+        "max_checkpoint_bytes": max_checkpoint_bytes,
+        "source_sha256": source_sha256,
+        "environment_sha256": environment_sha256,
+    }
 
-    shared_stage_fields = (
-        "terminal_step",
-        "np_seed",
-        "torch_seed",
-        "identity_rng_seed",
-        "world_size",
-        "cuda_device_count",
-        "max_checkpoint_bytes",
-        "source_sha256",
-        "environment_sha256",
+    from tabicl.train._identity_rng import make_identity_treatment
+
+    seed_sha256 = make_manifest(
+        "seed",
+        {
+            "np_seed": seed,
+            "torch_seed": seed,
+            "identity_rng_seed": seed,
+            "world_size": _FORMAL_WORLD_SIZE,
+        },
+    )["sha256"]
+    treatment_sha256 = {
+        arm: make_manifest(
+            "treatment",
+            make_identity_treatment(
+                mode=arm,
+                seed=seed,
+                world_size=_FORMAL_WORLD_SIZE,
+            ),
+        )["sha256"]
+        for arm in _FORMAL_ARM_ORDER
+    }
+
+    by_key: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for entry, (arm, stage) in zip(entries, _FORMAL_LEDGER_ORDER):
+        terminal_step = _FORMAL_STAGE_BUDGETS[stage]
+        expected_checkpoint = f"arms/{arm}/{stage}/step-{terminal_step}.ckpt"
+        expected_finalized = f"arms/{arm}/{stage}/finalized-checkpoint.json"
+        if entry["terminal_step"] != terminal_step:
+            raise ValueError(f"transaction ledger {stage} budget is not canonical")
+        if (
+            entry["upstream_identity"] != f"{study_id}:{arm}:{stage}"
+            or entry["artifact_identity"] != f"{study_id}.{arm}.{stage}.final"
+        ):
+            raise ValueError("transaction ledger producer identity is not canonical")
+        if (
+            entry["checkpoint_relpath"] != expected_checkpoint
+            or entry["finalized_manifest_relpath"] != expected_finalized
+        ):
+            raise ValueError("transaction ledger artifact path is not canonical")
+        for field, expected_value in global_fields.items():
+            if entry[field] != expected_value:
+                raise ValueError(
+                    f"transaction ledger global invariant {field} differs"
+                )
+        by_key[(arm, stage)] = entry
+
+    stage_fields = (
         "prior_sha256",
         "architecture_sha256",
         "optimizer_sha256",
         "scientific_sha256",
         "cohort_protocol_sha256",
     )
-    for stage in _FORMAL_STAGE_BUDGETS:
+    for stage in _FORMAL_STAGE_ORDER:
         stage_entries = [by_key[(arm, stage)] for arm in _FORMAL_ARM_ORDER]
-        for field in shared_stage_fields:
+        for field in stage_fields:
             if len({entry[field] for entry in stage_entries}) != 1:
                 raise ValueError(
                     f"transaction ledger {stage} shared invariant {field} differs"
                 )
-        arm_protocols = {
-            entry["arm_protocol_sha256"] for entry in stage_entries
-        }
-        if len(arm_protocols) != len(_FORMAL_ARM_ORDER):
+        exemplar = stage_entries[0]
+        expected_cohort = make_manifest(
+            "cohort_protocol",
+            {
+                "stage": stage,
+                "terminal_step": _FORMAL_STAGE_BUDGETS[stage],
+                "source_sha256": source_sha256,
+                "environment_sha256": environment_sha256,
+                "architecture_sha256": exemplar["architecture_sha256"],
+                "prior_sha256": exemplar["prior_sha256"],
+                "optimizer_sha256": exemplar["optimizer_sha256"],
+                "seed_sha256": seed_sha256,
+                "scientific_config_sha256": exemplar["scientific_sha256"],
+            },
+        )["sha256"]
+        if exemplar["cohort_protocol_sha256"] != expected_cohort:
             raise ValueError(
-                f"transaction ledger {stage} arm treatment protocols must differ"
+                "transaction ledger cohort protocol digest is not derived"
             )
+        for arm in _FORMAL_ARM_ORDER:
+            expected_arm = make_manifest(
+                "arm_protocol",
+                {
+                    "cohort_protocol_sha256": expected_cohort,
+                    "mode": arm,
+                    "treatment_sha256": treatment_sha256[arm],
+                },
+            )["sha256"]
+            if by_key[(arm, stage)]["arm_protocol_sha256"] != expected_arm:
+                raise ValueError(
+                    "transaction ledger arm protocol digest is not derived"
+                )
     return by_key
 
 

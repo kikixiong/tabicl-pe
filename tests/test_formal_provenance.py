@@ -452,7 +452,7 @@ def test_provenance_bundle_rejects_rehashed_shared_manifest_without_protocol_reh
         validate_provenance_bundle(tampered)
 
 
-def _formal_trainer(tmp_path, *, source_sha=None):
+def _formal_trainer(tmp_path, *, source_sha=None, max_checkpoint_bytes=1 << 20):
     from tabicl.train._identity_rng import TrainerIdentityRNG
     from tabicl.train._run import Trainer
     from tabicl.train._train_config import build_parser
@@ -485,6 +485,8 @@ def _formal_trainer(tmp_path, *, source_sha=None):
             "500000",
             "--checkpoint_dir",
             str(tmp_path / "checkpoints"),
+            "--max_checkpoint_bytes",
+            str(max_checkpoint_bytes),
             "--formal_training",
             "true",
             "--formal_stage",
@@ -560,6 +562,7 @@ def test_formal_parser_defaults_off_and_exposes_explicit_trust_inputs():
 
     config = build_parser().parse_args([])
     assert config.formal_training is False
+    assert config.max_checkpoint_bytes is None
     for name in (
         "formal_stage",
         "formal_source_manifest",
@@ -588,6 +591,34 @@ def test_trainer_formal_checkpoint_persists_validated_provenance(tmp_path):
         "stage": "stage1",
         "terminal_step": 500_000,
     }
+
+
+@pytest.mark.parametrize("value", [None, True, False, 0, -1, 1.5, "100"])
+def test_formal_trainer_requires_positive_overlay_checkpoint_ceiling(tmp_path, value):
+    trainer = _formal_trainer(tmp_path)
+    trainer.config.max_checkpoint_bytes = value
+    with pytest.raises(ValueError, match="positive max_checkpoint_bytes overlay ceiling"):
+        trainer.configure_formal_provenance()
+
+
+def test_formal_trainer_passes_overlay_checkpoint_ceiling_to_atomic_save(
+    tmp_path, monkeypatch
+):
+    import tabicl.train._run as run_module
+
+    trainer = _formal_trainer(tmp_path, max_checkpoint_bytes=123_456)
+    trainer.configure_formal_provenance()
+    observed = {}
+
+    def capture_save(value, path, *, max_bytes):
+        observed.update(value=value, path=path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(run_module, "atomic_torch_save", capture_save)
+    trainer.save_checkpoint("step-1.ckpt")
+
+    assert observed["max_bytes"] == 123_456
+    assert observed["path"].endswith("/step-1.ckpt")
+    assert observed["value"]["provenance"] == trainer.formal_provenance
 
 
 def test_formal_trainer_fails_closed_on_external_source_digest_drift(tmp_path):

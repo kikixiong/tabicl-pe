@@ -11,7 +11,7 @@ export PYTHONPATH="$ROOT/src" PYTHONNOUSERSITE=1
 
 for NAME in FORMAL_ARTIFACT_ROOT FORMAL_CHECKPOINT_DIR FORMAL_SOURCE_MANIFEST \
   FORMAL_SOURCE_SHA256 FORMAL_SOURCE_COMMIT_SHA FORMAL_SOURCE_TREE_SHA \
-  FORMAL_ENVIRONMENT_SHA256 FORMAL_STUDY_ID FORMAL_OUTPUT_ID \
+  FORMAL_ENVIRONMENT_SHA256 FORMAL_SEED FORMAL_STUDY_ID FORMAL_OUTPUT_ID \
   FORMAL_PRIOR_SHA256 FORMAL_ARCHITECTURE_SHA256 FORMAL_OPTIMIZER_SHA256 \
   FORMAL_SCIENTIFIC_SHA256 FORMAL_COHORT_PROTOCOL_SHA256 FORMAL_ARM_PROTOCOL_SHA256 \
   FORMAL_TRANSACTION_LEDGER FORMAL_TRANSACTION_LEDGER_SHA256 \
@@ -23,6 +23,11 @@ for NAME in FORMAL_ARTIFACT_ROOT FORMAL_CHECKPOINT_DIR FORMAL_SOURCE_MANIFEST \
   FORMAL_MANIFEST_CEILING_BYTES FORMAL_PROTOCOL_METADATA_ALLOWANCE_BYTES; do
   [[ -n "${!NAME:-}" ]] || { echo "$NAME is required" >&2; exit 2; }
 done
+case "$FORMAL_SEED" in
+  42|43|44) ;;
+  *) echo "FORMAL_SEED must be exactly 42, 43, or 44" >&2; exit 2 ;;
+esac
+readonly FORMAL_SEED
 [[ ! -e "$FORMAL_CHECKPOINT_DIR" && ! -L "$FORMAL_CHECKPOINT_DIR" ]] || {
   echo "fresh stage namespace already exists" >&2; exit 1;
 }
@@ -39,7 +44,7 @@ done
   --attestation-ceiling-bytes "$FORMAL_ATTESTATION_CEILING_BYTES" \
   --manifest-ceiling-bytes "$FORMAL_MANIFEST_CEILING_BYTES" \
   --protocol-metadata-allowance-bytes "$FORMAL_PROTOCOL_METADATA_ALLOWANCE_BYTES"
-mkdir -p "$FORMAL_CHECKPOINT_DIR"
+mkdir -- "$FORMAL_CHECKPOINT_DIR"
 TRAIN_LOG="$FORMAL_CHECKPOINT_DIR/train.log"
 SOURCE_ATTESTATION="$FORMAL_CHECKPOINT_DIR/source-attestation-trainer.json"
 VALIDATOR_ATTESTATION="$FORMAL_CHECKPOINT_DIR/source-attestation-validator.json"
@@ -75,7 +80,9 @@ PYTHON="$PYTHON" "$ROOT/scripts/run_with_durable_log.sh" \
     --wandb_log false --wandb_project TabICLv2-Identity \
     --wandb_name "$FORMAL_OUTPUT_ID" --wandb_mode disabled \
     --wandb_dir "$FORMAL_CHECKPOINT_DIR/wandb" \
-    --np_seed 42 --torch_seed 42 --identity_rng_seed 42 --max_steps 10000 \
+    --np_seed "$FORMAL_SEED" --torch_seed "$FORMAL_SEED" \
+    --identity_rng_seed "$FORMAL_SEED" --max_steps 10000 \
+    --progress_refresh_seconds 30 \
     --batch_size 64 --micro_batch_size 1 --lr 2e-5 \
     --muon true --beta1 0.9 --weight_decay 0.01 --use_cautious_wd false \
     --scheduler cosine_with_restarts --warmup_proportion 0.01 \
@@ -95,7 +102,8 @@ PYTHON="$PYTHON" "$ROOT/scripts/run_with_durable_log.sh" \
     --icl_num_blocks 12 --icl_nhead 8 --icl_ssmax true \
     --ssmax_type qassmax-mlp-elementwise --ff_factor 2 \
     --norm_first true --zero_init false --use_flash_attn3 true --recompute true \
-    --checkpoint_dir "$FORMAL_CHECKPOINT_DIR" --save_temp_every 100 \
+    --checkpoint_dir "$FORMAL_CHECKPOINT_DIR" \
+    --max_checkpoint_bytes "$CHECKPOINT_CEILING_BYTES" --save_temp_every 100 \
     --save_perm_every 10000 --max_checkpoints 1 --empty_cache_every 0
 
 "$PYTHON" -I -B "$ROOT/scripts/reject_nonfinite_log.py" "$TRAIN_LOG" \
@@ -110,7 +118,8 @@ PYTHON="$PYTHON" "$ROOT/scripts/run_with_durable_log.sh" \
     --action checkpoint-validator --source-attestation-output "$VALIDATOR_ATTESTATION" \
     --source-attestation-max-bytes "$FORMAL_ATTESTATION_CEILING_BYTES" -- \
     --checkpoint "$FINAL_CHECKPOINT" --mode "$MODE" \
-    --np-seed 42 --torch-seed 42 --identity-seed 42 \
+    --np-seed "$FORMAL_SEED" --torch-seed "$FORMAL_SEED" \
+    --identity-seed "$FORMAL_SEED" \
     --stage stage3 --terminal-step 10000 --source-sha256 "$FORMAL_SOURCE_SHA256" \
     --environment-sha256 "$FORMAL_ENVIRONMENT_SHA256" --prior-sha256 "$FORMAL_PRIOR_SHA256" \
     --architecture-sha256 "$FORMAL_ARCHITECTURE_SHA256" \

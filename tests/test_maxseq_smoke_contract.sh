@@ -8,19 +8,38 @@ contains() { grep -F -- "$2" "$1" >/dev/null || fail "$(basename "$1") lacks $2"
 
 for SCRIPT in \
   "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" \
+  "$ROOT/scripts/run_slurm_h100_identity_case.sh" \
   "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" \
+  "$ROOT/scripts/slurm_h100_identity_nccl_smoke.sh" \
+  "$ROOT/scripts/submit_h100_identity_validation.sh" \
   "$ROOT/scripts/formal_run_with_gpu_monitor.sh"; do
   [[ -x "$SCRIPT" ]] || fail "$SCRIPT is not executable"
   bash -n "$SCRIPT"
 done
 
 contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" '#SBATCH --qos=short'
-contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" 'checkout --quiet --detach'
-contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" ': "${GIT:?'
-contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" '"$GIT" clone'
-contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" ': "${NVIDIA_SMI:?'
-contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" '"$NVIDIA_SMI" --query-gpu=uuid'
-contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" 'EXPECTED_GPUS=2'
+contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" '#SBATCH --gres=gpu:1'
+contains "$ROOT/scripts/slurm_h100_identity_nccl_smoke.sh" '#SBATCH --gres=gpu:2'
+contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" 'nccl_2gpu must use the dedicated two-GPU wrapper'
+contains "$ROOT/scripts/slurm_h100_identity_nccl_smoke.sh" 'reserved for nccl_2gpu'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'checkout --quiet --detach'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'hermetic_git() {'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'GIT_ALLOW_PROTOCOL=https'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'hermetic_git -C "$CHECKOUT_PARENT" clone --quiet --no-hardlinks --no-checkout --'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'remote get-url origin'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '"$NVIDIA_SMI" --id="$GPU_TOKEN"'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'trap '\''status=$?; trap - EXIT INT TERM; cleanup; exit "$status"'\'' EXIT'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'verify_filesystem_isolation.py'
+contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" 'exec "$FORMAL_SUBMISSION_EXACT_ROOT/scripts/run_slurm_h100_identity_case.sh" 1'
+contains "$ROOT/scripts/slurm_h100_identity_nccl_smoke.sh" 'exec "$FORMAL_SUBMISSION_EXACT_ROOT/scripts/run_slurm_h100_identity_case.sh" 2'
+if grep -F 'dirname "${BASH_SOURCE[0]}"' "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" >/dev/null; then
+  fail "one-GPU spool wrapper resolves an untrusted sibling directory"
+fi
+if grep -F 'dirname "${BASH_SOURCE[0]}"' "$ROOT/scripts/slurm_h100_identity_nccl_smoke.sh" >/dev/null; then
+  fail "two-GPU spool wrapper resolves an untrusted sibling directory"
+fi
+contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" 'FORMAL_VISIBLE_GPU_UUIDS'
+contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" 'FORMAL_EXPECTED_ENVIRONMENT_SHA256'
 contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" '--nproc_per_node=2'
 if grep -F 'MAXSEQ_REPEAT_STEPS' "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" >/dev/null; then
   fail "hostile repeat-step override is exposed"
@@ -29,6 +48,18 @@ contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" '--utilization-requir
 contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" 'functional case created unbound GPU monitor artifacts'
 contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" '--checkpoint-ceiling-bytes'
 contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" '--runtime-evidence-output'
+contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" 'os.mkdir(case_id, mode=0o700, dir_fd=directory_fd)'
+contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" 'os.O_NOFOLLOW'
+contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" 'os.path.normpath(root) != root'
+if grep -F 'mkdir -- "$CASE_ROOT"' "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" >/dev/null; then
+  fail "case root creation follows a path instead of a validated parent dirfd"
+fi
+if grep -F 'mkdir -p "$CASE_ROOT"' "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" >/dev/null; then
+  fail "case root creation is not atomic fresh-only mkdir"
+fi
+if grep -F '[[ ! -e "$CASE_ROOT"' "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" >/dev/null; then
+  fail "case root uses a check-then-create race"
+fi
 contains "$ROOT/scripts/formal_run_with_gpu_monitor.sh" 'summarize_formal_gpu_usage.py'
 contains "$ROOT/scripts/formal_run_with_gpu_monitor.sh" 'FORMAL_GPU_ACTIVE_START_SIGNAL='
 contains "$ROOT/scripts/formal_run_with_gpu_monitor.sh" 'FORMAL_GPU_ACTIVE_END_SIGNAL='

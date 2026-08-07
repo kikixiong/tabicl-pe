@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -45,12 +47,21 @@ def test_empty_three_arm_study_accounts_for_all_peaks_and_logs():
     capacity = _module()
     checkpoint_ceiling = (1 << 53) + 17
     log_allowance = 123_457
+    unit = 4097
 
     remaining = capacity.empty_study_remaining_bytes(
-        checkpoint_ceiling, log_allowance
+        checkpoint_ceiling, log_allowance, allocation_unit=unit
+    )
+    components = capacity.physical_budget_components(
+        checkpoint_ceiling, log_allowance, allocation_unit=unit
     )
 
-    assert remaining == 15 * checkpoint_ceiling + log_allowance
+    assert remaining == components["total_physical_budget_bytes"]
+    assert components["checkpoint_physical_budget_bytes"] == 15 * (
+        (checkpoint_ceiling + unit - 1) // unit * unit
+    )
+    assert components["directory_entry_slots"] == 114
+    assert components["directory_physical_budget_bytes"] == 131 * unit
     assert capacity.required_bytes(remaining) == (
         20 * (1 << 30) + (5 * remaining + 3) // 4
     )
@@ -60,6 +71,7 @@ def test_audited_remaining_handles_staggered_cross_arm_progress():
     capacity = _module()
     checkpoint_ceiling = 101
     allowance = 17
+    unit = 64
     initial, consumed, remaining = capacity.remaining_after_audit(
         checkpoint_ceiling,
         allowance,
@@ -67,11 +79,17 @@ def test_audited_remaining_handles_staggered_cross_arm_progress():
         # One arm may already have a final while two arms retain differently
         # sized live temporaries.  Byte subtraction neither assumes lockstep
         # progress nor double-counts those existing artifacts.
-        checkpoint_bytes=101 + 73 + 29,
-        durable_bytes=11,
+        checkpoint_bytes=320,
+        durable_bytes=64,
+        durable_file_count=1,
+        directory_count=5,
+        directory_bytes=200,
+        allocation_unit=unit,
     )
-    assert initial == 15 * checkpoint_ceiling + allowance
-    assert consumed == 214
+    assert initial == capacity.empty_study_remaining_bytes(
+        checkpoint_ceiling, allowance, allocation_unit=unit
+    )
+    assert consumed == 584
     assert remaining == initial - consumed
 
 
@@ -82,6 +100,57 @@ def test_statvfs_available_bytes_uses_integer_bavail_times_frsize(tmp_path):
     assert capacity.available_bytes(tmp_path, statvfs=lambda _path: fake) == (
         ((1 << 53) + 3) * 4097
     )
+
+
+def test_preflight_rounds_tiny_slots_and_counts_every_directory_slot():
+    capacity = _module()
+    unit = 4096
+    report = capacity.physical_budget_components(
+        1, 1, allocation_unit=unit
+    )
+
+    assert report["checkpoint_physical_budget_bytes"] == 15 * unit
+    assert report["durable_physical_budget_bytes"] == unit
+    assert report["directory_entry_slots"] == 114
+    assert report["directory_physical_budget_bytes"] == 131 * unit
+    assert report["total_physical_budget_bytes"] == 147 * unit
+    assert report["durable_file_slots"] == 78
+    assert report["durable_entry_slots"] == 82
+
+
+def test_aggregate_rounding_uses_all_bounded_durable_file_slots_exactly():
+    capacity = _module()
+    unit = 4096
+    # 78 one-byte files use 78 fragments; the 79th aggregate byte must share
+    # an already active slot and does not invent an unbounded 79th file.
+    assert capacity._aggregate_physical_budget(79, 78, unit) == 78 * unit
+
+
+@pytest.mark.parametrize("delta,allowed", [(0, True), (-1, False)])
+def test_physical_preflight_boundary_is_exact(tmp_path, capsys, delta, allowed):
+    capacity = _module()
+    unit = 4096
+    remaining = capacity.empty_study_remaining_bytes(
+        1, 1, allocation_unit=unit
+    )
+    required = capacity.required_bytes(remaining)
+    result = capacity.main(
+        [
+            "--artifact-root",
+            str(tmp_path),
+            "--checkpoint-ceiling-bytes",
+            "1",
+            "--durable-log-allowance-bytes",
+            "1",
+        ],
+        available_bytes_fn=lambda _path: required + delta,
+        allocation_unit_bytes_fn=lambda _path: unit,
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert result == (0 if allowed else 1)
+    assert report["allowed"] is allowed
+    assert report["remaining_bytes"] == remaining
+    assert report["required_bytes"] == required
 
 
 @pytest.mark.parametrize("delta,allowed", [(0, True), (-1, False)])
@@ -154,7 +223,10 @@ def test_main_outputs_canonical_report_and_refuses_one_byte_short(tmp_path, caps
     capacity = _module()
     checkpoint_ceiling = 101
     log_allowance = 17
-    remaining = 15 * checkpoint_ceiling + log_allowance
+    unit = 4096
+    remaining = capacity.empty_study_remaining_bytes(
+        checkpoint_ceiling, log_allowance, allocation_unit=unit
+    )
     required = 20 * (1 << 30) + (5 * remaining + 3) // 4
     result = capacity.main(
         [
@@ -166,18 +238,22 @@ def test_main_outputs_canonical_report_and_refuses_one_byte_short(tmp_path, caps
             str(log_allowance),
         ],
         available_bytes_fn=lambda _path: required - 1,
+        allocation_unit_bytes_fn=lambda _path: unit,
     )
 
     assert result == 1
     report = json.loads(capsys.readouterr().out)
-    assert report == {
-        "allowed": False,
-        "available_bytes": required - 1,
-        "remaining_bytes": remaining,
-        "required_bytes": required,
-        "reasons": ["remaining_capacity"],
-        "schema_version": 1,
-    }
+    assert report["allowed"] is False
+    assert report["available_bytes"] == required - 1
+    assert report["remaining_bytes"] == remaining
+    assert report["required_bytes"] == required
+    assert report["reasons"] == ["remaining_capacity"]
+    assert report["schema_version"] == 1
+    assert report["allocation_unit_bytes"] == unit
+    assert report["durable_file_slots"] == 78
+    assert report["durable_entry_slots"] == 82
+    assert report["directory_slots"] == 17
+    assert report["budget_basis"] == "physical_allocation_bytes"
 
 
 @pytest.mark.parametrize("delta,allowed", [(0, True), (-1, False)])
@@ -187,9 +263,27 @@ def test_audited_staggered_capacity_exact_boundary(tmp_path, capsys, delta, allo
     allowance = 1_000
     (tmp_path / "step-1.ckpt").write_bytes(b"c" * 73)
     (tmp_path / "protocol-ledger.json").write_bytes(b"p" * 29)
-    initial = 15 * checkpoint_ceiling + allowance
-    consumed = 73 + 29
-    remaining = initial - consumed
+    unit = 4096
+    audited = capacity.audit_artifact_tree(
+        tmp_path,
+        checkpoint_ceiling_bytes=checkpoint_ceiling,
+        durable_log_allowance_bytes=allowance,
+        run_log_ceiling_bytes=10,
+        attestation_ceiling_bytes=10,
+        manifest_ceiling_bytes=10,
+        allocation_unit=unit,
+    )
+    initial, consumed, remaining = capacity.remaining_after_audit(
+        checkpoint_ceiling,
+        allowance,
+        checkpoint_count=audited["checkpoint_count"],
+        checkpoint_bytes=audited["checkpoint_bytes"],
+        durable_bytes=audited["durable_bytes"],
+        durable_file_count=audited["durable_file_count"],
+        directory_count=audited["directory_count"],
+        directory_bytes=audited["directory_bytes"],
+        allocation_unit=unit,
+    )
     required = capacity.required_bytes(remaining)
 
     result = capacity.main(
@@ -209,18 +303,22 @@ def test_audited_staggered_capacity_exact_boundary(tmp_path, capsys, delta, allo
             "--manifest-ceiling-bytes",
             "10",
             "--protocol-metadata-allowance-bytes",
-            "550",
+            "370",
         ],
         available_bytes_fn=lambda _path: required + delta,
+        allocation_unit_bytes_fn=lambda _path: unit,
     )
 
     assert result == (0 if allowed else 1)
     report = json.loads(capsys.readouterr().out)
     assert report["allowed"] is allowed
     assert report["initial_study_bytes"] == initial
-    assert report["consumed_checkpoint_bytes"] == 73
+    assert report["consumed_checkpoint_bytes"] == audited["checkpoint_bytes"]
+    assert report["consumed_checkpoint_logical_bytes"] == 73
     assert report["consumed_checkpoint_count"] == 1
-    assert report["consumed_durable_bytes"] == 29
+    assert report["consumed_durable_bytes"] == audited["durable_bytes"]
+    assert report["consumed_durable_logical_bytes"] == 29
+    assert report["consumed_directory_bytes"] == audited["directory_bytes"]
     assert report["consumed_bytes"] == consumed
     assert report["remaining_bytes"] == remaining
     assert report["remaining_source"] == "audited_study_bytes"
@@ -258,14 +356,18 @@ def test_capacity_retries_when_tree_mutates_between_audit_and_statvfs(
             "--manifest-ceiling-bytes",
             "10",
             "--protocol-metadata-allowance-bytes",
-            "550",
+            "370",
         ],
         available_bytes_fn=mutate_once,
+        allocation_unit_bytes_fn=lambda _path: 4096,
     )
     report = json.loads(capsys.readouterr().out)
     assert result == 0
     assert calls == 2
-    assert report["consumed_durable_bytes"] == 5
+    assert report["consumed_durable_logical_bytes"] == 5
+    assert report["consumed_durable_bytes"] == capacity._physical_bytes(
+        artifact.stat()
+    )
 
 
 def test_audited_remaining_never_becomes_negative():
@@ -401,6 +503,198 @@ def test_durable_capture_is_bounded_and_rejects_nonfinite_or_oom(tmp_path):
     assert overflow.stat().st_size == 11
 
 
+def test_durable_capture_overflow_kills_stubborn_process_group_descendants(
+    tmp_path,
+):
+    logs = _script_module("reject_nonfinite_log_process_group", LOG_SCRIPT)
+    output = tmp_path / "overflow-group.log"
+    grandchild_pid_path = tmp_path / "grandchild.pid"
+    child_script = """
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+grandchild = subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+])
+pathlib.Path(sys.argv[1]).write_text(str(grandchild.pid))
+sys.stdout.write("x" * 65536)
+sys.stdout.flush()
+time.sleep(60)
+"""
+
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="exceeded"):
+        logs.capture_durable_log(
+            output,
+            max_bytes=16,
+            command=[
+                sys.executable,
+                "-u",
+                "-c",
+                child_script,
+                str(grandchild_pid_path),
+            ],
+        )
+    assert time.monotonic() - started < 10.0
+    grandchild_pid = int(grandchild_pid_path.read_text())
+
+    def process_is_live(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        proc_stat = Path(f"/proc/{pid}/stat")
+        try:
+            # Zombies no longer execute or retain the captured pipe; their
+            # parent/init reaps them asynchronously.
+            return proc_stat.read_text().split()[2] != "Z"
+        except FileNotFoundError:
+            return False
+
+    deadline = time.monotonic() + 5.0
+    while process_is_live(grandchild_pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not process_is_live(grandchild_pid)
+    assert output.stat().st_size == 16
+    assert not (tmp_path / "overflow-group.log.live").exists()
+
+
+def test_durable_capture_publication_exception_leaves_no_process_group(
+    tmp_path, monkeypatch
+):
+    logs = _script_module("reject_nonfinite_log_exception_group", LOG_SCRIPT)
+    output = tmp_path / "exception-group.log"
+    grandchild_pid_path = tmp_path / "exception-grandchild.pid"
+    child_script = """
+import pathlib
+import subprocess
+import sys
+
+grandchild = subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+])
+pathlib.Path(sys.argv[1]).write_text(str(grandchild.pid))
+"""
+
+    monkeypatch.setattr(
+        logs.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("forced publication failure")
+        ),
+    )
+    with pytest.raises(OSError, match="forced publication failure"):
+        logs.capture_durable_log(
+            output,
+            max_bytes=16,
+            command=[
+                sys.executable,
+                "-u",
+                "-c",
+                child_script,
+                str(grandchild_pid_path),
+            ],
+        )
+    grandchild_pid = int(grandchild_pid_path.read_text())
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{grandchild_pid}/stat").read_text().split()[2]
+        except (FileNotFoundError, ProcessLookupError):
+            break
+        if state == "Z":
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("stubborn grandchild survived capture exception cleanup")
+    assert not output.exists()
+    assert not (tmp_path / "exception-group.log.live").exists()
+
+
+def test_durable_capture_exposes_bounded_live_log_then_publishes_same_inode(
+    tmp_path,
+):
+    logs = _script_module("reject_nonfinite_log_live", LOG_SCRIPT)
+    output = tmp_path / "train.log"
+    live = tmp_path / "train.log.live"
+    release = tmp_path / "release"
+    result = {}
+
+    def capture():
+        try:
+            result["value"] = logs.capture_durable_log(
+                output,
+                max_bytes=512,
+                command=[
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    (
+                        "import pathlib,sys,time; "
+                        "gate=pathlib.Path(sys.argv[1]); "
+                        "print('step=1 loss=0.5', flush=True); "
+                        "\nwhile not gate.exists(): time.sleep(0.01)\n"
+                        "print('step=2 loss=0.4', flush=True)"
+                    ),
+                    str(release),
+                ],
+            )
+        except BaseException as error:  # surfaced in the assertion thread
+            result["error"] = error
+
+    thread = threading.Thread(target=capture)
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if live.exists() and b"step=1" in live.read_bytes():
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("bounded live log did not become readable")
+
+    live_stat = live.stat()
+    assert live_stat.st_size <= 512
+    assert not output.exists()
+    release.touch()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert "error" not in result
+    assert result["value"][1] == 0
+    assert not live.exists()
+    assert output.stat().st_ino == live_stat.st_ino
+    assert output.stat().st_size <= 512
+    assert output.read_text().splitlines() == [
+        "step=1 loss=0.5",
+        "step=2 loss=0.4",
+    ]
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["ENOSPC", "No space left on device", "OSError: [Errno 28] failed"],
+)
+def test_durable_capture_rejects_storage_exhaustion_signatures(tmp_path, message):
+    logs = _script_module(f"reject_enospc_{hash(message)}", LOG_SCRIPT)
+    output = tmp_path / "run.log"
+
+    with pytest.raises(ValueError, match="storage exhausted"):
+        logs.capture_durable_log(
+            output,
+            max_bytes=1_024,
+            command=[sys.executable, "-c", f"print({message!r})"],
+        )
+
+    assert output.exists()
+    assert not (tmp_path / "run.log.live").exists()
+
+
 def test_durable_capture_never_replaces_existing_output(tmp_path):
     logs = _script_module("reject_nonfinite_log_race", LOG_SCRIPT)
     output = tmp_path / "run.log"
@@ -473,13 +767,27 @@ def test_post_validation_prune_refuses_three_checkpoint_peak(tmp_path):
 def test_durable_subbudgets_sum_across_all_nine_jobs_once():
     capacity = _module()
     report = capacity.validate_durable_budget_partition(
-        durable_log_allowance_bytes=18 * 100 + 18 * 10 + 9 * 20 + 40,
+        durable_log_allowance_bytes=36 * 100 + 18 * 10 + 9 * 20 + 40,
         run_log_ceiling_bytes=100,
         attestation_ceiling_bytes=10,
         manifest_ceiling_bytes=20,
         protocol_metadata_allowance_bytes=40,
     )
     assert report["assigned_bytes"] == report["durable_log_allowance_bytes"]
+    assert report["assigned_bytes"] == 4 * 9 * 100 + 2 * 9 * 10 + 9 * 20 + 40
+
+    # The historical two-output/job calculation omitted the externally owned
+    # scheduler stdout/stderr slots.  The standalone stage capacity gate must
+    # reject that under-budget even when every other partition is exact.
+    legacy_two_output_budget = 2 * 9 * 100 + 2 * 9 * 10 + 9 * 20 + 40
+    with pytest.raises(ValueError, match="aggregate"):
+        capacity.validate_durable_budget_partition(
+            durable_log_allowance_bytes=legacy_two_output_budget,
+            run_log_ceiling_bytes=100,
+            attestation_ceiling_bytes=10,
+            manifest_ceiling_bytes=20,
+            protocol_metadata_allowance_bytes=40,
+        )
 
     with pytest.raises(ValueError, match="aggregate"):
         capacity.validate_durable_budget_partition(
@@ -507,8 +815,16 @@ def test_artifact_tree_audit_counts_every_noncheckpoint_byte(tmp_path):
         attestation_ceiling_bytes=3,
         manifest_ceiling_bytes=4,
     )
-    assert report["checkpoint_bytes"] == 10
-    assert report["durable_bytes"] == 14
+    assert report["checkpoint_logical_bytes"] == 10
+    assert report["durable_logical_bytes"] == 14
+    assert report["checkpoint_bytes"] == capacity._physical_bytes(
+        (tmp_path / "step-1.ckpt").stat()
+    )
+    assert report["durable_bytes"] == sum(
+        capacity._physical_bytes(path.stat())
+        for path in tmp_path.iterdir()
+        if path.is_file() and path.name != "step-1.ckpt"
+    )
 
     with pytest.raises(ValueError, match="aggregate"):
         capacity.audit_artifact_tree(
@@ -518,4 +834,192 @@ def test_artifact_tree_audit_counts_every_noncheckpoint_byte(tmp_path):
             run_log_ceiling_bytes=5,
             attestation_ceiling_bytes=3,
             manifest_ceiling_bytes=4,
+        )
+
+
+def test_artifact_tree_counts_empty_directory_physical_allocation(tmp_path):
+    capacity = _module()
+    empty = tmp_path / "empty-stage"
+    empty.mkdir()
+    report = capacity.audit_artifact_tree(
+        tmp_path,
+        checkpoint_ceiling_bytes=1,
+        durable_log_allowance_bytes=1,
+        run_log_ceiling_bytes=1,
+        attestation_ceiling_bytes=1,
+        manifest_ceiling_bytes=1,
+    )
+    expected = capacity._physical_bytes(tmp_path.stat()) + capacity._physical_bytes(
+        empty.stat()
+    )
+    assert report["directory_count"] == 2
+    assert report["directory_observed_physical_bytes"] == expected
+    assert report["directory_entry_count"] == 2
+    assert report["directory_reserved_consumed_bytes"] == 4 * 4096
+    assert report["directory_bytes"] == max(expected, 4 * 4096)
+    assert report["durable_bytes"] == 0
+
+
+@pytest.mark.parametrize("delta,allowed", [(0, True), (-1, False)])
+def test_audited_parent_dirent_growth_boundary_is_exact(
+    tmp_path, capsys, delta, allowed
+):
+    capacity = _module()
+    unit = 4096
+    audited = capacity.audit_artifact_tree(
+        tmp_path,
+        checkpoint_ceiling_bytes=1,
+        durable_log_allowance_bytes=1_000,
+        run_log_ceiling_bytes=10,
+        attestation_ceiling_bytes=10,
+        manifest_ceiling_bytes=10,
+        allocation_unit=unit,
+    )
+    initial, consumed, remaining = capacity.remaining_after_audit(
+        1,
+        1_000,
+        checkpoint_count=0,
+        checkpoint_bytes=0,
+        durable_bytes=0,
+        durable_file_count=0,
+        directory_count=audited["directory_count"],
+        directory_bytes=audited["directory_bytes"],
+        allocation_unit=unit,
+    )
+    assert audited["directory_entry_count"] == 1
+    assert audited["directory_reserved_consumed_bytes"] == 2 * unit
+    assert consumed == audited["directory_bytes"]
+    assert initial - consumed == remaining
+    required = capacity.required_bytes(remaining)
+    result = capacity.main(
+        [
+            "--artifact-root",
+            str(tmp_path),
+            "--checkpoint-ceiling-bytes",
+            "1",
+            "--durable-log-allowance-bytes",
+            "1000",
+            "--audit-tree",
+            "--remaining-from-audit",
+            "--run-log-ceiling-bytes",
+            "10",
+            "--attestation-ceiling-bytes",
+            "10",
+            "--manifest-ceiling-bytes",
+            "10",
+            "--protocol-metadata-allowance-bytes",
+            "370",
+        ],
+        available_bytes_fn=lambda _path: required + delta,
+        allocation_unit_bytes_fn=lambda _path: unit,
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert result == (0 if allowed else 1)
+    assert report["allowed"] is allowed
+    assert report["remaining_bytes"] == remaining
+
+
+def test_artifact_tree_rejects_more_than_bounded_directory_slots(tmp_path):
+    capacity = _module()
+    for index in range(capacity.FORMAL_DIRECTORY_SLOTS):
+        (tmp_path / f"directory-{index:02d}").mkdir()
+    with pytest.raises(ValueError, match="too many directory slots"):
+        capacity.audit_artifact_tree(
+            tmp_path,
+            checkpoint_ceiling_bytes=1,
+            durable_log_allowance_bytes=1,
+            run_log_ceiling_bytes=1,
+            attestation_ceiling_bytes=1,
+            manifest_ceiling_bytes=1,
+        )
+
+
+def test_artifact_tree_deduplicates_atomic_hardlink_physical_bytes(tmp_path):
+    capacity = _module()
+    originals = []
+    for index in range(capacity.DURABLE_FILE_SLOTS):
+        path = tmp_path / f"metadata-{index:02d}.json"
+        path.write_bytes(b"x")
+        originals.append(path)
+    (tmp_path / ".metadata-atomic.tmp").hardlink_to(originals[0])
+    report = capacity.audit_artifact_tree(
+        tmp_path,
+        checkpoint_ceiling_bytes=1,
+        durable_log_allowance_bytes=capacity.DURABLE_FILE_SLOTS,
+        run_log_ceiling_bytes=1,
+        attestation_ceiling_bytes=1,
+        manifest_ceiling_bytes=1,
+    )
+    assert report["durable_file_count"] == capacity.DURABLE_FILE_SLOTS
+    assert report["durable_entry_count"] == capacity.DURABLE_FILE_SLOTS + 1
+    assert report["durable_logical_bytes"] == capacity.DURABLE_FILE_SLOTS
+    assert report["durable_bytes"] == sum(
+        capacity._physical_bytes(path.stat()) for path in originals
+    )
+
+
+def test_directory_audit_counts_cross_fragment_dirent_growth(tmp_path):
+    capacity = _module()
+    originals = []
+    for index in range(capacity.DURABLE_FILE_SLOTS):
+        path = tmp_path / ("metadata-" + "x" * 180 + f"-{index:02d}")
+        path.write_bytes(b"x")
+        originals.append(path)
+    for index in range(capacity.ATOMIC_DURABLE_ENTRY_SLOTS):
+        (tmp_path / f".atomic-long-name-{index}.tmp").hardlink_to(
+            originals[index]
+        )
+    report = capacity.audit_artifact_tree(
+        tmp_path,
+        checkpoint_ceiling_bytes=1,
+        durable_log_allowance_bytes=capacity.DURABLE_FILE_SLOTS,
+        run_log_ceiling_bytes=1,
+        attestation_ceiling_bytes=1,
+        manifest_ceiling_bytes=1,
+    )
+    assert report["durable_entry_count"] == capacity.DURABLE_ENTRY_SLOTS
+    assert report["directory_reserved_consumed_bytes"] == (
+        report["directory_count"] + report["directory_entry_count"]
+    ) * report["allocation_unit_bytes"]
+    assert report["directory_reserved_consumed_bytes"] > report[
+        "allocation_unit_bytes"
+    ]
+    assert report["directory_bytes"] == max(
+        report["directory_observed_physical_bytes"],
+        report["directory_reserved_consumed_bytes"],
+    )
+
+
+def test_artifact_tree_rejects_more_than_atomic_entry_peak(tmp_path):
+    capacity = _module()
+    originals = []
+    for index in range(capacity.DURABLE_FILE_SLOTS):
+        path = tmp_path / f"metadata-{index:02d}.json"
+        path.write_bytes(b"x")
+        originals.append(path)
+    for index in range(capacity.ATOMIC_DURABLE_ENTRY_SLOTS + 1):
+        (tmp_path / f".atomic-{index}.tmp").hardlink_to(originals[index])
+    with pytest.raises(ValueError, match="too many durable file entries"):
+        capacity.audit_artifact_tree(
+            tmp_path,
+            checkpoint_ceiling_bytes=1,
+            durable_log_allowance_bytes=capacity.DURABLE_FILE_SLOTS,
+            run_log_ceiling_bytes=1,
+            attestation_ceiling_bytes=1,
+            manifest_ceiling_bytes=1,
+        )
+
+
+def test_artifact_tree_rejects_more_than_durable_inode_slots(tmp_path):
+    capacity = _module()
+    for index in range(capacity.DURABLE_FILE_SLOTS + 1):
+        (tmp_path / f"unique-{index:02d}.json").write_bytes(b"x")
+    with pytest.raises(ValueError, match="too many durable file slots"):
+        capacity.audit_artifact_tree(
+            tmp_path,
+            checkpoint_ceiling_bytes=1,
+            durable_log_allowance_bytes=capacity.DURABLE_FILE_SLOTS + 1,
+            run_log_ceiling_bytes=1,
+            attestation_ceiling_bytes=1,
+            manifest_ceiling_bytes=1,
         )
