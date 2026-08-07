@@ -38,6 +38,12 @@ MANIFEST_SCHEMA_VERSION = 1
 PROVENANCE_SCHEMA_VERSION = 1
 FORMAL_MODES = frozenset({"rope", "temporary", "none"})
 FORMAL_STAGES = frozenset({"stage1", "stage2", "stage3"})
+_FORMAL_ARM_ORDER = ("rope", "temporary", "none")
+_FORMAL_STAGE_BUDGETS = {
+    "stage1": 500_000,
+    "stage2": 40_000,
+    "stage3": 10_000,
+}
 ARCHITECTURE_TREATMENT_FIELD = "row_identity_mode"
 TREATMENT_CONFIG_FIELDS = frozenset({ARCHITECTURE_TREATMENT_FIELD})
 # These are the only run-config fields removed from the scientific manifest.
@@ -1236,6 +1242,110 @@ def _validate_ledger_entry(entry: Any) -> Mapping[str, Any]:
     return entry
 
 
+def validate_canonical_transaction_ledger(
+    payload: Any,
+    *,
+    artifact_root: str | os.PathLike[str],
+) -> dict[tuple[str, str], Mapping[str, Any]]:
+    """Validate the exact immutable three-arm, three-stage formal ledger."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("transaction ledger payload must be an object")
+    _require_exact_keys(payload, {"study_id", "entries"}, where="transaction ledger")
+    study_id = payload["study_id"]
+    if not isinstance(study_id, str) or _SAFE_ID.fullmatch(study_id) is None:
+        raise ValueError("transaction ledger study_id is invalid")
+    raw_entries = payload["entries"]
+    if not isinstance(raw_entries, list) or len(raw_entries) != 9:
+        raise ValueError(
+            "transaction ledger must contain exactly three arms by three stages"
+        )
+    entries = [dict(_validate_ledger_entry(entry)) for entry in raw_entries]
+    expected_keys = {
+        (arm, stage)
+        for arm in _FORMAL_ARM_ORDER
+        for stage in _FORMAL_STAGE_BUDGETS
+    }
+    keys = [(entry["arm"], entry["stage"]) for entry in entries]
+    if len(set(keys)) != len(keys) or set(keys) != expected_keys:
+        raise ValueError(
+            "transaction ledger arm/stage entries must be unique and complete"
+        )
+
+    root = os.path.realpath(
+        os.fspath(_absolute_lexical_path(artifact_root, where="artifact root"))
+    )
+    checkpoint_paths: list[str] = []
+    finalized_paths: list[str] = []
+    by_key: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for entry in entries:
+        arm = entry["arm"]
+        stage = entry["stage"]
+        if entry["terminal_step"] != _FORMAL_STAGE_BUDGETS[stage]:
+            raise ValueError(f"transaction ledger {stage} budget is not canonical")
+        if entry["upstream_identity"] != f"{study_id}:{arm}:{stage}" or entry[
+            "artifact_identity"
+        ] != f"{study_id}.{arm}.{stage}.final":
+            raise ValueError("transaction ledger producer identity is not canonical")
+        for field, destination in (
+            ("checkpoint_relpath", checkpoint_paths),
+            ("finalized_manifest_relpath", finalized_paths),
+        ):
+            relative = _validate_relative_path(
+                entry[field], where=f"transaction ledger {field}"
+            )
+            resolved = os.path.realpath(
+                os.path.join(root, *PurePosixPath(relative).parts)
+            )
+            try:
+                contained = os.path.commonpath((root, resolved)) == root
+            except ValueError:
+                contained = False
+            if not contained:
+                raise ValueError(
+                    f"transaction ledger {field} escapes artifact root"
+                )
+            destination.append(resolved)
+        by_key[(arm, stage)] = entry
+    all_paths = checkpoint_paths + finalized_paths
+    if len(set(checkpoint_paths)) != 9 or len(set(finalized_paths)) != 9 or len(
+        set(all_paths)
+    ) != 18:
+        raise ValueError("transaction ledger artifact paths must be globally unique")
+
+    shared_stage_fields = (
+        "terminal_step",
+        "np_seed",
+        "torch_seed",
+        "identity_rng_seed",
+        "world_size",
+        "cuda_device_count",
+        "max_checkpoint_bytes",
+        "source_sha256",
+        "environment_sha256",
+        "prior_sha256",
+        "architecture_sha256",
+        "optimizer_sha256",
+        "scientific_sha256",
+        "cohort_protocol_sha256",
+    )
+    for stage in _FORMAL_STAGE_BUDGETS:
+        stage_entries = [by_key[(arm, stage)] for arm in _FORMAL_ARM_ORDER]
+        for field in shared_stage_fields:
+            if len({entry[field] for entry in stage_entries}) != 1:
+                raise ValueError(
+                    f"transaction ledger {stage} shared invariant {field} differs"
+                )
+        arm_protocols = {
+            entry["arm_protocol_sha256"] for entry in stage_entries
+        }
+        if len(arm_protocols) != len(_FORMAL_ARM_ORDER):
+            raise ValueError(
+                f"transaction ledger {stage} arm treatment protocols must differ"
+            )
+    return by_key
+
+
 def checkpoint_sha256(path: str | os.PathLike[str]) -> str:
     fd, before = _open_regular_nofollow(path)
     digest = hashlib.sha256()
@@ -2301,29 +2411,20 @@ def validate_parent_trust(trust: ParentTrust) -> ValidatedParent:
         expected_sha=trust.transaction_ledger_sha256,
     )
     ledger_payload = ledger["payload"]
-    _require_exact_keys(
-        ledger_payload, {"study_id", "entries"}, where="transaction ledger"
+    artifact_root = trust.artifact_root or trust.transaction_ledger_path.parent
+    entries = validate_canonical_transaction_ledger(
+        ledger_payload, artifact_root=artifact_root
     )
-    if ledger_payload["study_id"] != trust.study_id or not isinstance(
-        ledger_payload["entries"], list
-    ):
+    if ledger_payload["study_id"] != trust.study_id:
         raise ValueError("transaction ledger study/entries mismatch")
-    matches = []
-    for entry in ledger_payload["entries"]:
-        entry = _validate_ledger_entry(entry)
-        if (
-            entry["arm"] == trust.arm
-            and entry["stage"] == trust.parent_stage
-            and entry["upstream_identity"] == trust.upstream_identity
-            and entry["artifact_identity"] == trust.artifact_identity
-        ):
-            matches.append(entry)
-    if len(matches) != 1:
+    entry = entries[(trust.arm, trust.parent_stage)]
+    if (
+        entry["upstream_identity"] != trust.upstream_identity
+        or entry["artifact_identity"] != trust.artifact_identity
+    ):
         raise ValueError(
             "transaction ledger must contain exactly one expected producer entry"
         )
-    entry = matches[0]
-    artifact_root = trust.artifact_root or trust.transaction_ledger_path.parent
     expected_checkpoint_path = _resolved_ledger_path(
         artifact_root, entry["checkpoint_relpath"], where="ledger checkpoint"
     )
@@ -2864,26 +2965,20 @@ def _load_finalization_ledger_entry(
         expected_sha=trust.transaction_ledger_sha256,
     )
     payload = ledger["payload"]
-    _require_exact_keys(payload, {"study_id", "entries"}, where="transaction ledger")
-    if payload["study_id"] != trust.study_id or not isinstance(
-        payload["entries"], list
-    ):
+    entries = validate_canonical_transaction_ledger(
+        payload, artifact_root=trust.artifact_root
+    )
+    if payload["study_id"] != trust.study_id:
         raise ValueError("transaction ledger study/entries mismatch")
-    matches = []
-    for candidate in payload["entries"]:
-        entry = _validate_ledger_entry(candidate)
-        if (
-            entry["arm"] == mode
-            and entry["stage"] == stage
-            and entry["upstream_identity"] == trust.upstream_identity
-            and entry["artifact_identity"] == trust.artifact_identity
-        ):
-            matches.append(entry)
-    if len(matches) != 1:
+    entry = entries[(mode, stage)]
+    if (
+        entry["upstream_identity"] != trust.upstream_identity
+        or entry["artifact_identity"] != trust.artifact_identity
+    ):
         raise ValueError(
             "transaction ledger must contain exactly one finalization entry"
         )
-    return matches[0]
+    return entry
 
 
 def _open_future_ledger_target(

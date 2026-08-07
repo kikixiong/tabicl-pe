@@ -3,8 +3,8 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import os
 from dataclasses import replace
-import fcntl
 import io
 from pathlib import Path
 import sys
@@ -394,7 +394,9 @@ def test_running_step_stall_emits_once_until_progress_resumes(
     ]
     assert monitor.poll(stalled.state).events == ()
 
-    spec.jobs[0].log_path.write_text("step=11 loss=0.4\n")
+    # Change the byte length as well as the content. Some shared filesystems
+    # coalesce back-to-back same-size writes into one observable mtime tick.
+    spec.jobs[0].log_path.write_text("step=11 loss=0.40\n")
     progressed = monitor.poll(stalled.state)
     assert progressed.events == ()
     clock.value += 60.0
@@ -587,7 +589,12 @@ def test_checkpoint_integrity_and_strict_report_run_only_when_identity_changes(
     first = monitor.poll({})
     second = monitor.poll(first.state)
     stat_before = spec.jobs[0].checkpoint_path.stat()
-    spec.jobs[0].checkpoint_path.touch()
+    # Make the metadata identity change deterministic even on filesystems with
+    # coarse or coalesced wall-clock timestamp updates.
+    os.utime(
+        spec.jobs[0].checkpoint_path,
+        ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns + 1_000_000_000),
+    )
     changed = monitor.poll(second.state)
 
     assert first.events == ()
