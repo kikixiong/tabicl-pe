@@ -4,10 +4,11 @@
 
 ## Current phase
 
-Implementation is in final integration on descendant branch
-`codex/pe-mechanism-sae-v1`, based on public formal candidate `f06c1f1`.
-The formal training candidate and the running exploratory training scripts
-remain unchanged.
+Implementation is CPU-complete on descendant branch
+`codex/pe-mechanism-sae-v1`. The formal training candidate is being replaced
+because the checkpoint consumer now enforces a canonical three-arm by
+three-stage ledger; all earlier H100 gate evidence is therefore stale for the
+new candidate. Running exploratory jobs remain untouched.
 
 Implemented and regression tested:
 
@@ -18,9 +19,23 @@ Implemented and regression tested:
   condition lineage;
 - official model-in-the-loop no-op, target, matched-control, and round-trip
   interventions;
+- independently bound Temporary-to-RoPE paired reverse patches with native and
+  no-op source baselines plus latent and decoded-dose balance gates;
+- candidate-level six-component intersection-union tests with
+  Benjamini-Yekutieli correction on validation, immutable feature freezing,
+  and six-component Holm-confirmed replication on the complete held-out
+  candidate-by-dataset set;
+- full probability/label/loss recomputation, exact-content and
+  invariant-prediction dataset-alias rejection, and strict formal checkpoint
+  lineage from Stage 1 through the evaluated stage;
 - deterministic TALENT/TabArena dataset manifests, paired statistics, atomic
   outputs, storage gates, and public-safe provenance;
 - version-specific TabICLv2 and TabPFN v2.6 instrumentation tests.
+
+The current CPU regression totals are 454 passed (2 skipped) for the root
+package and 297 passed for the mechanism package. Both source distributions
+and wheels build successfully. These are implementation checks, not scientific
+results.
 
 The No-PE exploratory checkpoint at exactly step 210000 has been copied and
 content-verified outside the repository. A real strict smoke run bound analysis
@@ -43,11 +58,14 @@ coverage is adapter validation only.
 Still required before a mechanistic claim:
 
 - a content-verified matched Stable RoPE checkpoint at the same step;
-- an independently sourced paired reverse-patch rescue. Restoring the same
-  latent is only a round-trip plumbing control;
-- a verified multi-dataset selection workflow that applies false-discovery-rate
-  control before freezing candidate features;
-- frozen feature/control selection before held-out TALENT or TabArena use.
+- real independently sourced paired reverse-patch runs over the frozen
+  validation roster. Restoring the same latent is only a round-trip plumbing
+  control;
+- a pushed immutable training SHA and descendant analysis SHA, followed by the
+  complete H100 gate matrix for the new training SHA;
+- actual validation selection, an externally pre-registered freeze, and the
+  complete held-out TALENT confirmation run before any feature is called
+  replicated.
 
 No mechanism result, sparse feature, downstream improvement, or efficiency
 gain is claimed at this stage.  Existing pilot checkpoints remain diagnostic

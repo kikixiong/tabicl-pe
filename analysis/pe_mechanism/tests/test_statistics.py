@@ -5,6 +5,8 @@ import pytest
 
 from pe_mechanism.statistics import (
     adjust_fdr,
+    adjust_fdr_arbitrary_dependence,
+    adjust_holm,
     paired_bootstrap_ci,
     paired_differences,
     paired_sign_flip_p_value,
@@ -50,6 +52,24 @@ def test_fdr_adjustment_preserves_input_order() -> None:
         adjust_fdr([1.1])
 
 
+def test_by_adjustment_adds_harmonic_arbitrary_dependence_correction() -> None:
+    p_values = [0.04, 0.001, 0.03, 0.2]
+    harmonic = 1.0 + 1 / 2 + 1 / 3 + 1 / 4
+    np.testing.assert_allclose(
+        adjust_fdr_arbitrary_dependence(p_values),
+        np.minimum(adjust_fdr(p_values) * harmonic, 1.0),
+    )
+    with pytest.raises(ValueError):
+        adjust_fdr_arbitrary_dependence([])
+
+
+def test_holm_adjustment_preserves_order_and_is_step_down_monotone() -> None:
+    adjusted = adjust_holm([0.04, 0.001, 0.03, 0.2])
+    np.testing.assert_allclose(adjusted, [0.09, 0.004, 0.09, 0.2])
+    with pytest.raises(ValueError):
+        adjust_holm([float("nan")])
+
+
 def test_sign_flip_p_value_is_deterministic_and_directional() -> None:
     positive_a = paired_sign_flip_p_value([1.0] * 12, n_resamples=1000, seed=9)
     positive_b = paired_sign_flip_p_value([1.0] * 12, n_resamples=1000, seed=9)
@@ -57,6 +77,11 @@ def test_sign_flip_p_value_is_deterministic_and_directional() -> None:
     assert positive_a == positive_b
     assert positive_a < 0.01
     assert negative > 0.99
+
+
+def test_sign_flip_uses_exact_small_sample_null_distribution() -> None:
+    assert paired_sign_flip_p_value([1.0] * 3, n_resamples=1, seed=1) == 1 / 8
+    assert paired_sign_flip_p_value([1.0] * 8, n_resamples=1, seed=999) == 1 / 256
 
 
 def test_site_selection_requires_replication_and_control_excess() -> None:

@@ -20,6 +20,8 @@ _COMMAND_MODULES = {
     "train-repr": "representation",
     "reconstruction-sensitivity": "causal",
     "model-causal": "official_causal",
+    "select-features": "feature_selection",
+    "confirm-features": "confirmation",
 }
 
 
@@ -53,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         "model-causal": (
             "Run official TabICL model-in-the-loop representation interventions."
+        ),
+        "select-features": (
+            "Select validation-replicated features and freeze held-out choices."
+        ),
+        "confirm-features": (
+            "Confirm frozen features across the complete held-out roster."
         ),
     }
     for command in _COMMAND_MODULES:

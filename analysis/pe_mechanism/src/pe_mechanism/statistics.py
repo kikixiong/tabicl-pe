@@ -68,20 +68,78 @@ def adjust_fdr(p_values: Iterable[float]) -> np.ndarray:
     return adjusted
 
 
+def adjust_fdr_arbitrary_dependence(p_values: Iterable[float]) -> np.ndarray:
+    """Benjamini-Yekutieli adjusted p-values in input order.
+
+    The harmonic correction controls the false-discovery rate without an
+    independence or positive-dependence assumption.  This is the appropriate
+    gate for dependent candidate-level intersection-union hypotheses.
+    """
+
+    values = np.asarray(list(p_values), dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("p_values must be a non-empty one-dimensional sequence")
+    if np.any(~np.isfinite(values)) or np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("p_values must be finite and between zero and one")
+    harmonic = float(np.sum(1.0 / np.arange(1, values.size + 1)))
+    return np.clip(adjust_fdr(values) * harmonic, 0.0, 1.0)
+
+
+def adjust_holm(p_values: Iterable[float]) -> np.ndarray:
+    """Holm family-wise-error adjusted p-values in input order."""
+
+    values = np.asarray(list(p_values), dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("p_values must be a non-empty one-dimensional sequence")
+    if np.any(~np.isfinite(values)) or np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("p_values must be finite and between zero and one")
+    order = np.argsort(values)
+    ranked = values[order]
+    scaled = ranked * np.arange(values.size, 0, -1)
+    adjusted_ranked = np.maximum.accumulate(scaled)
+    adjusted = np.empty_like(adjusted_ranked)
+    adjusted[order] = np.clip(adjusted_ranked, 0.0, 1.0)
+    return adjusted
+
+
 def paired_sign_flip_p_value(
     differences: Sequence[float] | np.ndarray,
     *,
     n_resamples: int = 10_000,
     seed: int = 42,
 ) -> float:
-    """One-sided paired randomization p-value for a positive mean effect."""
+    """One-sided paired randomization p-value for a positive mean effect.
+
+    For at most 20 dataset-level pairs this enumerates the complete ``2**n``
+    null distribution.  Larger rosters use a fixed-seed Monte Carlo estimate.
+    The exact branch avoids resampling noise near a false-discovery-rate gate.
+    """
 
     values = np.asarray(differences, dtype=np.float64)
     if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
         raise ValueError("differences must be a non-empty finite one-dimensional vector")
-    if isinstance(n_resamples, bool) or n_resamples < 1:
+    if (
+        isinstance(n_resamples, bool)
+        or not isinstance(n_resamples, int)
+        or n_resamples < 1
+    ):
         raise ValueError("n_resamples must be a positive integer")
     observed = float(values.mean())
+    if values.size <= 20:
+        total = 1 << int(values.size)
+        exceedances = 0
+        bit_positions = np.arange(values.size, dtype=np.uint64)
+        for start in range(0, total, 2048):
+            masks = np.arange(
+                start, min(start + 2048, total), dtype=np.uint64
+            )[:, None]
+            bits = (masks >> bit_positions[None, :]) & np.uint64(1)
+            signs = bits.astype(np.float64) * 2.0 - 1.0
+            exceedances += int(
+                np.count_nonzero((signs * values).mean(axis=1) >= observed)
+            )
+        return float(exceedances / total)
+
     rng = np.random.default_rng(seed)
     exceedances = 0
     # Batch the sign flips so large dataset rosters do not allocate an

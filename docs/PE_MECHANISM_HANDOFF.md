@@ -62,6 +62,13 @@ with the numerical baseline, target/control features, representation digest,
 and sample roster. No held-out activation may be used to recompute those
 choices.
 
+Formal paired work is restricted to `row_interactor`. Feature identifiers are
+coordinates in a frozen representation of the flattened RowInteraction CLS
+slots; they are not raw columns, row positions, attention heads, positional
+indices, or single neurons. An `exploratory_pilot` checkpoint study may be used
+only for discovery and cannot enter validation, selection, or held-out
+confirmation.
+
 ## Artifact boundary
 
 Source, tests, protocol documents, sanitized manifests, and aggregate
@@ -81,13 +88,19 @@ study caps private activations at 30 GiB and stops new generation below a
 2. From clean exact SHAs, run official collection on small discovery and
    validation datasets and prove the complete collect-to-representation-to-live
    intervention path.
-3. Run method-level ablations on the TALENT discovery roster and select at most
-   two replicated sites using only pre-registered validation criteria.
+3. Run method-level ablations on the TALENT discovery roster and propose
+   candidate latent features. The implemented validation workflow may freeze
+   at most two candidates using candidate-level six-component tests and
+   Benjamini-Yekutieli correction; do not select sites or features from
+   held-out data.
 4. Train PCA, dense, and sparse representations on aligned Stable RoPE/No-PE
    activations. Reject any coordinate or inference-contract mismatch.
-5. Run model interventions on validation data, including matched random
-   controls. Implement an independently bound paired reverse patch before using
-   the word rescue.
-6. Hash and freeze any proposed intervention, baseline, controls, and sample
-   roster before held-out TALENT and TabArena tests.
+5. Run model interventions on every frozen validation dataset, including
+   dose-matched controls and the independently bound paired reverse patch. Do
+   not use the word rescue unless all source-native/source-no-op and dose gates
+   pass.
+6. Hash and externally pre-register the selected intervention, baseline,
+   controls, validation fingerprints, and held-out sample rosters. Then run the
+   complete candidate-by-held-out-dataset Cartesian set and apply the frozen
+   six-component intersection-union plus Holm confirmation rule.
 7. Publish only sanitized code, protocol, aggregate statistics, and provenance.

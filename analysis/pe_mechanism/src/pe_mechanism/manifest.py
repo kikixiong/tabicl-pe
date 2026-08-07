@@ -19,6 +19,8 @@ Command = Literal[
     "train-repr",
     "reconstruction-sensitivity",
     "model-causal",
+    "select-features",
+    "confirm-features",
 ]
 EvidenceLevel = Literal["strict", "exploratory_legacy"]
 
@@ -28,8 +30,12 @@ _COMMANDS = {
     "train-repr",
     "reconstruction-sensitivity",
     "model-causal",
+    "select-features",
+    "confirm-features",
 }
-_LEGACY_COMMANDS = _COMMANDS | {"causal"}
+_LEGACY_COMMANDS = (_COMMANDS - {"select-features", "confirm-features"}) | {
+    "causal"
+}
 _EVIDENCE_LEVELS = {"strict", "exploratory_legacy"}
 _PORTABLE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\[\]-]{0,191}$")
 _PORTABLE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,191}$")

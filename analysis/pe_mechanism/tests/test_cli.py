@@ -18,6 +18,8 @@ from pe_mechanism import cli
         ("train-repr", ".representation"),
         ("reconstruction-sensitivity", ".causal"),
         ("model-causal", ".official_causal"),
+        ("select-features", ".feature_selection"),
+        ("confirm-features", ".confirmation"),
     ],
 )
 def test_cli_dispatches_to_lazy_workflow_module(
