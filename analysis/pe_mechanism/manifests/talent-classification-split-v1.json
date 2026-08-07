@@ -1,0 +1,1052 @@
+{
+  "assignment_hash_algorithm": "sha256_newline_join_sorted_assigned_names",
+  "assignment_sha256": "e18e9291f9808e764e6f36874f397aa6ff64605d4997f7b0b7b4c8b9d11cf147",
+  "assignments": [
+    {
+      "canonical_name": "analcatdataauthorship",
+      "name": "analcatdata_authorship",
+      "rank": 0,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "creditc",
+      "name": "Credit_c",
+      "rank": 1,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "madeline",
+      "name": "madeline",
+      "rank": 2,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "baseball",
+      "name": "baseball",
+      "rank": 3,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "cardiovasculardiseasedataset",
+      "name": "Cardiovascular-Disease-dataset",
+      "rank": 4,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "pimaindiansdiabetesdatabase",
+      "name": "Pima_Indians_Diabetes_Database",
+      "rank": 5,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "autounivau42500",
+      "name": "autoUniv-au4-2500",
+      "rank": 6,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "forexaudchfdayhigh",
+      "name": "FOREX_audchf-day-High",
+      "rank": 7,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "bngtictactoe",
+      "name": "BNG(tic-tac-toe)",
+      "rank": 8,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "satellite",
+      "name": "Satellite",
+      "rank": 9,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "led24",
+      "name": "led24",
+      "rank": 10,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "compass",
+      "name": "compass",
+      "rank": 11,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "nationalhealthandnutritionhealthsurvey",
+      "name": "National_Health_and_Nutrition_Health_Survey",
+      "rank": 12,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "ringnorm",
+      "name": "ringnorm",
+      "rank": 13,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "innhotelsgroup",
+      "name": "INNHotelsGroup",
+      "rank": 14,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "magictelescope",
+      "name": "MagicTelescope",
+      "rank": 15,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "cmc",
+      "name": "cmc",
+      "rank": 16,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "naticusdroidandroidpermissionsdataset",
+      "name": "naticusdroid+android+permissions+dataset",
+      "rank": 17,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "raininaustralia",
+      "name": "Rain_in_Australia",
+      "rank": 18,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "ada",
+      "name": "ada",
+      "rank": 19,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "texture",
+      "name": "texture",
+      "rank": 20,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "bngcmc",
+      "name": "BNG(cmc)",
+      "rank": 21,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "airlinesseed0nrows2000nclasses10ncols100stratifytrue",
+      "name": "airlines_seed_0_nrows_2000_nclasses_10_ncols_100_stratify_True",
+      "rank": 22,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "pc4",
+      "name": "pc4",
+      "rank": 23,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "piechart3",
+      "name": "PieChart3",
+      "rank": 24,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "shuttle",
+      "name": "shuttle",
+      "rank": 25,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "datascienceforgoodkivacrowdfunding",
+      "name": "Data_Science_for_Good_Kiva_Crowdfunding",
+      "rank": 26,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "gesturephasesegmentationprocessed",
+      "name": "GesturePhaseSegmentationProcessed",
+      "rank": 27,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "diabeticretinopathydebrecen",
+      "name": "Diabetic_Retinopathy_Debrecen",
+      "rank": 28,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "semeion",
+      "name": "semeion",
+      "rank": 29,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "employee",
+      "name": "Employee",
+      "rank": 30,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "yeast",
+      "name": "yeast",
+      "rank": 31,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "house16h",
+      "name": "house_16H",
+      "rank": 32,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "mammography",
+      "name": "mammography",
+      "rank": 33,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "mfeatmorphological",
+      "name": "mfeat-morphological",
+      "rank": 34,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "junglechess2pcsrawendgamecomplete",
+      "name": "jungle_chess_2pcs_raw_endgame_complete",
+      "rank": 35,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "walkingactivity",
+      "name": "walking-activity",
+      "rank": 36,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "pumpkinseeds",
+      "name": "Pumpkin_Seeds",
+      "rank": 37,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "qsar",
+      "name": "qsar",
+      "rank": 38,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "clickpredictionsmall",
+      "name": "Click_prediction_small",
+      "rank": 39,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "microaggregation2",
+      "name": "microaggregation2",
+      "rank": 40,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "artificialcharacters",
+      "name": "artificial-characters",
+      "rank": 41,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "okcupidstem",
+      "name": "okcupid_stem",
+      "rank": 42,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "gametesheterogeneity20atts1600het040250edm2001",
+      "name": "GAMETES_Heterogeneity_20atts_1600_Het_0.4_0.2_50_EDM-2_001",
+      "rank": 43,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "accelerometer",
+      "name": "accelerometer",
+      "rank": 44,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "ozonelevel8hr",
+      "name": "ozone-level-8hr",
+      "rank": 45,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "japanesevowels",
+      "name": "JapaneseVowels",
+      "rank": 46,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "autounivau71100",
+      "name": "autoUniv-au7-1100",
+      "rank": 47,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "mfeatfactors",
+      "name": "mfeat-factors",
+      "rank": 48,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "forexaudsgdhourhigh",
+      "name": "FOREX_audsgd-hour-High",
+      "rank": 49,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "mfeatfourier",
+      "name": "mfeat-fourier",
+      "rank": 50,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "waveformdatabasegeneratorversion1",
+      "name": "waveform_database_generator_version_1",
+      "rank": 51,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "eyemovementsbin",
+      "name": "eye_movements_bin",
+      "rank": 52,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "firstordertheoremproving",
+      "name": "first-order-theorem-proving",
+      "rank": 53,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "ibmhranalyticsemployeeattritionandperformance",
+      "name": "IBM_HR_Analytics_Employee_Attrition_and_Performance",
+      "rank": 54,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "predictstudentsdropoutandacademicsuccess",
+      "name": "predict_students_dropout_and_academic_success",
+      "rank": 55,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "spambase",
+      "name": "spambase",
+      "rank": 56,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "krvsk",
+      "name": "kr-vs-k",
+      "rank": 57,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "adaprior",
+      "name": "ada_prior",
+      "rank": 58,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "mozilla4",
+      "name": "mozilla4",
+      "rank": 59,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "banknoteauthentication",
+      "name": "banknote_authentication",
+      "rank": 60,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "statlog",
+      "name": "statlog",
+      "rank": 61,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "bank",
+      "name": "bank",
+      "rank": 62,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "dabetes130ushospitals",
+      "name": "dabetes_130-us_hospitals",
+      "rank": 63,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "bngbreastw",
+      "name": "BNG(breast-w)",
+      "rank": 64,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "letter",
+      "name": "letter",
+      "rank": 65,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "hillvalley",
+      "name": "hill-valley",
+      "rank": 66,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "companybankruptcyprediction",
+      "name": "company_bankruptcy_prediction",
+      "rank": 67,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "golfplaydatasetextended",
+      "name": "golf_play_dataset_extended",
+      "rank": 68,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "satimage",
+      "name": "satimage",
+      "rank": 69,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "gametesepistasis2way20atts01hedm11",
+      "name": "GAMETES_Epistasis_2-Way_20atts_0.1H_EDM-1_1",
+      "rank": 70,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "internetfirewall",
+      "name": "internet_firewall",
+      "rank": 71,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "defaultofcreditcardclients",
+      "name": "default_of_credit_card_clients",
+      "rank": 72,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "segment",
+      "name": "segment",
+      "rank": 73,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "forexaudjpyhourhigh",
+      "name": "FOREX_audjpy-hour-High",
+      "rank": 74,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "adaagnostic",
+      "name": "ada_agnostic",
+      "rank": 75,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "customerpersonalityanalysis",
+      "name": "Customer_Personality_Analysis",
+      "rank": 76,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "pageblocks",
+      "name": "page-blocks",
+      "rank": 77,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "abalone",
+      "name": "abalone",
+      "rank": 78,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "smokinganddrinkingdatasetwithbodysignal",
+      "name": "Smoking_and_Drinking_Dataset_with_body_signal",
+      "rank": 79,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "forexaudjpydayhigh",
+      "name": "FOREX_audjpy-day-High",
+      "rank": 80,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "waveform5000",
+      "name": "waveform-5000",
+      "rank": 81,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "dis",
+      "name": "dis",
+      "rank": 82,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "telcocustomerchurn",
+      "name": "telco-customer-churn",
+      "rank": 83,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "forexaudusdhourhigh",
+      "name": "FOREX_audusd-hour-High",
+      "rank": 84,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "blerssidatasetforindoorlocalization",
+      "name": "BLE_RSSI_dataset_for_Indoor_localization",
+      "rank": 85,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "estimationofobesitylevels",
+      "name": "estimation_of_obesity_levels",
+      "rank": 86,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "dna",
+      "name": "dna",
+      "rank": 87,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "wine",
+      "name": "wine",
+      "rank": 88,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "winequalityred",
+      "name": "wine-quality-red",
+      "rank": 89,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "thyroid",
+      "name": "thyroid",
+      "rank": 90,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "fitnessclubc",
+      "name": "Fitness_Club_c",
+      "rank": 91,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "phoneme",
+      "name": "phoneme",
+      "rank": 92,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "volkert",
+      "name": "volkert",
+      "rank": 93,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "carevaluation",
+      "name": "car-evaluation",
+      "rank": 94,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "qsarbiodegradation",
+      "name": "QSAR_biodegradation",
+      "rank": 95,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "sylvine",
+      "name": "sylvine",
+      "rank": 96,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "eyemovements",
+      "name": "eye_movements",
+      "rank": 97,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "led7",
+      "name": "led7",
+      "rank": 98,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "gasdrift",
+      "name": "gas-drift",
+      "rank": 99,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "ujipencharacters",
+      "name": "UJI_Pen_Characters",
+      "rank": 100,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "optdigits",
+      "name": "optdigits",
+      "rank": 101,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "telecomchurndataset",
+      "name": "Telecom_Churn_Dataset",
+      "rank": 102,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "mfeatpixel",
+      "name": "mfeat-pixel",
+      "rank": 103,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "ibmemployeeperformance",
+      "name": "ibm-employee-performance",
+      "rank": 104,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "mobilec36oversampling",
+      "name": "mobile_c36_oversampling",
+      "rank": 105,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "thyroidann",
+      "name": "thyroid-ann",
+      "rank": 106,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "kddcup09upselling",
+      "name": "KDDCup09_upselling",
+      "rank": 107,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "electricity",
+      "name": "electricity",
+      "rank": 108,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "rl",
+      "name": "rl",
+      "rank": 109,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "allrep",
+      "name": "allrep",
+      "rank": 110,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "kc1",
+      "name": "kc1",
+      "rank": 111,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "indianpines",
+      "name": "Indian_pines",
+      "rank": 112,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "steelplatesfaults",
+      "name": "steel_plates_faults",
+      "rank": 113,
+      "split": "discovery"
+    },
+    {
+      "canonical_name": "winequalitywhite",
+      "name": "wine-quality-white",
+      "rank": 114,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "pc1",
+      "name": "pc1",
+      "rank": 115,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "thyroiddis",
+      "name": "thyroid-dis",
+      "rank": 116,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "wallrobotnavigation",
+      "name": "wall-robot-navigation",
+      "rank": 117,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "onehundredplantsmargin",
+      "name": "one-hundred-plants-margin",
+      "rank": 118,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "waveformdatabasegenerator",
+      "name": "waveform_database_generator",
+      "rank": 119,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "internetusage",
+      "name": "internet_usage",
+      "rank": 120,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "twonorm",
+      "name": "twonorm",
+      "rank": 121,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "nationallongitudinalsurveybinary",
+      "name": "national-longitudinal-survey-binary",
+      "rank": 122,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "wilt",
+      "name": "Wilt",
+      "rank": 123,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "eegeyestate",
+      "name": "eeg-eye-state",
+      "rank": 124,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "asppotasscoclassification",
+      "name": "ASP-POTASSCO-classification",
+      "rank": 125,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "waterqualityandpotability",
+      "name": "Water_Quality_and_Potability",
+      "rank": 126,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "kropt",
+      "name": "kropt",
+      "rank": 127,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "vehicle",
+      "name": "vehicle",
+      "rank": 128,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "mfeatkarhunen",
+      "name": "mfeat-karhunen",
+      "rank": 129,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "pc3",
+      "name": "pc3",
+      "rank": 130,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "bankcustomerchurndataset",
+      "name": "Bank_Customer_Churn_Dataset",
+      "rank": 131,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "onehundredplantstexture",
+      "name": "one-hundred-plants-texture",
+      "rank": 132,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "onehundredplantsshape",
+      "name": "one-hundred-plants-shape",
+      "rank": 133,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "phishingwebsites",
+      "name": "PhishingWebsites",
+      "rank": 134,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "kddipumsla97small",
+      "name": "kdd_ipums_la_97-small",
+      "rank": 135,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "waterquality",
+      "name": "water_quality",
+      "rank": 136,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "htru",
+      "name": "htru",
+      "rank": 137,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "forexcadjpydayhigh",
+      "name": "FOREX_cadjpy-day-High",
+      "rank": 138,
+      "split": "validation"
+    },
+    {
+      "canonical_name": "drugconsumption",
+      "name": "drug_consumption",
+      "rank": 139,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "basketballc",
+      "name": "Basketball_c",
+      "rank": 140,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "mfeatzernike",
+      "name": "mfeat-zernike",
+      "rank": 141,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "pendigits",
+      "name": "pendigits",
+      "rank": 142,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "forexaudcadhourhigh",
+      "name": "FOREX_audcad-hour-High",
+      "rank": 143,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "deltaailerons",
+      "name": "delta_ailerons",
+      "rank": 144,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "pol",
+      "name": "pol",
+      "rank": 145,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "drybeandataset",
+      "name": "dry_bean_dataset",
+      "rank": 146,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "cdcdiabeteshealthindicators",
+      "name": "CDC_Diabetes_Health_Indicators",
+      "rank": 147,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "firmteacherclavedirectionclassification",
+      "name": "Firm-Teacher_Clave-Direction_Classification",
+      "rank": 148,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "pizzacutter3",
+      "name": "PizzaCutter3",
+      "rank": 149,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "miceproteinexpression",
+      "name": "mice_protein_expression",
+      "rank": 150,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "forexcadjpyhourhigh",
+      "name": "FOREX_cadjpy-hour-High",
+      "rank": 151,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "credit",
+      "name": "credit",
+      "rank": 152,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "ricecammeoandosmancik",
+      "name": "rice_cammeo_and_osmancik",
+      "rank": 153,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "contraceptivemethodchoice",
+      "name": "contraceptive_method_choice",
+      "rank": 154,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "forexaudcaddayhigh",
+      "name": "FOREX_audcad-day-High",
+      "rank": 155,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "mobilepriceclassification",
+      "name": "Mobile_Price_Classification",
+      "rank": 156,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "allbp",
+      "name": "allbp",
+      "rank": 157,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "sportsarticlesforobjectivityanalysis",
+      "name": "sports_articles_for_objectivity_analysis",
+      "rank": 158,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "californiahousingclassification",
+      "name": "California-Housing-Classification",
+      "rank": 159,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "ficoheloccleaned",
+      "name": "FICO-HELOC-cleaned",
+      "rank": 160,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "gendergapinspanishwp",
+      "name": "Gender_Gap_in_Spanish_WP",
+      "rank": 161,
+      "split": "held_out"
+    },
+    {
+      "canonical_name": "turiyestudentevaluation",
+      "name": "turiye_student_evaluation",
+      "rank": 162,
+      "split": "held_out"
+    }
+  ],
+  "counts": {
+    "discovery": 114,
+    "held_out": 24,
+    "validation": 25
+  },
+  "eligibility": {
+    "max_classes": 100,
+    "max_features": 500,
+    "require_at_least_one_feature": true,
+    "require_at_least_two_training_classes": true,
+    "require_complete_and_aligned_feature_splits": true,
+    "require_nonempty_splits": true,
+    "require_safe_numeric_storage": true,
+    "require_validation_and_test_labels_seen_in_training": true,
+    "required_splits": [
+      "train",
+      "val",
+      "test"
+    ]
+  },
+  "excluded_tabarena_overlap": [
+    "Amazon_employee_access",
+    "E-CommereShippingData",
+    "HR_Analytics_Job_Change_of_Data_Scientists",
+    "MIC",
+    "Marketing_Campaign",
+    "SDSS17",
+    "churn",
+    "customer_satisfaction_in_airline",
+    "heloc",
+    "in_vehicle_coupon_recommendation",
+    "jm1",
+    "maternal_health_risk",
+    "seismic+bumps",
+    "splice",
+    "taiwanese_bankruptcy_prediction",
+    "website_phishing"
+  ],
+  "fractions": {
+    "discovery": 0.7,
+    "held_out": 0.15,
+    "validation": 0.15
+  },
+  "ineligibility_reason_counts": {
+    "too_many_classes": 69,
+    "too_many_features": 2,
+    "unknown_test_labels": 77,
+    "unknown_val_labels": 75,
+    "unsafe_object_numeric_features": 2,
+    "unsupported_task_type": 119
+  },
+  "kind": "dataset_level_split",
+  "overlap_exclusion": {
+    "canonicalization": "lowercase_ascii_alphanumeric_v1",
+    "roster_sha256": "b1f71e48085451cbe2126cbc02799c3969ecf9e7965f6aa71757db63fd6003ee",
+    "suite": "TabArena",
+    "version": "v0.1"
+  },
+  "scan_counts": {
+    "assigned": 163,
+    "discovered": 300,
+    "eligible_before_overlap": 179,
+    "excluded_tabarena_overlap": 16
+  },
+  "schema_version": 1,
+  "seed": 20260807,
+  "suite": "TALENT",
+  "task_type": "classification"
+}
