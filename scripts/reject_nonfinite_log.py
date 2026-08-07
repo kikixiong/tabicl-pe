@@ -8,15 +8,23 @@ import json
 import os
 from pathlib import Path
 import re
+import select
+import signal
 import stat
 import subprocess
 import sys
-import tempfile
+import time
 
 
 ERROR_PATTERNS = (
     ("non-finite value", re.compile(r"(?i)(?<![A-Za-z0-9_])(?:nan|[+-]?inf(?:inity)?|non[- ]finite)(?![A-Za-z0-9_])")),
     ("out of memory", re.compile(r"(?i)(?:out of memory|\bOOM\b)")),
+    (
+        "storage exhausted",
+        re.compile(
+            r"(?i)(?:\bENOSPC\b|no space left on device|\[Errno\s+28\])"
+        ),
+    ),
     ("traceback", re.compile(r"(?m)^Traceback \(most recent call last\):")),
 )
 
@@ -83,10 +91,61 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[bytes], *, grace_seconds: float = 1.0
+) -> None:
+    """TERM, then KILL the isolated command group, including descendants."""
+
+    pgid = process.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + grace_seconds
+    while _process_group_exists(pgid) and time.monotonic() < deadline:
+        try:
+            process.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(0.01)
+    if _process_group_exists(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def capture_durable_log(
-    output: Path, *, max_bytes: int, command: list[str]
+    output: Path,
+    *,
+    max_bytes: int,
+    command: list[str],
+    live_output: Path | None = None,
 ) -> tuple[dict[str, object], int]:
-    """Capture a command with exact growth bounds and no-replace publication."""
+    """Capture bounded live output, then atomically publish the durable log.
+
+    The incomplete byte stream is exposed through ``live_output`` (by default
+    ``OUTPUT.live``).  ``output`` itself remains absent until the command has
+    stopped, the stream has been flushed and fsynced, and a no-replace hard-link
+    publication succeeds.  The live name and final name therefore refer to the
+    exact same inode during publication; no copy or mutable rename window can
+    make the durable result differ from what was monitored.
+    """
     if max_bytes < 0:
         raise ValueError("max_bytes must be non-negative")
     if not command:
@@ -94,25 +153,55 @@ def capture_durable_log(
     parent = output.parent.resolve(strict=True)
     if output.parent.is_symlink() or output.exists() or output.is_symlink():
         raise ValueError("durable log output must be a fresh non-symlink path")
-    temporary: Path | None = None
+    if live_output is None:
+        live_output = output.with_name(output.name + ".live")
+    if live_output.parent.resolve(strict=True) != parent:
+        raise ValueError("live log must be a sibling of the durable output")
+    if (
+        live_output.parent.is_symlink()
+        or live_output.exists()
+        or live_output.is_symlink()
+    ):
+        raise ValueError("live log output must be a fresh non-symlink path")
+
+    live_created = False
     process: subprocess.Popen[bytes] | None = None
+    process_group_cleaned = False
     overflow = False
     try:
-        fd, raw_temp = tempfile.mkstemp(
-            prefix=f".{output.name}.", suffix=".tmp", dir=parent
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
         )
-        temporary = Path(raw_temp)
+        fd = os.open(live_output, flags, 0o600)
+        live_created = True
         with os.fdopen(fd, "w+b", buffering=0) as handle:
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                start_new_session=True,
             )
             assert process.stdout is not None
             total = 0
             while True:
-                chunk = process.stdout.read(1 << 16)
+                pipe_fd = process.stdout.fileno()
+                readable, _, _ = select.select([pipe_fd], [], [], 0.1)
+                if not readable:
+                    # A descendant can inherit stdout after the direct child
+                    # exits.  A blocking read would then wait forever and
+                    # leave that descendant outside the cleanup path.
+                    if process.poll() is not None and not process_group_cleaned:
+                        _terminate_process_group(process)
+                        process_group_cleaned = True
+                    continue
+                # Reading the pipe FD directly returns the currently available
+                # bytes instead of waiting for a full BufferedReader request.
+                chunk = os.read(pipe_fd, 1 << 16)
                 if not chunk:
                     break
                 allowed = max_bytes - total
@@ -121,24 +210,30 @@ def capture_durable_log(
                         handle.write(chunk[:allowed])
                         total += allowed
                     overflow = True
-                    process.terminate()
                     break
                 handle.write(chunk)
                 total += len(chunk)
+                if process.poll() is not None and not process_group_cleaned:
+                    _terminate_process_group(process)
+                    process_group_cleaned = True
             if overflow:
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                _terminate_process_group(process)
+                process_group_cleaned = True
             status = process.wait()
+            if not process_group_cleaned:
+                _terminate_process_group(process)
+                process_group_cleaned = True
+            process.stdout.close()
             handle.flush()
             os.fsync(handle.fileno())
 
         # Hard-link publication is atomic and fails if OUTPUT appeared after
         # the initial freshness check; unlike mv it cannot overwrite a rival.
-        os.link(temporary, output, follow_symlinks=False)
-        temporary.unlink()
-        temporary = None
+        # It also proves that the monitored live bytes and published bytes are
+        # the same inode.
+        os.link(live_output, output, follow_symlinks=False)
+        live_output.unlink()
+        live_created = False
         _fsync_directory(parent)
 
         if overflow:
@@ -146,12 +241,11 @@ def capture_durable_log(
         report = scan_log(output, max_bytes=max_bytes)
         return report, status
     finally:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
-        if temporary is not None:
+        if process is not None and not process_group_cleaned:
+            _terminate_process_group(process)
+        if live_created:
             try:
-                temporary.unlink()
+                live_output.unlink()
             except FileNotFoundError:
                 pass
 

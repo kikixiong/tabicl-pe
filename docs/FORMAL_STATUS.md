@@ -2,13 +2,13 @@
 
 ## Scientific question
 
-The study asks whether TabICLv2 needs stable feature position or only temporary
-feature identity. It trains three otherwise matched arms from scratch:
+The study asks how stable versus table-random ordinal Row-RoPE affects
+TabICLv2. It trains three otherwise matched arms from scratch:
 
 | Arm | Row interaction treatment | Intended contrast |
 | --- | --- | --- |
 | `rope` | Standard RoPE tied to input feature order | Stable ordinal position |
-| `temporary` | RoPE identities randomly reassigned per table/forward pass | Identity without stable order |
+| `temporary` | Ordinal RoPE identities randomly reassigned per table and reused for that table/prediction lifecycle | Table-random ordinal identity |
 | `none` | Row RoPE disabled | No explicit positional identity |
 
 The shared stage budgets are fixed at 500,000, 40,000, and 10,000 steps. Shared
@@ -17,37 +17,85 @@ optimizer/scheduler/scaler configuration, seeds, and stage settings while
 excluding only the identity treatment. Arm protocol digests bind that treatment
 separately. This makes the matched comparison machine-checkable.
 
+The primary three-arm result is therefore an ordinal Row-RoPE comparison. It
+does not by itself establish a broader claim about arbitrary non-ordinal
+temporary identities; controls such as `cls_only`, non-ordinal phase, and
+row-wise resampling remain optional follow-on experiments.
+
 ## Current readiness
 
-The candidate is CPU-ready. Unit, integration, resume, Gloo, shell transaction,
-monitor, capacity, provenance, and public-hygiene tests are implemented. No H100
-result is claimed yet, and no formal production training should be submitted
-until every hardware gate in `FORMAL_HANDOFF.md` passes for the exact candidate
-commit.
+Unit, integration, resume, Gloo, shell transaction, monitor, capacity,
+provenance, and public-hygiene checks define the CPU acceptance matrix. No H100
+result is claimed by this repository state, and no formal production training
+may be submitted until that matrix is repeated from a clean detached checkout
+and every hardware gate in `FORMAL_HANDOFF.md` passes for the same pushed exact
+candidate commit.
 
 The formal execution path is fresh-only. Every compute case must start from a
 clean detached exact-commit checkout, attest the Git commit/tree and tracked
 source bytes, isolate imports from user/editable installations, and prove that
 loaded `tabicl` modules come from that checkout.
 
+The training commit must already be advertised by
+`https://github.com/kikixiong/tabicl-pe.git` on the fixed ref
+`refs/heads/codex/position-identity-v1`. Controllers and compute wrappers use a
+digest-bound Git executable for a bounded exact-ref query before any namespace,
+submission, release, or clone. Held plans, receipts, H100 terminal evidence,
+formal runtime completions, and formal terminal evidence carry the resulting
+repository binding; local repositories and stale or moved refs are invalid.
+
+The H100 smoke matrix has a fixed, verified `03:00:00` limit. That limit does
+not carry over to the 500,000/40,000/10,000-step production stages. Exact
+per-stage production walltimes are not yet frozen in the overlay/receipt/
+runtime/`scontrol` contract, so formal submission is still blocked on this
+point. Stage 2/3 limits must come from the six maximum-sequence smokes; Stage 1
+requires measured full-prior throughput and an explicitly approved bound.
+
 ## Storage and retention contract
 
 Let `C` be the externally chosen, precommitted maximum bytes for one full
-checkpoint, and let `L` be the aggregate allowance for durable logs,
-attestations, manifests, and protocol metadata. A fresh study reserves
+checkpoint, `L` the aggregate logical allowance for durable logs,
+attestations, manifests, and protocol metadata, and `A` the artifact
+filesystem's positive `f_frsize`. Protocol metadata includes a bounded
+completion envelope for each of the nine jobs and one bounded external
+terminal scheduler-log attestation. Define `ceil_A(x)` as allocation-unit
+rounding and define the worst physical allocation for aggregate logical bytes
+across 78 file slots as
 
 ```text
-R = 15*C + L
-required_free_bytes = 20 GiB + ceil(5*R/4)
+aggregate_A(L, 78) =
+    0,                                                   if L = 0
+    (min(L,78)-1)*A + ceil_A(L-min(L,78)+1),            otherwise
+
+R_physical = 15*ceil_A(C)
+  + aggregate_A(L, 78)
+  + (17 + 114)*A
+
+required_free_bytes = 20 GiB + ceil(5*R_physical/4)
 ```
 
-All arithmetic is integer byte arithmetic. The fifteen checkpoint slots cover
-nine terminal checkpoints plus six concurrent retained/atomic peak slots. Each
-active stage directory may contain at most two checkpoint-shaped files. After a
-terminal checkpoint passes strict final validation, pruning must leave only
-that terminal checkpoint. Later capacity checks audit the full study tree,
+All arithmetic is integer byte arithmetic. The 78 durable files are 36
+per-job run-log outputs, 18 source attestations, nine finalized manifests, and
+15 protocol-metadata files, including the post-seal transaction-commit marker.
+Their 82 directory entries include four simultaneous atomic temporary
+publication names. The 114 total directory-entry slots are one artifact-root
+entry, 16 child-directory entries, those 82
+durable entries, and 15 checkpoint entries; the 17 directory objects
+themselves are charged separately.
+
+The fifteen checkpoint slots cover nine terminal checkpoints plus six
+concurrent retained/atomic peak slots. Each active stage directory may contain
+at most two checkpoint-shaped files. After a terminal checkpoint passes strict
+final validation, pruning must leave only that terminal checkpoint. Later
+capacity checks audit the full study tree in physical allocation bytes,
 subtract actual consumed bytes from the same study-wide budget, and fail if the
 tree changes around the filesystem snapshot.
+
+Ephemeral candidate clones are excluded from this durable budget only because
+the job work root is required to reside on a different filesystem from the
+artifact namespace. The submit controller proves this from no-follow directory
+descriptors before namespace creation and again while all jobs are held; every
+compute wrapper repeats the check before creating or cloning into a work tree.
 
 `C` is not inferred from a convenient one-step statistic. The H100 smoke matrix
 must save all nine full Trainer checkpoints, prove each is no larger than the
@@ -68,3 +116,17 @@ make no utilization claim. A separate read-only, event-only monitor observes
 scheduler state, bounded log tails, checkpoint identity/integrity, validation
 reports, disk thresholds, and any already recorded utilization evidence. It
 never submits or cancels jobs.
+
+The monitor first proves that every configured artifact is inside the fixed
+`disk_path` namespace and physically on that same `st_dev`; for a pending path,
+it binds the nearest existing no-follow ancestor. Its state and event-ledger
+directories must each be on a different filesystem from that proven artifact
+device, so a three-device disk/artifact/writable layout cannot pass and its own
+bounded writes cannot consume the reserve it is measuring.
+
+Each in-job completion explicitly states that scheduler logs are not yet
+terminal. A separate receipt-bound finalizer must obtain exact successful
+allocation rows from the digest-bound accounting executable, scan and stably
+hash both Slurm spool files for all nine jobs after terminality, and publish one
+write-once terminal attestation. Until that publication succeeds, scheduler
+log provenance and the cohort itself remain incomplete.

@@ -469,7 +469,7 @@ class Trainer:
         self.scaler = torch.GradScaler("cuda", enabled=self.amp)
         if self.amp:
             if self.master_process:
-                print(f"Automatic Mixed Precision is enabled.")
+                print("Automatic Mixed Precision is enabled.")
             self.amp_ctx = torch.autocast(
                 device_type="cuda",
                 dtype=(
@@ -568,6 +568,7 @@ class Trainer:
             "torch_seed": self.config.torch_seed,
             "identity_rng_seed": self.config.identity_rng_seed,
             "world_size": self.ddp_world_size,
+            "max_checkpoint_bytes": self.config.max_checkpoint_bytes,
         }
         for field, expected in expected_current.items():
             if payload[field] != expected:
@@ -579,6 +580,15 @@ class Trainer:
         if not getattr(self.config, "formal_training", False):
             self.formal_provenance = None
             return
+        max_checkpoint_bytes = getattr(self.config, "max_checkpoint_bytes", None)
+        if (
+            isinstance(max_checkpoint_bytes, bool)
+            or not isinstance(max_checkpoint_bytes, int)
+            or max_checkpoint_bytes < 1
+        ):
+            raise ValueError(
+                "formal training requires a positive max_checkpoint_bytes overlay ceiling"
+            )
         required = (
             "formal_stage",
             "formal_source_manifest",
@@ -612,7 +622,7 @@ class Trainer:
             key: value
             for key, value in vars(self.config).items()
             if key not in FORMAL_PROTOCOL_CONFIG_FIELDS
-            and key != "identity_sampler_version"
+            and key not in {"identity_sampler_version", "max_checkpoint_bytes"}
         }
         prior_stream = self.prior_dataset.logical_stream_state_dict(
             cursor=self.prior_cursor
@@ -818,7 +828,11 @@ class Trainer:
         checkpoint.update(identity_fields)
         if getattr(self, "formal_provenance", None) is not None:
             checkpoint["provenance"] = self.formal_provenance
-        atomic_torch_save(checkpoint, checkpoint_path)
+        atomic_torch_save(
+            checkpoint,
+            checkpoint_path,
+            max_bytes=getattr(self.config, "max_checkpoint_bytes", None),
+        )
 
     def coordinate_checkpoint_phase(
         self, phase: str, local_error: Exception | None
@@ -866,7 +880,7 @@ class Trainer:
                 # Consider a checkpoint temporary if its step is not divisible by save_perm_every
                 if step % self.config.save_perm_every != 0:
                     temp_checkpoints.append((step, ckpt))
-            except:
+            except (IndexError, ValueError):
                 continue  # Ignore files that don't match the format
 
         # Sort temporary checkpoints by step number (ascending)
@@ -918,9 +932,23 @@ class Trainer:
         and handles checkpoint saving and metric logging.
         """
 
+        progress_refresh_seconds = getattr(
+            self.config, "progress_refresh_seconds", 0.1
+        )
+        if (
+            isinstance(progress_refresh_seconds, bool)
+            or not isinstance(progress_refresh_seconds, (int, float))
+            or not math.isfinite(progress_refresh_seconds)
+            or progress_refresh_seconds <= 0
+        ):
+            raise ValueError("progress_refresh_seconds must be finite and positive")
+
         if self.master_process:
             step_progress = tqdm(
-                range(self.curr_step, self.config.max_steps), desc="Step", leave=True
+                range(self.curr_step, self.config.max_steps),
+                desc="Step",
+                leave=True,
+                mininterval=float(progress_refresh_seconds),
             )
         else:
             step_progress = range(self.curr_step, self.config.max_steps)
@@ -956,10 +984,11 @@ class Trainer:
 
                     # Update progress bar with rounded values for cleaner display
                     step_progress.set_postfix(
-                        **{
+                        {
                             k: round(v, 3) if isinstance(v, float) else v
                             for k, v in results.items()
-                        }
+                        },
+                        refresh=False,
                     )
 
                 # Logging to Weights & Biases

@@ -69,6 +69,8 @@ def _forbidden_fragments() -> tuple[bytes, ...]:
     values = (
         "/" + "Users" + "/",
         "/" + "home" + "/",
+        "/" + "mnt" + "/" + "data" + "/",
+        "/" + "slurm" + "-storage" + "/",
         "noe" + "ther",
         "ws/" + "TabFM",
         "jia" + "xio",
@@ -79,6 +81,12 @@ def _forbidden_fragments() -> tuple[bytes, ...]:
         "248" + "694",
         "248" + "695",
         "248" + "696",
+        "249" + "092",
+        "249" + "093",
+        "249" + "094",
+        "249" + "095",
+        "249" + "096",
+        "249" + "097",
     )
     return tuple(value.lower().encode("utf-8") for value in values)
 
@@ -108,9 +116,31 @@ def _assert_public_path(path: str, *, changed: bool) -> None:
     assert not path.endswith((".pyc", ".pyo"))
     if not changed:
         return
-    assert not path.endswith((".bundle", ".ckpt", ".csv", ".jsonl"))
+    assert not path.endswith(
+        (
+            ".bundle",
+            ".ckpt",
+            ".csv",
+            ".jsonl",
+            ".log",
+            ".out",
+            ".err",
+            ".tgz",
+            ".tar",
+            ".zip",
+        )
+    )
     assert not any(
-        part.lower() in {"wandb", "predictions", "raw_predictions"}
+        part.lower()
+        in {
+            "artifacts",
+            "checkpoints",
+            "gpu-monitor",
+            "logs",
+            "wandb",
+            "predictions",
+            "raw_predictions",
+        }
         for part in parts
     )
     assert not any(
@@ -206,3 +236,32 @@ def test_new_blob_limit_accepts_boundary_and_rejects_one_byte_over() -> None:
     _assert_new_blob_size(MAX_NEW_BLOB_BYTES, object_id="a" * 40)
     with pytest.raises(AssertionError):
         _assert_new_blob_size(MAX_NEW_BLOB_BYTES + 1, object_id="b" * 40)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"/" + b"mnt" + b"/" + b"data" + b"/private/result",
+        b"/" + b"slurm" + b"-storage" + b"/private/result",
+        b"scheduler job " + b"249" + b"092",
+    ],
+)
+def test_public_blob_guard_rejects_cluster_paths_and_job_ids(raw: bytes) -> None:
+    with pytest.raises(AssertionError):
+        _assert_public_blob(raw, where="synthetic regression")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "artifacts/result.json",
+        "logs/train.log",
+        "checkpoints/final.bin",
+        "gpu-monitor/usage.txt",
+        "results/raw.err",
+        "results/smoke.zip",
+    ],
+)
+def test_public_path_guard_rejects_private_artifact_shapes(path: str) -> None:
+    with pytest.raises(AssertionError):
+        _assert_public_path(path, changed=True)

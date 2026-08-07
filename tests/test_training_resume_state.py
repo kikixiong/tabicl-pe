@@ -1,4 +1,5 @@
 import random
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -36,7 +37,7 @@ class _CheckpointProgress:
     def __iter__(self):
         return iter(self.values)
 
-    def set_postfix(self, **kwargs):
+    def set_postfix(self, values=None, *, refresh=True, **kwargs):
         if self.fail_hook:
             raise RuntimeError("master hook boom")
 
@@ -64,6 +65,7 @@ def _checkpoint_coordination_worker(
             save_perm_every=100,
             max_checkpoints=1 if scenario == "prune_failure" else 0,
             checkpoint_dir=checkpoint_dir,
+            max_checkpoint_bytes=1 if scenario == "ceiling_failure" else None,
         )
         trainer.ddp = True
         trainer.ddp_rank = rank
@@ -138,15 +140,28 @@ def _checkpoint_coordination_worker(
         else:
             assert isinstance(error, RuntimeError)
             assert "rank 0" in str(error)
-            assert scenario.split("_")[0] in str(error)
-            assert "boom" in str(error)
+            if scenario == "ceiling_failure":
+                assert "write phase" in str(error)
+                assert "max_checkpoint_bytes" in str(error)
+                if rank == 0:
+                    assert not list(Path(checkpoint_dir).iterdir())
+            else:
+                assert scenario.split("_")[0] in str(error)
+                assert "boom" in str(error)
         dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize(
-    "scenario", ["success", "hook_failure", "write_failure", "prune_failure"]
+    "scenario",
+    [
+        "success",
+        "hook_failure",
+        "write_failure",
+        "ceiling_failure",
+        "prune_failure",
+    ],
 )
 def test_two_rank_checkpoint_boundary_coordinates_outcomes(tmp_path, scenario):
     mp.spawn(
@@ -407,6 +422,69 @@ def test_checkpoint_rng_boundary_is_after_logging(monkeypatch):
     Trainer.train.__wrapped__(trainer)
 
     torch.testing.assert_close(captured[0], expected_at_boundary, rtol=0, atol=0)
+
+
+def test_progress_output_is_rate_limited_without_skipping_training_steps(monkeypatch):
+    import tabicl.train._run as run_module
+    from tabicl.train._run import Trainer
+
+    calls = {}
+
+    class FakeProgress:
+        def __iter__(self):
+            yield from range(2)
+
+        def set_postfix(self, values, *, refresh):
+            calls.setdefault("postfix", []).append((values, refresh))
+
+    def fake_tqdm(iterable, *, desc, leave, mininterval):
+        calls["tqdm"] = (list(iterable), desc, leave, mininterval)
+        return FakeProgress()
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = SimpleNamespace(
+        max_steps=2,
+        progress_refresh_seconds=30.0,
+        empty_cache_every=0,
+        save_temp_every=10,
+        save_perm_every=10,
+        max_checkpoints=0,
+    )
+    trainer.curr_step = 0
+    trainer.prior_cursor = 0
+    trainer.master_process = True
+    trainer.ddp = False
+    trainer.dataloader = [None, None]
+    observed = []
+    trainer.run_batch = lambda batch: observed.append(batch) or {"loss": 0.5}
+    trainer.scheduler = SimpleNamespace(get_last_lr=lambda: [1.0])
+    trainer.wandb_run = None
+    monkeypatch.setattr(run_module, "tqdm", fake_tqdm)
+
+    Trainer.train.__wrapped__(trainer)
+
+    assert calls["tqdm"] == ([0, 1], "Step", True, 30.0)
+    assert len(calls["postfix"]) == 2
+    assert all(refresh is False for _, refresh in calls["postfix"])
+    assert observed == [None, None]
+    assert trainer.curr_step == trainer.prior_cursor == 2
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_progress_refresh_interval_must_be_finite_and_positive(value):
+    from tabicl.train._run import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = SimpleNamespace(
+        max_steps=0,
+        progress_refresh_seconds=value,
+    )
+    trainer.curr_step = 0
+    trainer.master_process = False
+    trainer.ddp = False
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        Trainer.train.__wrapped__(trainer)
 
 
 def _cpu_trainer_config(checkpoint_dir, *, checkpoint_path=None):

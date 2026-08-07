@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -125,6 +126,35 @@ def record_gpu_window(
         or not os.access(executable, os.X_OK)
     ):
         raise ValueError("NVIDIA_SMI must be an absolute executable")
+    raw_tokens = os.environ.get("FORMAL_VISIBLE_GPU_TOKENS", "")
+    tokens = tuple(raw_tokens.split(",")) if raw_tokens else ()
+    token_pattern = re.compile(r"^(?:[0-9]+|GPU-[A-Za-z0-9._-]+|MIG-[A-Za-z0-9._-]+)$")
+    if (
+        len(tokens) != expected_gpu_count
+        or len(set(tokens)) != expected_gpu_count
+        or any(token_pattern.fullmatch(token) is None for token in tokens)
+    ):
+        raise ValueError("formal GPU recorder requires exact CUDA-visible GPU tokens")
+
+    def scoped_query(fields: str) -> subprocess.CompletedProcess[str]:
+        rows: list[str] = []
+        for token in tokens:
+            result = query_fn(
+                [
+                    executable,
+                    f"--id={token}",
+                    f"--query-gpu={fields}",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            lines = [line for line in result.stdout.splitlines() if line.strip()]
+            if result.returncode != 0 or len(lines) != 1:
+                raise RuntimeError("CUDA-visible nvidia-smi query failed")
+            rows.append(lines[0])
+        return subprocess.CompletedProcess([], 0, "\n".join(rows) + "\n", "")
     if any(
         path.exists() or path.is_symlink()
         for path in (
@@ -141,16 +171,7 @@ def record_gpu_window(
     with csv_path.open("x", encoding="utf-8") as csv_handle, jsonl_path.open(
         "x", encoding="utf-8"
     ) as jsonl_handle:
-        initial = query_fn(
-            [
-                executable,
-                "--query-gpu=uuid",
-                "--format=csv,noheader,nounits",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        initial = scoped_query("uuid")
         expected_gpu_uuids = tuple(
             line.strip() for line in initial.stdout.splitlines() if line.strip()
         )
@@ -183,16 +204,7 @@ def record_gpu_window(
             if stop_path.exists():
                 raise RuntimeError("compute ended before active training window closed")
             loop_start = monotonic_fn()
-            result = query_fn(
-                [
-                    executable,
-                    "--query-gpu=uuid,utilization.gpu",
-                    "--format=csv,noheader,nounits",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            result = scoped_query("uuid,utilization.gpu")
             if result.returncode != 0:
                 raise RuntimeError("nvidia-smi sample failed")
             timestamp = monotonic_fn()
