@@ -38,7 +38,30 @@ SCHEDULER_COMMANDS = ("sbatch", "scontrol", "scancel", "squeue", "sacct")
 TRANSACTION_JOURNAL_CEILING_BYTES = 2_000_000
 RUNTIME_COMPLETION_CEILING_BYTES = 65_536
 TERMINAL_LOG_ATTESTATION_CEILING_BYTES = 131_072
+FORMAL_METADATA_CEILING_BYTES = 128 << 20
 SCHEDULER_RECONCILIATION_ATTEMPTS = 3
+LOCAL_COMMAND_TIMEOUT_SECONDS = 120
+SCHEDULER_COMMAND_TIMEOUT_SECONDS = 30
+LOCAL_GIT_CONFIG_OVERRIDES = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.filemode=true",
+)
+PRODUCTION_REQUIRED_SOURCE_PATHS = (
+    "scripts/submit_h100_identity_formal.sh",
+    "scripts/verify_formal_overlay.py",
+    "scripts/verify_runtime_source.py",
+    "scripts/slurm_h100_identity_formal.sh",
+    "scripts/run_formal_identity_production_job.py",
+    "scripts/formal_train_v2_clf_identity_stage1.sh",
+    "scripts/formal_train_v2_clf_identity_stage2.sh",
+    "scripts/formal_train_v2_clf_identity_stage3.sh",
+    "scripts/run_with_durable_log.sh",
+)
+PRODUCTION_REQUIRED_CODE_ROOTS = ("scripts", "src/tabicl")
 TERMINAL_SCHEDULER_STATES = frozenset(
     {
         "CANCELLED",
@@ -87,6 +110,27 @@ _LEDGER_ENTRY_KEYS = {
     "scientific_sha256",
     "cohort_protocol_sha256",
     "arm_protocol_sha256",
+}
+_H100_GATE_KEYS = {
+    "attestation_sha256",
+    "checkpoint_ceiling_bytes",
+    "gpu_model",
+    "driver_version",
+    "nvidia_smi_sha256",
+}
+_CAMPAIGN_BINDING_KEYS = {
+    "campaign_id",
+    "campaign_manifest_sha256",
+    "training_commit_sha",
+    "training_tree_sha",
+    "source_manifest_sha256",
+    "environment_sha256",
+    "h100_attestation_sha256",
+    "nvidia_smi_sha256",
+    "checkpoint_ceiling_bytes",
+    "static_protocol_sha256_by_stage",
+    "time_limit_by_stage",
+    "predecessor_acceptance_sha256_by_seed",
 }
 
 
@@ -237,6 +281,22 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+def _require_external_evidence_topology(
+    paths: Sequence[Path],
+    *,
+    exact_root: Path,
+    artifact_root: Path,
+    job_work_root: Path,
+) -> None:
+    for evidence_path in paths:
+        if _paths_overlap(evidence_path, exact_root):
+            raise ValueError("formal evidence paths must be outside exact_root")
+        if _paths_overlap(evidence_path, artifact_root):
+            raise ValueError("formal evidence paths must be outside artifact_root")
+        if _paths_overlap(evidence_path, job_work_root):
+            raise ValueError("formal evidence paths must be outside job_work_root")
+
+
 def _open_directory_nofollow(path: Path, *, where: str) -> int:
     """Open every directory component without following symbolic links."""
     if (
@@ -288,6 +348,19 @@ def _load_git_repository_helper(root: Path):
     )
     if spec is None or spec.loader is None:
         raise ValueError("cannot load exact-T Git repository helper")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_campaign_registry_helper(root: Path):
+    path = root / "scripts/formal_campaign_registry.py"
+    spec = importlib.util.spec_from_file_location(
+        "_formal_submit_campaign_registry", path
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("cannot load exact-T campaign registry helper")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -411,6 +484,7 @@ def validate_overlay(
             "artifact_root",
             "source",
             "smoke",
+            "campaign",
             "capacity",
             "runtime",
             "scheduler",
@@ -468,14 +542,42 @@ def validate_overlay(
 
     smoke = _exact_keys(
         overlay["smoke"],
-        {"attestation_path", "expected_sha256", "expected_gpu_model"},
+        {
+            "attestation_path",
+            "expected_sha256",
+            "expected_gpu_model",
+            "expected_driver_version",
+        },
         "smoke",
     )
     smoke_path = _absolute_path(smoke["attestation_path"], "smoke attestation")
     smoke_sha256 = _digest(smoke["expected_sha256"], "smoke expected sha256")
     smoke_gpu_model = _safe_text(smoke["expected_gpu_model"], "smoke GPU model")
+    smoke_driver_version = _safe_text(
+        smoke["expected_driver_version"], "smoke GPU driver version"
+    )
     if "H100" not in smoke_gpu_model:
         raise ValueError("smoke GPU model must identify an H100")
+
+    campaign = _exact_keys(
+        overlay["campaign"],
+        {
+            "manifest_path",
+            "expected_sha256",
+            "acceptance_registry",
+            "binding",
+        },
+        "campaign",
+    )
+    campaign_manifest_path = _absolute_path(
+        campaign["manifest_path"], "campaign manifest"
+    )
+    campaign_expected_sha256 = _digest(
+        campaign["expected_sha256"], "campaign manifest"
+    )
+    campaign_acceptance_registry = _absolute_path(
+        campaign["acceptance_registry"], "campaign acceptance registry"
+    )
 
     capacity = _exact_keys(
         overlay["capacity"],
@@ -508,6 +610,14 @@ def validate_overlay(
         capacity["protocol_metadata_allowance_bytes"],
         "protocol metadata allowance",
     )
+    if protocol_metadata_allowance > FORMAL_METADATA_CEILING_BYTES:
+        raise ValueError(
+            "protocol metadata allowance exceeds the formal metadata ceiling"
+        )
+    if manifest_ceiling > protocol_metadata_allowance:
+        raise ValueError(
+            "finalized manifest ceiling exceeds the protocol metadata allowance"
+        )
     assigned_durable = (
         4 * len(ARMS) * len(STAGES) * run_log_ceiling
         + 2 * len(ARMS) * len(STAGES) * attestation_ceiling
@@ -519,18 +629,36 @@ def validate_overlay(
 
     runtime = _exact_keys(
         overlay["runtime"],
-        {"python", "git", "git_sha256", "nvidia_smi", "job_work_root"},
+        {
+            "python", "git", "git_sha256", "nvidia_smi",
+            "nvidia_smi_sha256", "job_work_root",
+        },
         "runtime",
     )
     python = _absolute_path(runtime["python"], "runtime python")
     git = _absolute_path(runtime["git"], "runtime git")
     git_sha256 = _digest(runtime["git_sha256"], "runtime git sha256")
     nvidia_smi = _absolute_path(runtime["nvidia_smi"], "runtime nvidia_smi")
+    nvidia_smi_sha256 = _digest(
+        runtime["nvidia_smi_sha256"], "runtime nvidia_smi sha256"
+    )
     job_work_root = _absolute_path(runtime["job_work_root"], "job work root")
     if _paths_overlap(job_work_root, root):
         raise ValueError("job_work_root must be disjoint from exact_root")
     if _paths_overlap(job_work_root, artifact_root):
         raise ValueError("job_work_root must be disjoint from artifact_root")
+    evidence_paths = (
+        source_manifest,
+        smoke_path,
+        campaign_manifest_path,
+        campaign_acceptance_registry,
+    )
+    _require_external_evidence_topology(
+        evidence_paths,
+        exact_root=root,
+        artifact_root=artifact_root,
+        job_work_root=job_work_root,
+    )
 
     scheduler = _exact_keys(
         overlay["scheduler"],
@@ -685,6 +813,130 @@ def validate_overlay(
             "arm_protocol_sha256": supplied_arms,
         }
 
+    campaign_binding_raw = _exact_keys(
+        campaign["binding"], _CAMPAIGN_BINDING_KEYS, "campaign binding"
+    )
+    campaign_id = _safe_id(
+        campaign_binding_raw["campaign_id"], "campaign binding campaign_id"
+    )
+    if study_id != f"{campaign_id}-seed{seed}":
+        raise ValueError("study_id is not the selected campaign seed namespace")
+    static_protocols = _exact_keys(
+        campaign_binding_raw["static_protocol_sha256_by_stage"],
+        {stage for stage, _budget in STAGES},
+        "campaign static protocols",
+    )
+    campaign_time_limits = _exact_keys(
+        campaign_binding_raw["time_limit_by_stage"],
+        {stage for stage, _budget in STAGES},
+        "campaign time limits",
+    )
+    predecessor_map = campaign_binding_raw[
+        "predecessor_acceptance_sha256_by_seed"
+    ]
+    expected_predecessor_keys = {
+        str(formal_seed) for formal_seed in sorted(FORMAL_SEEDS) if formal_seed < seed
+    }
+    predecessor_map = _exact_keys(
+        predecessor_map,
+        expected_predecessor_keys,
+        "campaign predecessor acceptances",
+    )
+    normalized_predecessors = {
+        key: _digest(value, f"campaign predecessor seed {key}")
+        for key, value in predecessor_map.items()
+    }
+    expected_static_protocols: dict[str, str] = {}
+    for stage_name, budget in STAGES:
+        protocol = stage_protocols[stage_name]
+        expected_static_protocols[stage_name] = make_manifest(
+            "formal_campaign_stage_static_protocol",
+            {
+                "training_commit_sha": commit_sha,
+                "training_tree_sha": tree_sha,
+                "source_manifest_sha256": source_sha256,
+                "environment_sha256": environment_sha256,
+                "stage": stage_name,
+                "terminal_step": budget,
+                "time_limit": time_limit_by_stage[stage_name],
+                "prior_sha256": protocol["prior_sha256"],
+                "architecture_sha256": protocol["architecture_sha256"],
+                "optimizer_sha256": protocol["optimizer_sha256"],
+                "scientific_sha256": protocol["scientific_sha256"],
+            },
+        )["sha256"]
+    normalized_static_protocols = {
+        stage: _digest(static_protocols[stage], f"campaign {stage} static protocol")
+        for stage, _budget in STAGES
+    }
+    normalized_campaign_times = {
+        stage: _slurm_duration(
+            campaign_time_limits[stage], f"campaign {stage} time limit"
+        )
+        for stage, _budget in STAGES
+    }
+    campaign_binding = {
+        "campaign_id": campaign_id,
+        "campaign_manifest_sha256": _digest(
+            campaign_binding_raw["campaign_manifest_sha256"],
+            "campaign binding manifest",
+        ),
+        "training_commit_sha": _git_oid(
+            campaign_binding_raw["training_commit_sha"],
+            "campaign training commit",
+        ),
+        "training_tree_sha": _git_oid(
+            campaign_binding_raw["training_tree_sha"], "campaign training tree"
+        ),
+        "source_manifest_sha256": _digest(
+            campaign_binding_raw["source_manifest_sha256"],
+            "campaign source manifest",
+        ),
+        "environment_sha256": _digest(
+            campaign_binding_raw["environment_sha256"], "campaign environment"
+        ),
+        "h100_attestation_sha256": _digest(
+            campaign_binding_raw["h100_attestation_sha256"],
+            "campaign H100 attestation",
+        ),
+        "nvidia_smi_sha256": _digest(
+            campaign_binding_raw["nvidia_smi_sha256"],
+            "campaign nvidia-smi executable",
+        ),
+        "checkpoint_ceiling_bytes": _positive_int(
+            campaign_binding_raw["checkpoint_ceiling_bytes"],
+            "campaign checkpoint ceiling",
+        ),
+        "static_protocol_sha256_by_stage": normalized_static_protocols,
+        "time_limit_by_stage": normalized_campaign_times,
+        "predecessor_acceptance_sha256_by_seed": normalized_predecessors,
+    }
+    expected_campaign_bindings = {
+        "campaign_manifest_sha256": campaign_expected_sha256,
+        "training_commit_sha": commit_sha,
+        "training_tree_sha": tree_sha,
+        "source_manifest_sha256": source_sha256,
+        "environment_sha256": environment_sha256,
+        "h100_attestation_sha256": smoke_sha256,
+        "nvidia_smi_sha256": nvidia_smi_sha256,
+        "checkpoint_ceiling_bytes": checkpoint_ceiling,
+        "static_protocol_sha256_by_stage": expected_static_protocols,
+        "time_limit_by_stage": time_limit_by_stage,
+    }
+    if any(
+        campaign_binding[key] != expected
+        for key, expected in expected_campaign_bindings.items()
+    ):
+        raise ValueError("campaign binding differs from the formal overlay")
+
+    h100_gate = {
+        "attestation_sha256": smoke_sha256,
+        "checkpoint_ceiling_bytes": checkpoint_ceiling,
+        "gpu_model": smoke_gpu_model,
+        "driver_version": smoke_driver_version,
+        "nvidia_smi_sha256": nvidia_smi_sha256,
+    }
+
     for stage_name, budget in STAGES:
         for arm in ARMS:
             upstream, artifact = _entry_identity(study_id, arm, stage_name)
@@ -731,7 +983,15 @@ def validate_overlay(
         raise ValueError("formal artifact paths must be unique")
 
     ledger = make_manifest(
-        "transaction_ledger", {"study_id": study_id, "entries": entries}
+        "transaction_ledger",
+        {
+            "study_id": study_id,
+            "protocol_metadata_allowance_bytes": protocol_metadata_allowance,
+            "entries": entries,
+            "h100_gate": h100_gate,
+            "campaign_binding": campaign_binding,
+            "runtime_tools": {"nvidia_smi_sha256": nvidia_smi_sha256},
+        },
     )
     ledger_path = artifact_root / "transaction-ledger.json"
     scheduler_log_root = artifact_root / "scheduler-logs"
@@ -756,6 +1016,7 @@ def validate_overlay(
                 "PYTHON": str(python),
                 "GIT": str(git),
                 "NVIDIA_SMI": str(nvidia_smi),
+                "FORMAL_NVIDIA_SMI_SHA256": nvidia_smi_sha256,
                 "PYTHONPATH": str(root / "src"),
                 "PYTHONNOUSERSITE": "1",
                 "CANDIDATE_REPOSITORY": candidate_repository,
@@ -776,6 +1037,12 @@ def validate_overlay(
                 "FORMAL_SOURCE_MANIFEST": str(source_manifest),
                 "FORMAL_SOURCE_SHA256": source_sha256,
                 "FORMAL_ENVIRONMENT_SHA256": environment_sha256,
+                "FORMAL_H100_ATTESTATION_SHA256": smoke_sha256,
+                "FORMAL_EXPECTED_GPU_MODEL": smoke_gpu_model,
+                "FORMAL_EXPECTED_DRIVER_VERSION": smoke_driver_version,
+                "FORMAL_CAMPAIGN_BINDING_SHA256": canonical_sha256(
+                    campaign_binding
+                ),
                 "FORMAL_SEED": str(seed),
                 "FORMAL_STUDY_ID": study_id,
                 "FORMAL_OUTPUT_ID": f"{study_id}-{arm}-{stage_name}",
@@ -885,6 +1152,13 @@ def validate_overlay(
             "attestation_path": str(smoke_path),
             "expected_sha256": smoke_sha256,
             "expected_gpu_model": smoke_gpu_model,
+            "expected_driver_version": smoke_driver_version,
+        },
+        "campaign": {
+            "manifest_path": str(campaign_manifest_path),
+            "expected_sha256": campaign_expected_sha256,
+            "acceptance_registry": str(campaign_acceptance_registry),
+            "binding": campaign_binding,
         },
         "capacity": {
             "checkpoint_ceiling_bytes": checkpoint_ceiling,
@@ -903,6 +1177,7 @@ def validate_overlay(
             "git": str(git),
             "git_sha256": git_sha256,
             "nvidia_smi": str(nvidia_smi),
+            "nvidia_smi_sha256": nvidia_smi_sha256,
             "job_work_root": str(job_work_root),
         },
         "scheduler": {
@@ -1030,6 +1305,9 @@ def _submission_receipt(
                 "cluster": item.get("cluster"),
                 "job_name": item["job_name"],
                 "parent_job_id": item["parent_job_id"],
+                "sbatch_argv_sha256": _digest(
+                    item["sbatch_argv_sha256"], "submitted sbatch argv"
+                ),
                 "scheduler_stdout": job["scheduler_stdout"],
                 "scheduler_stderr": job["scheduler_stderr"],
                 "completion_path": job["completion_path"],
@@ -1045,9 +1323,17 @@ def _submission_receipt(
             "source_commit_sha": plan["source"]["commit_sha"],
             "source_tree_sha": plan["source"]["tree_sha"],
             "repository_binding": dict(plan["repository_binding"]),
+            "h100_gate": dict(plan["ledger"]["payload"]["h100_gate"]),
+            "campaign_binding": dict(
+                plan["ledger"]["payload"]["campaign_binding"]
+            ),
+            "runtime_tools": dict(plan["ledger"]["payload"]["runtime_tools"]),
             "jobs_held_at_publication": True,
             "run_log_ceiling_bytes": plan["capacity"]["run_log_ceiling_bytes"],
             "manifest_ceiling_bytes": plan["capacity"]["manifest_ceiling_bytes"],
+            "protocol_metadata_allowance_bytes": plan["capacity"][
+                "protocol_metadata_allowance_bytes"
+            ],
             "runtime_completion_ceiling_bytes": RUNTIME_COMPLETION_CEILING_BYTES,
             "terminal_log_attestation_path": plan[
                 "terminal_log_attestation_path"
@@ -1097,6 +1383,14 @@ def _submission_commit(
             "transaction_id": plan.get("transaction_id", "f" * 32),
             "submission_receipt_sha256": receipt["sha256"],
             "transaction_ledger_sha256": plan["ledger"]["sha256"],
+            "protocol_metadata_allowance_bytes": plan["capacity"][
+                "protocol_metadata_allowance_bytes"
+            ],
+            "h100_gate": dict(plan["ledger"]["payload"]["h100_gate"]),
+            "campaign_binding": dict(
+                plan["ledger"]["payload"]["campaign_binding"]
+            ),
+            "runtime_tools": dict(plan["ledger"]["payload"]["runtime_tools"]),
             "job_ids": job_ids,
         },
     )
@@ -1276,8 +1570,12 @@ def _maximal_terminal_attestation(
                         # conservative serialized maximum.
                         "gpu_name": "H100" + "\x00" * 252,
                         "gpu_uuid": "GPU-" + "u" * 192,
+                        "gpu_driver_version": "d" * 128,
                         "repository_binding": repository_binding,
                         "manifest_ceiling_bytes": manifest_ceiling,
+                        "protocol_metadata_allowance_bytes": plan["capacity"][
+                            "protocol_metadata_allowance_bytes"
+                        ],
                     },
                     "scheduler_logs": scheduler_logs,
                     "finalized_artifact": {
@@ -1302,7 +1600,14 @@ def _maximal_terminal_attestation(
         "source_commit_sha": plan["source"]["commit_sha"],
         "source_tree_sha": plan["source"]["tree_sha"],
         "repository_binding": repository_binding,
+        "campaign_binding": dict(
+            plan["ledger"]["payload"]["campaign_binding"]
+        ),
+        "runtime_tools": dict(plan["ledger"]["payload"]["runtime_tools"]),
         "manifest_ceiling_bytes": manifest_ceiling,
+        "protocol_metadata_allowance_bytes": plan["capacity"][
+            "protocol_metadata_allowance_bytes"
+        ],
         "sacct_sha256": plan["scheduler"]["commands"]["sacct"]["sha256"],
         "path_format": "artifact_root_relative_posix_v1",
         "terminal_verified": True,
@@ -1338,6 +1643,7 @@ def _validate_protocol_metadata_budget(plan: Mapping[str, Any]) -> None:
                 "cluster": "cluster-max",
                 "job_name": f"tabicl-{'f' * 32}-{job['arm']}-s{job['stage_index']}",
                 "parent_job_id": parent_id,
+                "sbatch_argv_sha256": "f" * 64,
             }
         )
     receipt = _submission_receipt(plan, submitted)
@@ -1486,12 +1792,27 @@ def _minimal_env(*, path: str, pythonpath: str | None = None) -> dict[str, str]:
     return environment
 
 
+def _minimal_git_env(*, path: str) -> dict[str, str]:
+    return {
+        **_minimal_env(path=path),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_COUNT": "0",
+        "GIT_CEILING_DIRECTORIES": "/",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_PROTOCOL_FROM_USER": "0",
+        "GIT_ALLOW_PROTOCOL": "https",
+    }
+
+
 def _run(
     argv: Sequence[str],
     *,
     env: Mapping[str, str],
     where: str,
     allowed_returncodes: set[int] = {0},
+    pass_fds: Sequence[int] = (),
+    timeout_seconds: float = LOCAL_COMMAND_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         list(argv),
@@ -1501,13 +1822,15 @@ def _run(
         stderr=subprocess.PIPE,
         text=True,
         check=False,
+        timeout=timeout_seconds,
+        pass_fds=tuple(pass_fds),
     )
     if completed.returncode not in allowed_returncodes:
         raise RuntimeError(f"{where} failed with status {completed.returncode}")
     return completed
 
 
-def _attest_exact_checkout(plan: Mapping[str, Any]) -> None:
+def _attest_exact_checkout(plan: Mapping[str, Any]) -> str:
     root = Path(plan["exact_root"])
     physical_root = root.resolve(strict=True)
     if physical_root != root or not physical_root.is_dir():
@@ -1525,56 +1848,108 @@ def _attest_exact_checkout(plan: Mapping[str, Any]) -> None:
     git = Path(plan["runtime"]["git"])
     if not git.is_absolute() or not os.access(git, os.X_OK):
         raise ValueError("formal runtime Git is not executable")
-    _sha256_regular_executable(
+    git_command, git_fd = _open_digest_bound_executable(
         git,
         plan["runtime"]["git_sha256"],
         where="formal runtime Git",
     )
     nvidia_smi = Path(plan["runtime"]["nvidia_smi"])
-    if not nvidia_smi.is_absolute() or not os.access(nvidia_smi, os.X_OK):
-        raise ValueError("formal runtime NVIDIA_SMI is not executable")
+    nvidia_command, nvidia_fd = _open_digest_bound_executable(
+        nvidia_smi,
+        plan["runtime"]["nvidia_smi_sha256"],
+        where="formal runtime NVIDIA_SMI",
+    )
+    del nvidia_command
+    os.close(nvidia_fd)
     _require_physical_directory(
         Path(plan["runtime"]["job_work_root"]), where="formal job work root"
     )
 
     path = os.environ.get("PATH", "")
-    git_env = _minimal_env(path=path)
-    head = _run(
-        [str(git), "-C", str(root), "rev-parse", "HEAD^{commit}"],
-        env=git_env,
-        where="exact-T HEAD attestation",
-    ).stdout.strip()
-    tree = _run(
-        [str(git), "-C", str(root), "rev-parse", "HEAD^{tree}"],
-        env=git_env,
-        where="exact-T tree attestation",
-    ).stdout.strip()
-    if head != plan["source"]["commit_sha"]:
-        raise ValueError("exact-T checkout commit mismatch")
-    if tree != plan["source"]["tree_sha"]:
-        raise ValueError("exact-T checkout tree mismatch")
-    status = _run(
-        [
-            str(git),
-            "-C",
-            str(root),
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-        ],
-        env=git_env,
-        where="exact-T clean-tree attestation",
-    ).stdout
-    if status:
-        raise ValueError("exact-T checkout is dirty")
-    symbolic = _run(
-        [str(git), "-C", str(root), "symbolic-ref", "-q", "HEAD"],
-        env=git_env,
-        where="exact-T detached-HEAD attestation",
-        allowed_returncodes={0, 1},
-    )
-    if symbolic.returncode == 0:
-        raise ValueError("exact-T checkout must be detached")
+    git_env = _minimal_git_env(path=path)
+    try:
+        head = _run(
+            [
+                git_command,
+                *LOCAL_GIT_CONFIG_OVERRIDES,
+                "-C",
+                str(root),
+                "rev-parse",
+                "HEAD^{commit}",
+            ],
+            env=git_env,
+            where="exact-T HEAD attestation",
+            pass_fds=(git_fd,),
+        ).stdout.strip()
+        tree = _run(
+            [
+                git_command,
+                *LOCAL_GIT_CONFIG_OVERRIDES,
+                "-C",
+                str(root),
+                "rev-parse",
+                "HEAD^{tree}",
+            ],
+            env=git_env,
+            where="exact-T tree attestation",
+            pass_fds=(git_fd,),
+        ).stdout.strip()
+        if head != plan["source"]["commit_sha"]:
+            raise ValueError("exact-T checkout commit mismatch")
+        if tree != plan["source"]["tree_sha"]:
+            raise ValueError("exact-T checkout tree mismatch")
+        status = _run(
+            [
+                git_command,
+                *LOCAL_GIT_CONFIG_OVERRIDES,
+                "-C",
+                str(root),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            env=git_env,
+            where="exact-T clean-tree attestation",
+            pass_fds=(git_fd,),
+        ).stdout
+        if status:
+            raise ValueError("exact-T checkout is dirty")
+        symbolic = _run(
+            [
+                git_command,
+                *LOCAL_GIT_CONFIG_OVERRIDES,
+                "-C",
+                str(root),
+                "symbolic-ref",
+                "-q",
+                "HEAD",
+            ],
+            env=git_env,
+            where="exact-T detached-HEAD attestation",
+            allowed_returncodes={0, 1},
+            pass_fds=(git_fd,),
+        )
+        if symbolic.returncode == 0:
+            raise ValueError("exact-T checkout must be detached")
+        spool_source = _run(
+            [
+                git_command,
+                *LOCAL_GIT_CONFIG_OVERRIDES,
+                "-C",
+                str(root),
+                "show",
+                f"{plan['source']['commit_sha']}:scripts/slurm_h100_identity_formal.sh",
+            ],
+            env=git_env,
+            where="exact-T production spool source attestation",
+            pass_fds=(git_fd,),
+        )
+        spool_raw = spool_source.stdout.encode("utf-8")
+        if spool_source.stderr or len(spool_raw) > 1 << 20:
+            raise ValueError("exact-T production spool source is not bounded and clean")
+        spool_sha256 = hashlib.sha256(spool_raw).hexdigest()
+    finally:
+        os.close(git_fd)
 
     source = plan["source"]
     verifier = root / "scripts" / "verify_runtime_source.py"
@@ -1594,6 +1969,16 @@ def _attest_exact_checkout(plan: Mapping[str, Any]) -> None:
             source["commit_sha"],
             "--expected-tree-sha",
             source["tree_sha"],
+            *(
+                item
+                for required in PRODUCTION_REQUIRED_SOURCE_PATHS
+                for item in ("--required-path", required)
+            ),
+            *(
+                item
+                for required in PRODUCTION_REQUIRED_CODE_ROOTS
+                for item in ("--required-code-root", required)
+            ),
         ],
         env=_minimal_env(path=path, pythonpath=str(root / "src")),
         where="exact-T source/import attestation",
@@ -1622,6 +2007,83 @@ def _attest_exact_checkout(plan: Mapping[str, Any]) -> None:
     plan["filesystem_isolation"] = _require_work_artifact_filesystem_isolation(
         plan, artifact_directory=Path(plan["artifact_root"]).parent
     )
+    return spool_sha256
+
+
+def _validate_campaign_authorization(plan: Mapping[str, Any]) -> None:
+    root = Path(plan["exact_root"])
+    campaign = plan["campaign"]
+    registry = _load_campaign_registry_helper(root)
+    campaign_manifest = registry.read_canonical_manifest(
+        Path(campaign["manifest_path"]),
+        max_bytes=registry.CAMPAIGN_MANIFEST_CEILING_BYTES,
+        expected_kind="formal_campaign",
+        expected_sha256=campaign["expected_sha256"],
+    )
+    validated_campaign = registry.validate_campaign_manifest(campaign_manifest)
+    raw_evidence = validated_campaign["validation_evidence"]
+    _require_external_evidence_topology(
+        tuple(
+            Path(raw_evidence[key])
+            for key in (
+                "source_manifest_path",
+                "h100_attestation_path",
+                "h100_submission_receipt_path",
+                "environment_completion_path",
+            )
+        ),
+        exact_root=root,
+        artifact_root=Path(plan["artifact_root"]),
+        job_work_root=Path(plan["runtime"]["job_work_root"]),
+    )
+    completed = _run(
+        [
+            plan["runtime"]["python"],
+            "-I",
+            "-B",
+            str(root / "scripts" / "formal_campaign_registry.py"),
+            "authorize-seed",
+            "--campaign",
+            campaign["manifest_path"],
+            "--campaign-sha256",
+            campaign["expected_sha256"],
+            "--acceptance-registry",
+            campaign["acceptance_registry"],
+            "--seed",
+            str(plan["seed"]),
+        ],
+        env=_minimal_env(
+            path=os.environ.get("PATH", ""), pythonpath=str(root / "src")
+        ),
+        where="external immutable campaign authorization",
+    )
+    if completed.stderr or len(completed.stdout.encode("utf-8")) > 131_072:
+        raise ValueError("campaign authorization output is not bounded and clean")
+
+    def reject_duplicate_pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("campaign authorization has duplicate JSON keys")
+            result[key] = value
+        return result
+
+    try:
+        observed = json.loads(
+            completed.stdout,
+            object_pairs_hook=reject_duplicate_pairs,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant {token}")
+            ),
+        )
+    except json.JSONDecodeError as error:
+        raise ValueError("campaign authorization returned invalid JSON") from error
+    if (
+        observed != campaign["binding"]
+        or completed.stdout
+        != canonical_json_bytes(campaign["binding"]).decode("utf-8") + "\n"
+    ):
+        raise ValueError("campaign authorization differs from the formal plan")
 
 
 def _validate_h100_smoke(plan: Mapping[str, Any]) -> None:
@@ -1629,7 +2091,7 @@ def _validate_h100_smoke(plan: Mapping[str, Any]) -> None:
     python = plan["runtime"]["python"]
     source = plan["source"]
     smoke = plan["smoke"]
-    _run(
+    completed = _run(
         [
             python,
             "-I",
@@ -1653,6 +2115,8 @@ def _validate_h100_smoke(plan: Mapping[str, Any]) -> None:
             plan["repository_binding"]["repository_identity_sha256"],
             "--expected-repository-query-sha256",
             plan["repository_binding"]["query_sha256"],
+            "--expected-nvidia-smi-sha256",
+            plan["runtime"]["nvidia_smi_sha256"],
             "--expected-gpu-model",
             smoke["expected_gpu_model"],
             "--expected-checkpoint-ceiling-bytes",
@@ -1665,6 +2129,34 @@ def _validate_h100_smoke(plan: Mapping[str, Any]) -> None:
         ),
         where="external digest-bound H100 smoke attestation",
     )
+    if completed.stderr or len(completed.stdout.encode("utf-8")) > 131_072:
+        raise ValueError("H100 smoke validator output is not bounded and clean")
+    try:
+        report = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("H100 smoke validator returned invalid JSON") from error
+    expected_report_keys = {
+        "schema_version",
+        "valid",
+        "sha256",
+        "case_count",
+        "gpu_model",
+        "driver_version",
+        "nvidia_smi_sha256",
+    }
+    if not isinstance(report, Mapping) or set(report) != expected_report_keys:
+        raise ValueError("H100 smoke validator report schema mismatch")
+    if (
+        report["schema_version"] != 1
+        or report["valid"] is not True
+        or report["sha256"] != smoke["expected_sha256"]
+        or report["case_count"] != 12
+        or report["gpu_model"] != smoke["expected_gpu_model"]
+        or report["driver_version"] != smoke["expected_driver_version"]
+        or report["nvidia_smi_sha256"] != plan["runtime"]["nvidia_smi_sha256"]
+    ):
+        raise ValueError("H100 smoke validator report mismatch")
+    _safe_text(report["driver_version"], "smoke GPU driver version")
 
 
 def _run_submit_capacity_gate(
@@ -1797,6 +2289,7 @@ class TransactionJournal:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
+        flags |= getattr(os, "O_NONBLOCK", 0)
         try:
             fd = os.open(self.path.name, flags, dir_fd=parent_fd)
             try:
@@ -1822,12 +2315,15 @@ def _new_transaction_id(plan: Mapping[str, Any]) -> str:
     return digest.hexdigest()[:32]
 
 
-def _sha256_regular_executable(path: Path, expected_sha256: str, *, where: str) -> str:
-    """Hash a no-follow regular executable and reject path substitution."""
+def _open_digest_bound_executable(
+    path: Path, expected_sha256: str, *, where: str
+) -> tuple[str, int]:
+    """Open and hash one executable, retaining the exact inode for execution."""
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    flags |= getattr(os, "O_NONBLOCK", 0)
     parent_fd = _open_directory_nofollow(path.parent, where=f"{where} parent")
     try:
         fd = os.open(path.name, flags, dir_fd=parent_fd)
@@ -1848,23 +2344,34 @@ def _sha256_regular_executable(path: Path, expected_sha256: str, *, where: str) 
                 break
             digest.update(chunk)
         observed = digest.hexdigest()
-    finally:
+        if observed != expected_sha256:
+            raise ValueError(f"{where} SHA-256 mismatch")
+        return f"/proc/self/fd/{fd}", fd
+    except Exception:
         os.close(fd)
-    if observed != expected_sha256:
-        raise ValueError(f"{where} SHA-256 mismatch")
-    return str(path)
+        raise
 
 
-def _scheduler_commands(plan: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+def _scheduler_commands(
+    plan: Mapping[str, Any],
+) -> tuple[dict[str, str], tuple[int, ...], dict[str, str]]:
     commands: dict[str, str] = {}
-    for name in SCHEDULER_COMMANDS:
-        specification = plan["scheduler"]["commands"][name]
-        commands[name] = _sha256_regular_executable(
-            Path(specification["path"]),
-            specification["sha256"],
-            where=f"scheduler {name}",
-        )
-    return commands, _minimal_env(path="/usr/bin:/bin")
+    descriptors: list[int] = []
+    try:
+        for name in SCHEDULER_COMMANDS:
+            specification = plan["scheduler"]["commands"][name]
+            command, descriptor = _open_digest_bound_executable(
+                Path(specification["path"]),
+                specification["sha256"],
+                where=f"scheduler {name}",
+            )
+            commands[name] = command
+            descriptors.append(descriptor)
+    except Exception:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
+    return commands, tuple(descriptors), _minimal_env(path="/usr/bin:/bin")
 
 
 def _export_argument(exports: Mapping[str, str]) -> str:
@@ -1886,6 +2393,7 @@ def _sbatch_argv(
     job: Mapping[str, Any],
     parent_job_id: str | None,
     job_name: str,
+    spool_wrapper_command: str,
 ) -> list[str]:
     scheduler = plan["scheduler"]
     argv = [
@@ -1914,7 +2422,7 @@ def _sbatch_argv(
     argv.extend(
         [
             _export_argument(job["exports"]),
-            str(Path(plan["exact_root"]) / "scripts/slurm_h100_identity_formal.sh"),
+            spool_wrapper_command,
         ]
     )
     return argv
@@ -1960,6 +2468,7 @@ def _query_jobs_by_name(
     job_name: str,
     cluster: str | None,
     expected_job_id: str | None = None,
+    scheduler_fds: Sequence[int] = (),
 ) -> list[dict[str, str]]:
     completed = _run(
         [
@@ -1971,6 +2480,8 @@ def _query_jobs_by_name(
         ],
         env=scheduler_env,
         where=f"scheduler query for {job_name}",
+        pass_fds=scheduler_fds,
+        timeout_seconds=SCHEDULER_COMMAND_TIMEOUT_SECONDS,
     )
     if len(completed.stdout.encode("utf-8")) > 1_000_000:
         raise ValueError("scheduler query response exceeded the safety ceiling")
@@ -2013,6 +2524,7 @@ def _reconcile_held_submission(
     scheduler_env: Mapping[str, str],
     job_name: str,
     journal: TransactionJournal,
+    scheduler_fds: Sequence[int] = (),
 ) -> tuple[str, str | None]:
     parsed_id: str | None = None
     cluster: str | None = None
@@ -2024,15 +2536,25 @@ def _reconcile_held_submission(
             raise ValueError("nonzero sbatch response is not authoritative")
         parsed_id, cluster = candidate_id, candidate_cluster
     except ValueError:
-        journal.append(
-            "submit_response_untrusted",
-            {
-                "job_name": job_name,
-                "returncode": completed.returncode,
-                "stdout_sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
-                "stderr_sha256": hashlib.sha256(completed.stderr.encode()).hexdigest(),
-            },
-        )
+        try:
+            journal.append(
+                "submit_response_untrusted",
+                {
+                    "job_name": job_name,
+                    "returncode": completed.returncode,
+                    "stdout_sha256": hashlib.sha256(
+                        completed.stdout.encode()
+                    ).hexdigest(),
+                    "stderr_sha256": hashlib.sha256(
+                        completed.stderr.encode()
+                    ).hexdigest(),
+                },
+            )
+        except BaseException as error:
+            raise UnresolvedSubmission(
+                job_name,
+                "untrusted submission response preceded journal failure",
+            ) from error
     observations: list[dict[str, str]] = []
     for _attempt in range(3):
         try:
@@ -2042,17 +2564,33 @@ def _reconcile_held_submission(
                 job_name=job_name,
                 cluster=cluster,
                 expected_job_id=parsed_id,
+                scheduler_fds=scheduler_fds,
             )
+        except SubmissionInterrupted:
+            raise
         except Exception:
             observations = []
         if observations:
             break
     if len(observations) != 1:
         if parsed_id is not None and completed.returncode == 0:
-            journal.append(
-                "submit_response_known_id_unverified",
-                {"job_name": job_name, "job_id": parsed_id, "cluster": cluster},
-            )
+            try:
+                journal.append(
+                    "submit_response_known_id_unverified",
+                    {
+                        "job_name": job_name,
+                        "job_id": parsed_id,
+                        "cluster": cluster,
+                    },
+                )
+            except BaseException as error:
+                raise UnresolvedSubmission(
+                    job_name,
+                    "known submission ID preceded journal failure",
+                    known_job_id=parsed_id,
+                    cluster=cluster,
+                    name_remains_unresolved=False,
+                ) from error
         raise UnresolvedSubmission(
             job_name,
             "submission response could not be reconciled to exactly one held job",
@@ -2069,25 +2607,34 @@ def _reconcile_held_submission(
             cluster=cluster,
             name_remains_unresolved=False,
         )
-    if parsed_id is not None and parsed_id != observed["job_id"]:
+    try:
+        if parsed_id is not None and parsed_id != observed["job_id"]:
+            journal.append(
+                "submit_response_id_reconciled",
+                {
+                    "job_name": job_name,
+                    "response_job_id": parsed_id,
+                    "observed_job_id": observed["job_id"],
+                },
+            )
         journal.append(
-            "submit_response_id_reconciled",
+            "submit_accepted",
             {
                 "job_name": job_name,
-                "response_job_id": parsed_id,
-                "observed_job_id": observed["job_id"],
+                "job_id": observed["job_id"],
+                "cluster": cluster,
+                "state": observed["state"],
+                "reason": observed["reason"],
             },
         )
-    journal.append(
-        "submit_accepted",
-        {
-            "job_name": job_name,
-            "job_id": observed["job_id"],
-            "cluster": cluster,
-            "state": observed["state"],
-            "reason": observed["reason"],
-        },
-    )
+    except BaseException as error:
+        raise UnresolvedSubmission(
+            job_name,
+            "submission was uniquely reconciled before journal failure",
+            known_job_id=observed["job_id"],
+            cluster=cluster,
+            name_remains_unresolved=False,
+        ) from error
     return observed["job_id"], cluster
 
 
@@ -2096,6 +2643,7 @@ def _verify_released(
     squeue: str,
     scheduler_env: Mapping[str, str],
     item: Mapping[str, Any],
+    scheduler_fds: Sequence[int] = (),
 ) -> bool:
     try:
         observations = _query_jobs_by_name(
@@ -2104,6 +2652,7 @@ def _verify_released(
             job_name=item["job_name"],
             cluster=item.get("cluster"),
             expected_job_id=item["job_id"],
+            scheduler_fds=scheduler_fds,
         )
     except Exception:
         return False
@@ -2128,6 +2677,7 @@ def _query_scheduler_state(
     sacct: str,
     scheduler_env: Mapping[str, str],
     item: Mapping[str, Any],
+    scheduler_fds: Sequence[int] = (),
 ) -> tuple[str, str, str]:
     """Resolve one accepted job by ID, falling back from queue to accounting."""
 
@@ -2147,6 +2697,8 @@ def _query_scheduler_state(
         stderr=subprocess.PIPE,
         text=True,
         check=False,
+        timeout=SCHEDULER_COMMAND_TIMEOUT_SECONDS,
+        pass_fds=tuple(scheduler_fds),
     )
     if (
         len(queue.stdout.encode("utf-8")) > 1_000_000
@@ -2193,6 +2745,8 @@ def _query_scheduler_state(
         stderr=subprocess.PIPE,
         text=True,
         check=False,
+        timeout=SCHEDULER_COMMAND_TIMEOUT_SECONDS,
+        pass_fds=tuple(scheduler_fds),
     )
     if (
         len(accounting.stdout.encode("utf-8")) > 1_000_000
@@ -2230,6 +2784,7 @@ def _verify_cancelled(
     sacct: str,
     scheduler_env: Mapping[str, str],
     item: Mapping[str, Any],
+    scheduler_fds: Sequence[int] = (),
 ) -> tuple[bool, str | None, str | None]:
     last_state: str | None = None
     last_source: str | None = None
@@ -2240,6 +2795,7 @@ def _verify_cancelled(
                 sacct=sacct,
                 scheduler_env=scheduler_env,
                 item=item,
+                scheduler_fds=scheduler_fds,
             )
         except Exception:
             continue
@@ -2269,6 +2825,7 @@ def _rollback(
     scheduler_env: Mapping[str, str],
     submitted: Sequence[Mapping[str, Any]],
     journal: TransactionJournal,
+    scheduler_fds: Sequence[int] = (),
 ) -> tuple[list[str], list[str]]:
     cancelled: list[str] = []
     remaining: list[str] = []
@@ -2283,6 +2840,8 @@ def _rollback(
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
+                timeout=SCHEDULER_COMMAND_TIMEOUT_SECONDS,
+                pass_fds=tuple(scheduler_fds),
             )
         except BaseException as cancel_error:
             remaining.append(job_id)
@@ -2316,6 +2875,7 @@ def _rollback(
             sacct=sacct,
             scheduler_env=scheduler_env,
             item=item,
+            scheduler_fds=scheduler_fds,
         )
         _safe_journal_append(
             journal,
@@ -2354,28 +2914,44 @@ def submit_overlay(
     artifact_root = Path(plan["artifact_root"])
     if artifact_root == exact_root or exact_root in artifact_root.parents:
         raise ValueError("formal artifact namespace must be outside exact T")
-    _attest_exact_checkout(plan)
+    spool_wrapper_sha256 = _attest_exact_checkout(plan)
+    _validate_campaign_authorization(plan)
     _validate_h100_smoke(plan)
     _run_submit_capacity_gate(plan)
-    commands, scheduler_env = _scheduler_commands(plan)
-    _create_fresh_namespace(plan)
-    transaction_id = _new_transaction_id(plan)
-    plan["transaction_id"] = transaction_id
-    plan["rollback_path"] = str(
-        artifact_root / f"rollback-incomplete-{transaction_id}.json"
+    spool_wrapper_command, spool_wrapper_fd = _open_digest_bound_executable(
+        Path(plan["exact_root"]) / "scripts/slurm_h100_identity_formal.sh",
+        spool_wrapper_sha256,
+        where="exact-T production Slurm spool wrapper",
     )
-    journal = TransactionJournal(
-        artifact_root / f"transaction-journal-{transaction_id}.jsonl",
-        transaction_id,
-    )
-    journal.append(
-        "transaction_started",
-        {
-            "study_id": plan["study_id"],
-            "seed": plan["seed"],
-            "ledger_sha256": plan["ledger"]["sha256"],
-        },
-    )
+    try:
+        commands, scheduler_fds, scheduler_env = _scheduler_commands(plan)
+    except BaseException:
+        os.close(spool_wrapper_fd)
+        raise
+    try:
+        _create_fresh_namespace(plan)
+        transaction_id = _new_transaction_id(plan)
+        plan["transaction_id"] = transaction_id
+        plan["rollback_path"] = str(
+            artifact_root / f"rollback-incomplete-{transaction_id}.json"
+        )
+        journal = TransactionJournal(
+            artifact_root / f"transaction-journal-{transaction_id}.jsonl",
+            transaction_id,
+        )
+        journal.append(
+            "transaction_started",
+            {
+                "study_id": plan["study_id"],
+                "seed": plan["seed"],
+                "ledger_sha256": plan["ledger"]["sha256"],
+            },
+        )
+    except BaseException:
+        for scheduler_fd in scheduler_fds:
+            os.close(scheduler_fd)
+        os.close(spool_wrapper_fd)
+        raise
     accepted_ids: list[str] = []
     submitted: list[dict[str, Any]] = []
     observed_clusters: set[str | None] = set()
@@ -2389,7 +2965,7 @@ def submit_overlay(
         raise SubmissionInterrupted(f"signal_{signum}")
 
     if process_scoped_signals:
-        for signal_number in (signal.SIGINT, signal.SIGTERM):
+        for signal_number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
             prior_handlers[signal_number] = signal.getsignal(signal_number)
             signal.signal(signal_number, interrupt_handler)
     try:
@@ -2399,6 +2975,14 @@ def submit_overlay(
             job_name = f"tabicl-{transaction_id}-{job['arm']}-s{job['stage_index']}"
             job["exports"]["FORMAL_TRANSACTION_ID"] = transaction_id
             job["exports"]["FORMAL_EXPECTED_JOB_NAME"] = job_name
+            sbatch_argv = _sbatch_argv(
+                plan,
+                job,
+                parent_id,
+                job_name,
+                spool_wrapper_command,
+            )
+            sbatch_argv_sha256 = canonical_sha256(sbatch_argv)
             pending_submit_name = job_name
             journal.append(
                 "submit_intent",
@@ -2407,20 +2991,34 @@ def submit_overlay(
                     "stage": job["stage"],
                     "job_name": job_name,
                     "parent_job_id": parent_id,
+                    "sbatch_argv_sha256": sbatch_argv_sha256,
                 },
             )
-            completed = subprocess.run(
-                [
-                    commands["sbatch"],
-                    *_sbatch_argv(plan, job, parent_id, job_name),
-                ],
-                env=dict(scheduler_env),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
+            scheduler_argv = [commands["sbatch"], *sbatch_argv]
+            try:
+                completed = subprocess.run(
+                    scheduler_argv,
+                    env=dict(scheduler_env),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                    timeout=SCHEDULER_COMMAND_TIMEOUT_SECONDS,
+                    pass_fds=(*scheduler_fds, spool_wrapper_fd),
+                )
+            except subprocess.TimeoutExpired as timeout_error:
+                def timeout_text(value: str | bytes | None) -> str:
+                    if isinstance(value, bytes):
+                        return value.decode("utf-8", errors="replace")
+                    return value or ""
+
+                completed = subprocess.CompletedProcess(
+                    scheduler_argv,
+                    124,
+                    stdout=timeout_text(timeout_error.stdout),
+                    stderr=timeout_text(timeout_error.stderr),
+                )
             try:
                 job_id, cluster = _reconcile_held_submission(
                     completed=completed,
@@ -2428,13 +3026,13 @@ def submit_overlay(
                     scheduler_env=scheduler_env,
                     job_name=job_name,
                     journal=journal,
+                    scheduler_fds=scheduler_fds,
                 )
             except UnresolvedSubmission as unresolved:
                 if (
                     unresolved.known_job_id is not None
                     and unresolved.known_job_id not in accepted_ids
                 ):
-                    accepted_ids.append(unresolved.known_job_id)
                     submitted.append(
                         {
                             "job": job,
@@ -2442,8 +3040,10 @@ def submit_overlay(
                             "cluster": unresolved.cluster,
                             "job_name": job_name,
                             "parent_job_id": parent_id,
+                            "sbatch_argv_sha256": sbatch_argv_sha256,
                         }
                     )
+                    accepted_ids.append(unresolved.known_job_id)
                     pending_submit_name = None
                 else:
                     unresolved.name_remains_unresolved = True
@@ -2453,8 +3053,6 @@ def submit_overlay(
                 raise UnresolvedSubmission(
                     job_name, "scheduler reconciled two transaction names to one job ID"
                 )
-            accepted_ids.append(job_id)
-            job_ids_by_key[(job["arm"], job["stage"])] = job_id
             submitted.append(
                 {
                     "job": job,
@@ -2462,8 +3060,11 @@ def submit_overlay(
                     "cluster": cluster,
                     "job_name": job_name,
                     "parent_job_id": parent_id,
+                    "sbatch_argv_sha256": sbatch_argv_sha256,
                 }
             )
+            accepted_ids.append(job_id)
+            job_ids_by_key[(job["arm"], job["stage"])] = job_id
             pending_submit_name = None
             observed_clusters.add(cluster)
             if len(observed_clusters) != 1:
@@ -2532,11 +3133,14 @@ def submit_overlay(
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
+                timeout=SCHEDULER_COMMAND_TIMEOUT_SECONDS,
+                pass_fds=scheduler_fds,
             )
             released = _verify_released(
                 squeue=commands["squeue"],
                 scheduler_env=scheduler_env,
                 item=item,
+                scheduler_fds=scheduler_fds,
             )
             journal.append(
                 "release_observed",
@@ -2577,7 +3181,43 @@ def submit_overlay(
             for signal_number in prior_handlers:
                 signal.signal(signal_number, signal.SIG_IGN)
         if pending_submit_name is not None:
-            unresolved_job_names.append(pending_submit_name)
+            try:
+                pending_matches = _query_jobs_by_name(
+                    squeue=commands["squeue"],
+                    scheduler_env=scheduler_env,
+                    job_name=pending_submit_name,
+                    cluster=None,
+                    scheduler_fds=scheduler_fds,
+                )
+            except Exception:
+                pending_matches = []
+            if len(pending_matches) == 1:
+                discovered = pending_matches[0]
+                submitted_ids = {item["job_id"] for item in submitted}
+                if discovered["job_id"] not in submitted_ids:
+                    submitted.append(
+                        {
+                            "job": job,
+                            "job_id": discovered["job_id"],
+                            "cluster": None,
+                            "job_name": pending_submit_name,
+                            "parent_job_id": parent_id,
+                            "sbatch_argv_sha256": sbatch_argv_sha256,
+                        }
+                    )
+                if discovered["job_id"] not in accepted_ids:
+                    accepted_ids.append(discovered["job_id"])
+                _safe_journal_append(
+                    journal,
+                    "pending_submit_absorbed",
+                    {
+                        "job_name": pending_submit_name,
+                        "job_id": discovered["job_id"],
+                    },
+                )
+                pending_submit_name = None
+            else:
+                unresolved_job_names.append(pending_submit_name)
         if isinstance(error, UnresolvedSubmission) and error.name_remains_unresolved:
             unresolved_job_names.append(error.job_name)
         if failure_phase == "commit_publication_failed":
@@ -2605,6 +3245,7 @@ def submit_overlay(
                 scheduler_env=scheduler_env,
                 submitted=submitted,
                 journal=journal,
+                scheduler_fds=scheduler_fds,
             )
         except BaseException as rollback_error:
             cancelled, remaining = [], list(accepted_ids)
@@ -2654,6 +3295,10 @@ def submit_overlay(
         except Exception:
             pass
         raise RuntimeError("formal submission failed; accepted jobs were rolled back") from error
+    finally:
+        for scheduler_fd in scheduler_fds:
+            os.close(scheduler_fd)
+        os.close(spool_wrapper_fd)
     return receipt
 
 

@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import shutil
 import stat
@@ -21,9 +22,15 @@ CONTROLLER_FILES = (
     "scripts/run_h100_identity_validation.py",
     "scripts/run_h100_identity_maxseq_smoke.sh",
     "scripts/run_slurm_h100_identity_case.sh",
+    "scripts/formal_run_with_gpu_monitor.sh",
+    "scripts/run_with_durable_log.sh",
+    "scripts/exec_digest_bound_git.py",
+    "scripts/exec_digest_bound_nvidia_smi.py",
     "scripts/slurm_h100_identity_maxseq_smoke.sh",
     "scripts/slurm_h100_identity_nccl_smoke.sh",
     "scripts/verify_filesystem_isolation.py",
+    "scripts/verify_formal_environment.py",
+    "scripts/verify_formal_environment_transaction.py",
     "scripts/verify_git_repository.py",
     "scripts/verify_runtime_source.py",
 )
@@ -45,12 +52,96 @@ def canonical(value) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
+def make_manifest(kind: str, payload: dict) -> dict:
+    body = {"schema_version": 1, "kind": kind, "payload": payload}
+    return {**body, "sha256": hashlib.sha256(canonical(body)).hexdigest()}
+
+
+def write_environment_transaction(fixture, name: str) -> tuple[dict, dict]:
+    root = fixture["external"] / "environments" / name
+    root.mkdir(parents=True, exist_ok=True)
+    fingerprint = {
+        "visible_distribution_multiset": [],
+        "effective_formal_runtime_distributions": [],
+    }
+    installed_sha256 = hashlib.sha256(canonical(fingerprint)).hexdigest()
+    base_environment = {
+        "environment_fingerprint_schema_version": 2,
+        "installed_distributions_sha256": installed_sha256,
+    }
+    one = make_manifest(
+        "environment", {**base_environment, "visible_cuda_device_count": 1}
+    )
+    two = make_manifest(
+        "environment", {**base_environment, "visible_cuda_device_count": 2}
+    )
+    environment_map = {"1": one["sha256"], "2": two["sha256"]}
+    inventory = make_manifest(
+        "formal_environment_inventory",
+        {
+            "source_commit_sha": fixture["commit"],
+            "source_tree_sha": fixture["tree"],
+            "git_sha256": fixture["fake_git_sha256"],
+            "capture_visible_cuda_device_count": 0,
+            "installed_distributions_sha256": installed_sha256,
+            "environment_sha256_by_world_size": environment_map,
+            "fingerprint_preimage": fingerprint,
+        },
+    )
+    values = (
+        ("one_gpu", "one-gpu.json", one),
+        ("two_gpu", "two-gpu.json", two),
+        ("inventory", "inventory.json", inventory),
+    )
+    outputs = []
+    for role, filename, value in values:
+        raw = canonical(value) + b"\n"
+        (root / filename).write_bytes(raw)
+        outputs.append(
+            {
+                "role": role,
+                "name": filename,
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+    descriptor = {
+        "schema_version": 1,
+        "source_commit_sha": fixture["commit"],
+        "source_tree_sha": fixture["tree"],
+        "outputs": outputs,
+    }
+    transaction_sha256 = hashlib.sha256(canonical(descriptor) + b"\n").hexdigest()
+    completion = {
+        **descriptor,
+        "kind": "formal_environment_generation_completion",
+        "transaction_sha256": transaction_sha256,
+    }
+    completion_raw = canonical(completion) + b"\n"
+    completion_path = root / "environment-complete.json"
+    completion_path.write_bytes(completion_raw)
+    return environment_map, {
+        "completion_path": str(completion_path),
+        "completion_sha256": hashlib.sha256(completion_raw).hexdigest(),
+        "transaction_sha256": transaction_sha256,
+        "inventory_sha256": inventory["sha256"],
+        "completion_max_bytes": 1 << 20,
+        "manifest_max_bytes": 1 << 20,
+        "inventory_max_bytes": 128 << 20,
+    }
+
+
 def run(argv, **kwargs):
     return subprocess.run(argv, text=True, check=True, **kwargs)
 
 
 def write_executable(path: Path, body: str) -> None:
-    path.write_text(f"#!{sys.executable}\n" + body)
+    path.write_text(
+        f"#!{sys.executable}\n"
+        f"FAKE_EXECUTABLE_PATH = {str(path)!r}\n"
+        f"FAKE_EXECUTABLE_NAME = {path.name!r}\n"
+        + body
+    )
     path.chmod(0o755)
 
 
@@ -100,12 +191,33 @@ def fixture(tmp_path_factory):
 import os
 import sys
 from pathlib import Path
-if sys.argv[1:] == [
+state = Path(FAKE_EXECUTABLE_PATH).parent
+is_remote_query = sys.argv[1:] == [
     "ls-remote", "--refs",
     "https://github.com/kikixiong/tabicl-pe.git",
     "refs/heads/codex/position-identity-v1",
-]:
-    state = Path(__file__).resolve().parent
+]
+if not is_remote_query:
+    local_count_path = state / "git-local-count"
+    local_count = int(local_count_path.read_text()) + 1 if local_count_path.exists() else 1
+    local_count_path.write_text(str(local_count))
+    if (state / "swap-git-path-on-first-local").exists() and local_count == 1:
+        current = Path(FAKE_EXECUTABLE_PATH)
+        saved = current.with_name(current.name + ".verified-inode")
+        current.rename(saved)
+        current.write_text(
+            "#!" + sys.executable + "\\n"
+            + "from pathlib import Path\\n"
+            + "Path(" + repr(str(state / "replacement-executed")) + ").write_text('git')\\n"
+            + "raise SystemExit(97)\\n"
+        )
+        current.chmod(0o755)
+    if (state / "swap-git-path-on-first-local").exists() and local_count == 4:
+        current = Path(FAKE_EXECUTABLE_PATH)
+        saved = current.with_name(current.name + ".verified-inode")
+        current.unlink()
+        saved.rename(current)
+if is_remote_query:
     count_path = state / "git-query-count"
     count = int(count_path.read_text()) + 1 if count_path.exists() else 1
     count_path.write_text(str(count))
@@ -154,12 +266,34 @@ else:
 
     common = """
 import json
+import hashlib
 from pathlib import Path
 import sys
 
-state = Path(__file__).resolve().parent
+state = Path(FAKE_EXECUTABLE_PATH).parent
 with (state / "calls.jsonl").open("a") as handle:
-    handle.write(json.dumps({"cmd": Path(__file__).name, "argv": sys.argv[1:]}, separators=(",", ":")) + "\\n")
+    handle.write(json.dumps({"cmd": FAKE_EXECUTABLE_NAME, "argv": sys.argv[1:]}, separators=(",", ":")) + "\\n")
+
+def swap_scheduler_paths():
+    for name in ("sbatch", "scontrol", "scancel", "squeue", "sacct"):
+        current = state / name
+        saved = state / (name + ".verified-inode")
+        current.rename(saved)
+        current.write_text(
+            "#!" + sys.executable + "\\n"
+            + "from pathlib import Path\\n"
+            + "Path(" + repr(str(state / "replacement-executed")) + ").write_text(" + repr(name) + ")\\n"
+            + "raise SystemExit(97)\\n"
+        )
+        current.chmod(0o755)
+
+def restore_scheduler_paths():
+    for name in ("sbatch", "scontrol", "scancel", "squeue", "sacct"):
+        current = state / name
+        saved = state / (name + ".verified-inode")
+        if saved.exists():
+            current.unlink(missing_ok=True)
+            saved.rename(current)
 """
     write_executable(
         fakebin / "sbatch",
@@ -168,6 +302,28 @@ with (state / "calls.jsonl").open("a") as handle:
 count_path = state / "sbatch-count"
 count = int(count_path.read_text()) + 1 if count_path.exists() else 1
 count_path.write_text(str(count))
+wrapper_swap = state / "swap-spool-wrappers-on-first-sbatch"
+if wrapper_swap.exists() and count == 1:
+    exact_root = Path(wrapper_swap.read_text())
+    for filename in (
+        "slurm_h100_identity_maxseq_smoke.sh",
+        "slurm_h100_identity_nccl_smoke.sh",
+    ):
+        current = exact_root / "scripts" / filename
+        saved = current.with_name(filename + ".verified-inode")
+        current.rename(saved)
+        current.write_text(
+            "#!/bin/bash\\n"
+            + "printf malicious > "
+            + repr(str(state / "replacement-wrapper-executed"))
+            + "\\nexit 97\\n"
+        )
+        current.chmod(0o755)
+(state / f"spooled-wrapper-{count}.sha256").write_text(
+    hashlib.sha256(Path(sys.argv[-1]).read_bytes()).hexdigest()
+)
+if (state / "swap-scheduler-paths-on-first-sbatch").exists() and count == 1:
+    swap_scheduler_paths()
 fail = state / "fail-sbatch-at"
 if fail.exists() and count == int(fail.read_text()):
     raise SystemExit(41)
@@ -184,6 +340,13 @@ elif (state / "signal-sbatch-at").exists() and count == int((state / "signal-sba
     import os, signal, time
     os.kill(os.getppid(), signal.SIGTERM)
     time.sleep(5)
+elif (state / "signal-hup-sbatch-at").exists() and count == int((state / "signal-hup-sbatch-at").read_text()):
+    import os, signal, time
+    os.kill(os.getppid(), signal.SIGHUP)
+    time.sleep(5)
+elif (state / "sleep-sbatch-at").exists() and count == int((state / "sleep-sbatch-at").read_text()):
+    import time
+    time.sleep(60)
 elif (state / "response-loss-nonzero-at").exists() and count == int((state / "response-loss-nonzero-at").read_text()):
     raise SystemExit(41)
 elif (state / "duplicate-at").exists() and count == int((state / "duplicate-at").read_text()):
@@ -210,11 +373,17 @@ job_id = sys.argv[-1]
 (state / f"released-{job_id}").write_text("1")
 delete_cancel = state / "delete-scancel-after-release-at"
 if delete_cancel.exists() and count == int(delete_cancel.read_text()):
-    cancel = Path(__file__).with_name("scancel")
-    cancel.rename(cancel.with_name("scancel.missing"))
+    cancel = state / "scancel"
+    backup = state / "scancel.deleted-backup"
+    backup.write_bytes(cancel.read_bytes())
+    backup.chmod(cancel.stat().st_mode)
+    cancel.unlink()
+    (state / "scancel-path-deleted").write_text("1")
 collision = state / "precreate-receipt-at-release"
 if collision.exists() and count == int(collision.read_text()):
     Path((state / "receipt-path").read_text()).write_text('{"invalid":true}' + chr(10))
+if (state / "swap-scheduler-paths-on-first-sbatch").exists() and count == 12:
+    restore_scheduler_paths()
 """,
     )
     write_executable(
@@ -226,7 +395,19 @@ if len(sys.argv) < 2 or not sys.argv[-1].isdigit():
 failed = state / "fail-cancel-ids"
 if failed.exists() and sys.argv[-1] in failed.read_text().splitlines():
     raise SystemExit(43)
+sleeping = state / "sleep-cancel-ids"
+if sleeping.exists() and sys.argv[-1] in sleeping.read_text().splitlines():
+    import time
+    time.sleep(60)
 (state / f"cancelled-{sys.argv[-1]}").write_text("1")
+if sys.argv[-1] == "1001":
+    backup = state / "scancel.deleted-backup"
+    if backup.exists():
+        current = state / "scancel"
+        current.write_bytes(backup.read_bytes())
+        current.chmod(backup.stat().st_mode)
+        backup.unlink()
+    restore_scheduler_paths()
 """,
     )
     write_executable(
@@ -286,6 +467,8 @@ if job_arg is not None:
     job_id = job_arg.split('=', 1)[1]
     if (state / f"cancelled-{job_id}").exists():
         print(f"{job_id}|CANCELLED|")
+    elif (state / "accounting-running").exists():
+        print(f"{job_id}|RUNNING|")
     elif (state / "accounting-pending").exists():
         print(f"{job_id}|PENDING|")
 elif name_arg is not None:
@@ -315,6 +498,25 @@ else:
 
 def reset_fake(fixture, controls=None):
     fakebin = fixture["fakebin"]
+    for filename in (
+        "slurm_h100_identity_maxseq_smoke.sh",
+        "slurm_h100_identity_nccl_smoke.sh",
+    ):
+        current = fixture["exact"] / "scripts" / filename
+        saved = current.with_name(filename + ".verified-inode")
+        if saved.exists():
+            current.unlink(missing_ok=True)
+            saved.rename(current)
+    for command in ("git", "sbatch", "scontrol", "scancel", "squeue", "sacct"):
+        current = fakebin / command
+        saved = fakebin / f"{command}.verified-inode"
+        if saved.exists():
+            current.unlink(missing_ok=True)
+            saved.rename(current)
+    deleted_cancel = fakebin / "scancel.deleted-backup"
+    if deleted_cancel.exists():
+        (fakebin / "scancel").unlink(missing_ok=True)
+        deleted_cancel.rename(fakebin / "scancel")
     if not (fakebin / "scancel").exists() and (fakebin / "scancel.missing").exists():
         (fakebin / "scancel.missing").rename(fakebin / "scancel")
     for name in (
@@ -324,12 +526,16 @@ def reset_fake(fixture, controls=None):
         "fail-sbatch-at",
         "malformed-at",
         "signal-sbatch-at",
+        "signal-hup-sbatch-at",
+        "sleep-sbatch-at",
+        "sleep-cancel-ids",
         "response-loss-nonzero-at",
         "duplicate-at",
         "cluster-suffix",
         "fail-release-at",
         "fail-cancel-ids",
         "delete-scancel-after-release-at",
+        "scancel-path-deleted",
         "precreate-receipt-at-release",
         "release-stays-held",
         "release-delay-once",
@@ -338,11 +544,18 @@ def reset_fake(fixture, controls=None):
         "squeue-banner",
         "squeue-hide-id",
         "squeue-hide-name",
+        "accounting-running",
         "accounting-pending",
         "ambiguous-name",
         "receipt-path",
         "git-query-count",
+        "git-local-count",
         "git-ref-drift-after-preflight",
+        "swap-git-path-on-first-local",
+        "swap-scheduler-paths-on-first-sbatch",
+        "swap-spool-wrappers-on-first-sbatch",
+        "replacement-executed",
+        "replacement-wrapper-executed",
     ):
         (fakebin / name).unlink(missing_ok=True)
     for path in fakebin.glob("released-*"):
@@ -355,6 +568,8 @@ def reset_fake(fixture, controls=None):
         path.unlink()
     for path in fakebin.glob("job-*.json"):
         path.unlink()
+    for path in fakebin.glob("spooled-wrapper-*.sha256"):
+        path.unlink()
     for name, value in (controls or {}).items():
         (fakebin / name).write_text(str(value))
 
@@ -364,6 +579,9 @@ def overlay(fixture, name):
         path = fixture["fakebin"] / name
         return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
+    environment_map, environment_transaction = write_environment_transaction(
+        fixture, name
+    )
     return {
         "schema_version": 1,
         "kind": "h100_identity_gate_submit",
@@ -378,12 +596,16 @@ def overlay(fixture, name):
             "manifest_path": str(fixture["source_path"]),
             "manifest_sha256": fixture["source"]["sha256"],
         },
-        "environment_sha256_by_world_size": {"1": "1" * 64, "2": "2" * 64},
+        "environment_sha256_by_world_size": environment_map,
+        "environment_transaction": environment_transaction,
         "runtime": {
             "python": str(Path(sys.executable).resolve()),
             "git": str(fixture["fake_git"]),
             "git_sha256": fixture["fake_git_sha256"],
             "nvidia_smi": "/usr/bin/true",
+            "nvidia_smi_sha256": hashlib.sha256(
+                Path("/usr/bin/true").read_bytes()
+            ).hexdigest(),
             "case_work_root": str(fixture["case_work"]),
         },
         "scheduler_commands": {
@@ -412,6 +634,9 @@ def invoke(
     filesystem_isolation_drift=False,
     capacity_unit_drift=False,
     post_commit_signal=False,
+    post_held_plan_signal=False,
+    publication_interrupt="",
+    publication_uncertain="",
 ):
     reset_fake(fixture, controls)
     value = overlay(fixture, name)
@@ -435,6 +660,9 @@ def invoke(
         ),
         "TEST_CAPACITY_UNIT_DRIFT": "1" if capacity_unit_drift else "0",
         "TEST_POST_COMMIT_SIGNAL": "1" if post_commit_signal else "0",
+        "TEST_POST_HELD_PLAN_SIGNAL": "1" if post_held_plan_signal else "0",
+        "TEST_PUBLICATION_INTERRUPT": publication_interrupt,
+        "TEST_PUBLICATION_UNCERTAIN": publication_uncertain,
     }
     program = r'''
 import importlib.util
@@ -480,12 +708,24 @@ real_publish = module._publish_no_replace
 def publish(path, *args, **kwargs):
     result = real_publish(path, *args, **kwargs)
     if (
+        os.environ["TEST_POST_HELD_PLAN_SIGNAL"] == "1"
+        and Path(path).name == "held-plan.json"
+    ):
+        os.kill(os.getpid(), module.signal.SIGTERM)
+    if Path(path).name == os.environ["TEST_PUBLICATION_INTERRUPT"]:
+        raise module._PublicationInterrupted(
+            Path(path), KeyboardInterrupt("injected durable publication interrupt")
+        )
+    if Path(path).name == os.environ["TEST_PUBLICATION_UNCERTAIN"]:
+        raise module._PublicationUncertain(Path(path))
+    if (
         os.environ["TEST_POST_COMMIT_SIGNAL"] == "1"
         and Path(path).name == "submission-receipt.json"
     ):
         os.kill(os.getpid(), module.signal.SIGTERM)
     return result
 module._publish_no_replace = publish
+module.SCHEDULER_COMMAND_TIMEOUT_SECONDS = 1.0
 if os.environ["TEST_REAL_FILESYSTEM_ISOLATION"] != "1":
     isolation_calls = 0
     def isolation(*, exact_root, work_root, artifact_directory):
@@ -526,6 +766,7 @@ sys.stdout.buffer.write(module._canonical(receipt) + b"\n")
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        timeout=15,
     )
 
 
@@ -583,12 +824,11 @@ def test_success_is_exact_held_12_case_transaction_with_static_resources(fixture
             assert exported[key]
         if case_id == "nccl_2gpu":
             assert "--gres=gpu:2" in argv and "--cpus-per-task=64" in argv
-            assert argv[-1].endswith("slurm_h100_identity_nccl_smoke.sh")
             assert exported["FORMAL_EXPECTED_GPUS"] == "2"
         else:
             assert "--gres=gpu:1" in argv and "--cpus-per-task=32" in argv
-            assert argv[-1].endswith("slurm_h100_identity_maxseq_smoke.sh")
             assert exported["FORMAL_EXPECTED_GPUS"] == "1"
+        assert re.fullmatch(r"/proc/self/fd/[0-9]+", argv[-1]) is not None
 
     job_names = [
         next(item for item in event["argv"] if item.startswith("--job-name="))
@@ -628,6 +868,25 @@ def test_success_is_exact_held_12_case_transaction_with_static_resources(fixture
     assert receipt["payload"]["repository_binding"]["repository_ref"] == (
         "refs/heads/codex/position-identity-v1"
     )
+    expected_environment = overlay(fixture, "success")
+    environment_summary = receipt["payload"]["environment_transaction"]
+    assert environment_summary["completion_raw_sha256"] == (
+        expected_environment["environment_transaction"]["completion_sha256"]
+    )
+    assert environment_summary["transaction_sha256"] == (
+        expected_environment["environment_transaction"]["transaction_sha256"]
+    )
+    assert environment_summary["one_gpu_environment_sha256"] == (
+        expected_environment["environment_sha256_by_world_size"]["1"]
+    )
+    assert environment_summary["two_gpu_environment_sha256"] == (
+        expected_environment["environment_sha256_by_world_size"]["2"]
+    )
+    assert set(environment_summary["output_raw_sha256_by_role"]) == {
+        "one_gpu",
+        "two_gpu",
+        "inventory",
+    }
     validated = matrix.validate_gate_submission_receipt(
         receipt_path,
         expected_commit_sha=fixture["commit"],
@@ -637,6 +896,140 @@ def test_success_is_exact_held_12_case_transaction_with_static_resources(fixture
         max_bytes=1_000_000,
     )
     assert set(validated["artifact_identities"]) == set(case_ids)
+    assert validated["environment_transaction"] == environment_summary
+
+
+def test_local_checkout_git_uses_verified_inode_across_real_path_swap(fixture):
+    result = invoke(
+        fixture,
+        "git-inode-swap",
+        {"swap-git-path-on-first-local": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert (fixture["fakebin"] / "git-local-count").read_text() == "4"
+    assert not (fixture["fakebin"] / "replacement-executed").exists()
+
+
+def test_environment_verifier_executes_digest_bound_inode_after_path_swap(
+    tmp_path,
+):
+    module = load_submit_module()
+    verifier = tmp_path / "verifier.py"
+    observed = tmp_path / "observed.txt"
+    replacement_observed = tmp_path / "replacement-observed.txt"
+    verifier.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[1]).write_text('verified-inode')\n"
+    )
+    expected_sha256 = hashlib.sha256(verifier.read_bytes()).hexdigest()
+    command, descriptor = module._open_digest_bound_regular_file(
+        verifier,
+        expected_sha256,
+        "test environment verifier",
+    )
+    saved = verifier.with_suffix(".verified-inode")
+    verifier.rename(saved)
+    verifier.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(replacement_observed)!r}).write_text('replacement')\n"
+        "raise SystemExit(97)\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-B", command, str(observed)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            pass_fds=(descriptor,),
+        )
+    finally:
+        os.close(descriptor)
+    assert completed.returncode == 0, completed.stderr
+    assert observed.read_text() == "verified-inode"
+    assert not replacement_observed.exists()
+    with pytest.raises(ValueError, match="digest mismatch"):
+        module._open_digest_bound_regular_file(
+            verifier,
+            expected_sha256,
+            "test environment verifier",
+        )
+
+
+def test_scheduler_transaction_uses_verified_inodes_across_real_path_swap(
+    fixture,
+):
+    result = invoke(
+        fixture,
+        "scheduler-inode-swap-success",
+        {
+            "swap-scheduler-paths-on-first-sbatch": "1",
+            "squeue-hide-id": "1",
+            "accounting-running": "1",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    events = calls(fixture)
+    assert len([event for event in events if event["cmd"] == "sbatch"]) == 12
+    assert len([event for event in events if event["cmd"] == "scontrol"]) == 12
+    assert len([event for event in events if event["cmd"] == "squeue"]) == 12
+    assert len([event for event in events if event["cmd"] == "sacct"]) == 12
+    assert not (fixture["fakebin"] / "replacement-executed").exists()
+
+
+def test_sbatch_spools_digest_bound_wrapper_inode_after_exact_path_swap(fixture):
+    try:
+        result = invoke(
+            fixture,
+            "wrapper-inode-swap-success",
+            {"swap-spool-wrappers-on-first-sbatch": fixture["exact"]},
+        )
+        assert result.returncode == 0, result.stderr
+        entries = {
+            entry["path"]: entry["sha256"]
+            for entry in fixture["source"]["payload"]["entries"]
+        }
+        sbatches = [event for event in calls(fixture) if event["cmd"] == "sbatch"]
+        assert len(sbatches) == 12
+        for position, event in enumerate(sbatches, start=1):
+            exported = exports(event["argv"])
+            wrapper = (
+                "scripts/slurm_h100_identity_nccl_smoke.sh"
+                if exported["VALIDATION_CASE_ID"] == "nccl_2gpu"
+                else "scripts/slurm_h100_identity_maxseq_smoke.sh"
+            )
+            assert re.fullmatch(r"/proc/self/fd/[0-9]+", event["argv"][-1])
+            observed = (
+                fixture["fakebin"] / f"spooled-wrapper-{position}.sha256"
+            ).read_text()
+            assert observed == entries[wrapper]
+        assert not (fixture["fakebin"] / "replacement-wrapper-executed").exists()
+    finally:
+        reset_fake(fixture)
+
+
+def test_scheduler_rollback_uses_verified_inodes_across_real_path_swap(fixture):
+    result = invoke(
+        fixture,
+        "scheduler-inode-swap-rollback",
+        {
+            "swap-scheduler-paths-on-first-sbatch": "1",
+            "fail-release-at": "5",
+        },
+    )
+    assert result.returncode != 0
+    events = calls(fixture)
+    assert len([event for event in events if event["cmd"] == "sbatch"]) == 12
+    assert len([event for event in events if event["cmd"] == "scontrol"]) == 5
+    assert [event["argv"] for event in events if event["cmd"] == "scancel"] == [
+        [str(job)] for job in range(1012, 1000, -1)
+    ]
+    root = fixture["temp"] / "artifacts" / "scheduler-inode-swap-rollback"
+    recovery = json.loads((root / "rollback-recovery.json").read_text())
+    assert recovery["payload"]["remaining_job_ids"] == []
+    assert not (fixture["fakebin"] / "replacement-executed").exists()
 
 
 def test_post_commit_signal_cannot_turn_published_receipt_into_cli_failure(
@@ -656,18 +1049,199 @@ def test_post_commit_signal_cannot_turn_published_receipt_into_cli_failure(
     assert not [event for event in calls(fixture) if event["cmd"] == "scancel"]
 
 
+def test_held_plan_publication_interrupt_is_repropagated_after_truthful_rollback(
+    fixture,
+):
+    name = "held-plan-publication-interrupt"
+    result = invoke(fixture, name, publication_interrupt="held-plan.json")
+    assert result.returncode != 0
+    root = fixture["temp"] / "artifacts" / name
+    assert (root / "held-plan.json").is_file()
+    assert not (root / "submission-receipt.json").exists()
+    recovery = json.loads((root / "rollback-recovery.json").read_text())
+    assert recovery["payload"]["held_plan_published"] is True
+    assert recovery["payload"]["held_plan_visibility"] == "durable"
+    assert recovery["payload"]["submission_receipt_visibility"] == "absent"
+    assert recovery["payload"]["remaining_job_ids"] == []
+    assert [event["argv"] for event in calls(fixture) if event["cmd"] == "scancel"] == [
+        [str(job)] for job in range(1012, 1000, -1)
+    ]
+
+
+def test_signal_after_held_plan_return_observes_committed_flags_before_rollback(
+    fixture,
+):
+    name = "held-plan-post-return-signal"
+    result = invoke(fixture, name, post_held_plan_signal=True)
+    assert result.returncode != 0
+    root = fixture["temp"] / "artifacts" / name
+    recovery = json.loads((root / "rollback-recovery.json").read_text())
+    assert recovery["payload"]["held_plan_published"] is True
+    assert recovery["payload"]["held_plan_visibility"] == "durable"
+    assert recovery["payload"]["submission_receipt_visibility"] == "absent"
+    assert recovery["payload"]["remaining_job_ids"] == []
+    assert (root / "held-plan.json").is_file()
+    assert not (root / "submission-receipt.json").exists()
+
+
+def test_durable_receipt_publication_interrupt_is_repropagated_without_rollback(
+    fixture,
+):
+    name = "receipt-publication-interrupt"
+    result = invoke(
+        fixture,
+        name,
+        publication_interrupt="submission-receipt.json",
+    )
+    assert result.returncode != 0
+    root = fixture["temp"] / "artifacts" / name
+    assert (root / "submission-receipt.json").is_file()
+    assert not (root / "rollback-recovery.json").exists()
+    assert not [event for event in calls(fixture) if event["cmd"] == "scancel"]
+
+
+def test_uncertain_receipt_visibility_never_rolls_back_released_jobs(fixture):
+    name = "receipt-publication-uncertain"
+    result = invoke(
+        fixture,
+        name,
+        publication_uncertain="submission-receipt.json",
+    )
+    assert result.returncode != 0
+    assert "receipt visibility is uncertain" in result.stderr
+    root = fixture["temp"] / "artifacts" / name
+    assert (root / "submission-receipt.json").is_file()
+    assert not (root / "rollback-recovery.json").exists()
+    assert not [event for event in calls(fixture) if event["cmd"] == "scancel"]
+
+
 def test_imported_submit_default_never_rewrites_host_signal_handlers(tmp_path):
     module = load_submit_module()
     before = {
         signum: signal.getsignal(signum)
-        for signum in (signal.SIGINT, signal.SIGTERM)
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
     }
     with pytest.raises(Exception):
         module.submit(tmp_path / "missing.json", exact_root=tmp_path)
     assert {
         signum: signal.getsignal(signum)
-        for signum in (signal.SIGINT, signal.SIGTERM)
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
     } == before
+
+
+@pytest.mark.parametrize(
+    "fault", ("after_link", "after_link_fsync", "after_temp_unlink")
+)
+def test_write_once_publication_heals_each_post_link_failure(
+    tmp_path, fault
+):
+    module = load_submit_module()
+    value = module._make_envelope("publication_test", {"fault": fault})
+    path = tmp_path / "published.json"
+    assert module._publish_no_replace(
+        path, value, max_bytes=1 << 20, fault=fault
+    ) == path
+    assert path.read_bytes() == module._canonical(value) + b"\n"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_unhealable_directory_fsync_failure_revokes_link_before_error(
+    tmp_path, monkeypatch
+):
+    module = load_submit_module()
+    value = module._make_envelope("publication_test", {"fault": "fsync"})
+    path = tmp_path / "published.json"
+    real_fsync = module.os.fsync
+    calls = 0
+
+    def failing_fsync(fd):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise OSError("injected persistent directory fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(module.os, "fsync", failing_fsync)
+    with pytest.raises(module._PublicationUncertain):
+        module._publish_no_replace(path, value, max_bytes=1 << 20)
+    assert not path.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_process_interrupt_after_link_is_repropagated_after_durable_publication(
+    tmp_path, monkeypatch
+):
+    module = load_submit_module()
+    value = module._make_envelope("publication_test", {"fault": "interrupt"})
+    path = tmp_path / "published.json"
+    real_fsync = module.os.fsync
+    calls = 0
+
+    def interrupt_once(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt("injected publication interrupt")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(module.os, "fsync", interrupt_once)
+    with pytest.raises(module._PublicationInterrupted) as caught:
+        module._publish_no_replace(path, value, max_bytes=1 << 20)
+    assert isinstance(caught.value.interruption, KeyboardInterrupt)
+    assert path.read_bytes() == module._canonical(value) + b"\n"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_process_interrupt_between_link_syscall_and_flag_is_truthfully_recovered(
+    tmp_path, monkeypatch
+):
+    module = load_submit_module()
+    value = module._make_envelope("publication_test", {"fault": "link-window"})
+    path = tmp_path / "published.json"
+    real_link = module.os.link
+
+    def link_then_interrupt(*args, **kwargs):
+        real_link(*args, **kwargs)
+        raise KeyboardInterrupt("injected post-link pre-flag interrupt")
+
+    monkeypatch.setattr(module.os, "link", link_then_interrupt)
+    with pytest.raises(module._PublicationInterrupted) as caught:
+        module._publish_no_replace(path, value, max_bytes=1 << 20)
+    assert isinstance(caught.value.interruption, KeyboardInterrupt)
+    assert path.read_bytes() == module._canonical(value) + b"\n"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("cleanup_error", (KeyboardInterrupt, OSError))
+def test_durable_publication_cleanup_cannot_be_misreported_as_rollback(
+    tmp_path, monkeypatch, cleanup_error
+):
+    module = load_submit_module()
+    value = module._make_envelope("publication_test", {"fault": "final-cleanup"})
+    path = tmp_path / "published.json"
+    real_open_directory = module._open_directory_nofollow
+    real_close = module.os.close
+    captured = {}
+
+    def capture_directory(*args, **kwargs):
+        descriptor = real_open_directory(*args, **kwargs)
+        captured["parent_fd"] = descriptor
+        return descriptor
+
+    def close_then_fail(descriptor):
+        real_close(descriptor)
+        if descriptor == captured.get("parent_fd"):
+            raise cleanup_error("injected durable-final cleanup failure")
+
+    monkeypatch.setattr(module, "_open_directory_nofollow", capture_directory)
+    monkeypatch.setattr(module.os, "close", close_then_fail)
+    if cleanup_error is KeyboardInterrupt:
+        with pytest.raises(module._PublicationInterrupted):
+            module._publish_no_replace(path, value, max_bytes=1 << 20)
+    else:
+        assert module._publish_no_replace(path, value, max_bytes=1 << 20) == path
+    assert path.read_bytes() == module._canonical(value) + b"\n"
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 @pytest.mark.parametrize("failure_position", range(1, 13))
@@ -709,7 +1283,7 @@ def test_release_failure_cancels_all_and_incomplete_cancel_writes_truthful_recov
     assert recovery["payload"]["submission_receipt_published"] is False
 
 
-def test_missing_scancel_exec_after_release_still_publishes_recovery(fixture):
+def test_deleted_scancel_path_still_runs_verified_inode_during_rollback(fixture):
     root = Path(overlay(fixture, "missing-scancel-exec")["artifact_root"])
     result = invoke(
         fixture,
@@ -721,9 +1295,11 @@ def test_missing_scancel_exec_after_release_still_publishes_recovery(fixture):
     )
     assert result.returncode != 0
     recovery = json.loads((root / "rollback-recovery.json").read_text())
-    assert recovery["payload"]["remaining_job_ids"] == [
+    assert recovery["payload"]["remaining_job_ids"] == []
+    assert recovery["payload"]["cancelled_job_ids"] == [
         str(job) for job in range(1012, 1000, -1)
     ]
+    assert (fixture["fakebin"] / "scancel-path-deleted").read_text() == "1"
     assert recovery["payload"]["submission_receipt_published"] is False
 
 
@@ -754,10 +1330,19 @@ def test_duplicate_job_id_is_untrusted_and_records_recovery(fixture):
     assert recovery["payload"]["response_loss_resolution"] == "unique_job_absorbed"
 
 
-def test_sigterm_during_inflight_sbatch_uses_rollback_and_records_unknown_result(fixture):
-    result = invoke(fixture, "signal-inflight", {"signal-sbatch-at": 4})
+@pytest.mark.parametrize(
+    ("scenario", "control"),
+    (
+        ("signal-inflight", "signal-sbatch-at"),
+        ("sighup-inflight", "signal-hup-sbatch-at"),
+    ),
+)
+def test_signal_during_inflight_sbatch_uses_rollback_and_records_unknown_result(
+    fixture, scenario, control
+):
+    result = invoke(fixture, scenario, {control: 4})
     assert result.returncode != 0
-    root = Path(overlay(fixture, "signal-inflight")["artifact_root"])
+    root = Path(overlay(fixture, scenario)["artifact_root"])
     recovery = json.loads((root / "rollback-recovery.json").read_text())
     assert recovery["payload"]["reason"] == "sbatch_interrupted_with_unknown_result"
     assert recovery["payload"]["untrusted_sbatch_result_position"] == 4
@@ -766,6 +1351,29 @@ def test_sigterm_during_inflight_sbatch_uses_rollback_and_records_unknown_result
         "1004", "1003", "1002", "1001"
     ]
     assert recovery["payload"]["remaining_job_ids"] == []
+
+
+def test_sbatch_timeout_discovers_and_cancels_the_uncertain_job(fixture):
+    result = invoke(fixture, "sbatch-timeout", {"sleep-sbatch-at": 2})
+    assert result.returncode != 0
+    root = Path(overlay(fixture, "sbatch-timeout")["artifact_root"])
+    recovery = json.loads((root / "rollback-recovery.json").read_text())
+    assert recovery["payload"]["response_loss_resolution"] == "unique_job_absorbed"
+    assert recovery["payload"]["cancelled_job_ids"] == ["1002", "1001"]
+    assert recovery["payload"]["remaining_job_ids"] == []
+
+
+def test_scancel_timeout_continues_rollback_and_publishes_recovery(fixture):
+    result = invoke(
+        fixture,
+        "scancel-timeout",
+        {"fail-sbatch-at": 3, "sleep-cancel-ids": "1002"},
+    )
+    assert result.returncode != 0
+    root = Path(overlay(fixture, "scancel-timeout")["artifact_root"])
+    recovery = json.loads((root / "rollback-recovery.json").read_text())
+    assert recovery["payload"]["remaining_job_ids"] == ["1002"]
+    assert recovery["payload"]["cancelled_job_ids"] == ["1001"]
 
 
 def test_nonzero_response_loss_discovers_and_cancels_the_accepted_job(fixture):
@@ -1089,6 +1697,154 @@ def test_capacity_physical_block_boundary_exact_and_one_block_short(fixture):
         probe(required_blocks - 1)
 
 
+def test_environment_transaction_is_consumed_before_namespace_or_scheduler(fixture):
+    def remove_marker(value):
+        Path(value["environment_transaction"]["completion_path"]).unlink()
+
+    def tamper_one_gpu_output(value):
+        completion = Path(value["environment_transaction"]["completion_path"])
+        marker = json.loads(completion.read_text())
+        one_gpu = completion.parent / marker["outputs"][0]["name"]
+        one_gpu.write_bytes(one_gpu.read_bytes() + b"tamper")
+
+    scenarios = (
+        ("environment-marker-missing", remove_marker),
+        ("environment-output-tampered", tamper_one_gpu_output),
+        (
+            "environment-marker-digest-mismatch",
+            lambda value: value["environment_transaction"].update(
+                completion_sha256="0" * 64
+            ),
+        ),
+        (
+            "environment-transaction-digest-mismatch",
+            lambda value: value["environment_transaction"].update(
+                transaction_sha256="0" * 64
+            ),
+        ),
+        (
+            "environment-inventory-digest-mismatch",
+            lambda value: value["environment_transaction"].update(
+                inventory_sha256="0" * 64
+            ),
+        ),
+        (
+            "environment-noncanonical-ceiling",
+            lambda value: value["environment_transaction"].update(
+                inventory_max_bytes=(128 << 20) - 1
+            ),
+        ),
+        (
+            "environment-marker-inside-source",
+            lambda value: value["environment_transaction"].update(
+                completion_path=str(fixture["exact"] / "marker.json")
+            ),
+        ),
+    )
+    for name, mutation in scenarios:
+        result = invoke(fixture, name, mutate=mutation)
+        assert result.returncode != 0
+        assert calls(fixture) == []
+        assert not (fixture["temp"] / "artifacts" / name).exists()
+
+
+def test_source_manifest_must_include_environment_transaction_verifier(fixture):
+    def omit_verifier(value):
+        source = json.loads(json.dumps(fixture["source"]))
+        source["payload"]["entries"] = [
+            entry
+            for entry in source["payload"]["entries"]
+            if entry["path"]
+            != "scripts/verify_formal_environment_transaction.py"
+        ]
+        body = {
+            key: source[key] for key in ("schema_version", "kind", "payload")
+        }
+        source["sha256"] = hashlib.sha256(canonical(body)).hexdigest()
+        path = fixture["external"] / "source-without-environment-verifier.json"
+        path.write_bytes(canonical(source) + b"\n")
+        value["source"].update(
+            manifest_path=str(path), manifest_sha256=source["sha256"]
+        )
+
+    result = invoke(
+        fixture,
+        "source-omits-environment-verifier",
+        mutate=omit_verifier,
+    )
+    assert result.returncode != 0
+    assert (
+        "unexpected code file under tracked code root" in result.stderr
+        or "omits H100 gate controller files" in result.stderr
+        or "omits required runtime files" in result.stderr
+    )
+    assert "verify_formal_environment_transaction.py" in result.stderr
+    assert calls(fixture) == []
+    assert not (
+        fixture["temp"] / "artifacts" / "source-omits-environment-verifier"
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "scripts/submit_h100_identity_validation.sh",
+        "scripts/run_h100_identity_maxseq_smoke.sh",
+        "scripts/run_slurm_h100_identity_case.sh",
+        "scripts/formal_run_with_gpu_monitor.sh",
+        "scripts/run_with_durable_log.sh",
+        "scripts/slurm_h100_identity_maxseq_smoke.sh",
+        "scripts/slurm_h100_identity_nccl_smoke.sh",
+    ),
+)
+def test_source_manifest_must_include_every_h100_launch_shell(fixture, relative):
+    def omit_shell(value):
+        source = json.loads(json.dumps(fixture["source"]))
+        source["payload"]["entries"] = [
+            entry
+            for entry in source["payload"]["entries"]
+            if entry["path"] != relative
+        ]
+        body = {key: source[key] for key in ("schema_version", "kind", "payload")}
+        source["sha256"] = hashlib.sha256(canonical(body)).hexdigest()
+        path = fixture["external"] / f"source-without-{Path(relative).name}.json"
+        path.write_bytes(canonical(source) + b"\n")
+        value["source"].update(
+            manifest_path=str(path), manifest_sha256=source["sha256"]
+        )
+
+    result = invoke(
+        fixture,
+        f"source-omits-{Path(relative).stem}",
+        mutate=omit_shell,
+    )
+    assert result.returncode != 0
+    assert Path(relative).name in result.stderr
+    assert calls(fixture) == []
+
+
+def test_source_manifest_must_scan_scripts_code_root(fixture):
+    def omit_scripts_root(value):
+        source = json.loads(json.dumps(fixture["source"]))
+        source["payload"]["code_roots"] = ["src/tabicl"]
+        body = {key: source[key] for key in ("schema_version", "kind", "payload")}
+        source["sha256"] = hashlib.sha256(canonical(body)).hexdigest()
+        path = fixture["external"] / "source-without-scripts-code-root.json"
+        path.write_bytes(canonical(source) + b"\n")
+        value["source"].update(
+            manifest_path=str(path), manifest_sha256=source["sha256"]
+        )
+
+    result = invoke(
+        fixture,
+        "source-omits-scripts-code-root",
+        mutate=omit_scripts_root,
+    )
+    assert result.returncode != 0
+    assert "source manifest omits required code roots: ['scripts']" in result.stderr
+    assert calls(fixture) == []
+
+
 def test_preflight_negatives_never_reach_scheduler(fixture):
     scenarios = (
         (
@@ -1121,6 +1877,12 @@ def test_preflight_negatives_never_reach_scheduler(fixture):
             "scheduler-digest-mismatch",
             lambda value: value["scheduler_commands"]["sbatch"].update(
                 sha256="0" * 64
+            ),
+        ),
+        (
+            "nvidia-smi-digest-mismatch",
+            lambda value: value["runtime"].update(
+                nvidia_smi_sha256="0" * 64
             ),
         ),
         (
@@ -1236,6 +1998,51 @@ def test_receipt_validator_rejects_forged_repository_binding(fixture):
     sys.modules[matrix_spec.name] = matrix
     matrix_spec.loader.exec_module(matrix)
     with pytest.raises(ValueError, match="repository binding"):
+        matrix.validate_gate_submission_receipt(
+            receipt_path,
+            expected_commit_sha=fixture["commit"],
+            expected_tree_sha=fixture["tree"],
+            expected_source_manifest_sha256=fixture["source"]["sha256"],
+            expected_checkpoint_ceiling_bytes=300_000_000,
+            max_bytes=1_000_000,
+        )
+
+
+def test_receipt_validator_rejects_forged_environment_transaction_binding(fixture):
+    result = invoke(fixture, "receipt-environment-transaction-tamper")
+    assert result.returncode == 0, result.stderr
+    root = Path(
+        overlay(fixture, "receipt-environment-transaction-tamper")["artifact_root"]
+    )
+    held_path = root / "held-plan.json"
+    receipt_path = root / "submission-receipt.json"
+    held = json.loads(held_path.read_text())
+    receipt = json.loads(receipt_path.read_text())
+    for value in (held, receipt):
+        value["payload"]["environment_transaction"][
+            "one_gpu_environment_sha256"
+        ] = "0" * 64
+    held_body = {
+        key: held[key] for key in ("schema_version", "kind", "payload")
+    }
+    held["sha256"] = hashlib.sha256(canonical(held_body)).hexdigest()
+    receipt["payload"]["held_plan_sha256"] = held["sha256"]
+    receipt_body = {
+        key: receipt[key] for key in ("schema_version", "kind", "payload")
+    }
+    receipt["sha256"] = hashlib.sha256(canonical(receipt_body)).hexdigest()
+    for path, value in ((held_path, held), (receipt_path, receipt)):
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        path.write_bytes(canonical(value) + b"\n")
+
+    matrix_spec = importlib.util.spec_from_file_location(
+        "gate_environment_transaction_tamper_matrix",
+        ROOT / "scripts/run_h100_identity_validation.py",
+    )
+    matrix = importlib.util.module_from_spec(matrix_spec)
+    sys.modules[matrix_spec.name] = matrix
+    matrix_spec.loader.exec_module(matrix)
+    with pytest.raises(ValueError, match="environment transaction.*binding mismatch"):
         matrix.validate_gate_submission_receipt(
             receipt_path,
             expected_commit_sha=fixture["commit"],

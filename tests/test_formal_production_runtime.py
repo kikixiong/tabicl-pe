@@ -111,11 +111,44 @@ def _runtime_fixture(
         "cohort_protocol_sha256": digests["cohort"],
         "arm_protocol_sha256": digests["arm"],
     }
+    h100_gate = {
+        "attestation_sha256": "7" * 64,
+        "checkpoint_ceiling_bytes": 1000,
+        "gpu_model": "NVIDIA H100 80GB HBM3",
+        "driver_version": "570.00",
+        "nvidia_smi_sha256": "6" * 64,
+    }
+    campaign_binding = {
+        "campaign_id": "study",
+        "campaign_manifest_sha256": "8" * 64,
+        "training_commit_sha": "a" * 40,
+        "training_tree_sha": "b" * 40,
+        "source_manifest_sha256": digests["source"],
+        "environment_sha256": digests["environment"],
+        "h100_attestation_sha256": h100_gate["attestation_sha256"],
+        "nvidia_smi_sha256": "6" * 64,
+        "checkpoint_ceiling_bytes": 1000,
+        "static_protocol_sha256_by_stage": {
+            "stage1": "1" * 64,
+            "stage2": "2" * 64,
+            "stage3": "3" * 64,
+        },
+        "time_limit_by_stage": {
+            "stage1": "14-00:00:00",
+            "stage2": "3-00:00:00",
+            "stage3": "1-00:00:00",
+        },
+        "predecessor_acceptance_sha256_by_seed": {},
+    }
     ledger = _manifest(
         "transaction_ledger",
         {
             "study_id": "study-seed42",
+            "protocol_metadata_allowance_bytes": 3_000_000,
             "entries": [ledger_entry],
+            "h100_gate": h100_gate,
+            "campaign_binding": campaign_binding,
+            "runtime_tools": {"nvidia_smi_sha256": "6" * 64},
         },
     )
     ledger_path = artifact / "transaction-ledger.json"
@@ -152,9 +185,13 @@ def _runtime_fixture(
             "source_commit_sha": "a" * 40,
             "source_tree_sha": "b" * 40,
             "repository_binding": repository_binding,
+            "h100_gate": h100_gate,
+            "campaign_binding": campaign_binding,
+            "runtime_tools": {"nvidia_smi_sha256": "6" * 64},
             "jobs_held_at_publication": True,
             "run_log_ceiling_bytes": 10_000,
             "manifest_ceiling_bytes": 10_000,
+            "protocol_metadata_allowance_bytes": 3_000_000,
             "runtime_completion_ceiling_bytes": 65_536,
             "terminal_log_attestation_path": str(
                 artifact / "terminal-scheduler-logs.json"
@@ -189,6 +226,7 @@ def _runtime_fixture(
                     "cluster": None,
                     "job_name": job_name,
                     "parent_job_id": None,
+                    "sbatch_argv_sha256": "f" * 64,
                     "scheduler_stdout": str(stdout_path),
                     "scheduler_stderr": str(stderr_path),
                     "completion_path": str(completion_path),
@@ -205,6 +243,10 @@ def _runtime_fixture(
             "transaction_id": "0123456789abcdef0123456789abcdef",
             "submission_receipt_sha256": receipt["sha256"],
             "transaction_ledger_sha256": ledger["sha256"],
+            "protocol_metadata_allowance_bytes": 3_000_000,
+            "h100_gate": h100_gate,
+            "campaign_binding": campaign_binding,
+            "runtime_tools": {"nvidia_smi_sha256": "6" * 64},
             "job_ids": ["1001"],
         },
     )
@@ -246,6 +288,13 @@ def _runtime_fixture(
         "FORMAL_TRANSACTION_ID": "0123456789abcdef0123456789abcdef",
         "FORMAL_SOURCE_COMMIT_SHA": "a" * 40,
         "FORMAL_SOURCE_TREE_SHA": "b" * 40,
+        "FORMAL_SOURCE_SHA256": digests["source"],
+        "FORMAL_ENVIRONMENT_SHA256": digests["environment"],
+        "FORMAL_H100_ATTESTATION_SHA256": h100_gate["attestation_sha256"],
+        "FORMAL_NVIDIA_SMI_SHA256": "6" * 64,
+        "FORMAL_CAMPAIGN_BINDING_SHA256": hashlib.sha256(
+            _canonical(campaign_binding)
+        ).hexdigest(),
         "FORMAL_GIT_SHA256": git_sha256,
         "CANDIDATE_REPOSITORY": repository_binding["repository_url"],
         "CANDIDATE_REPOSITORY_REF": repository_binding["repository_ref"],
@@ -275,6 +324,9 @@ def _runtime_fixture(
         "CUDA_VISIBLE_DEVICES": "7",
         "FORMAL_VISIBLE_GPU_NAME": "NVIDIA H100 80GB HBM3",
         "FORMAL_VISIBLE_GPU_UUID": "GPU-fixture",
+        "FORMAL_VISIBLE_GPU_DRIVER_VERSION": "570.00",
+        "FORMAL_EXPECTED_GPU_MODEL": "NVIDIA H100 80GB HBM3",
+        "FORMAL_EXPECTED_DRIVER_VERSION": "570.00",
     }
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
@@ -289,6 +341,7 @@ def test_runtime_binds_receipt_ledger_resources_and_publishes_completion(
     stage = scripts / "formal_train_v2_clf_identity_stage1.sh"
     stage.write_text("#!/bin/bash\nexit 0\n")
     stage.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    monkeypatch.setattr(module, "_verify_formal_environment", lambda _root: None)
 
     assert module.main(
         ["--exact-root", str(exact), "--mode", "rope", "--stage", "1"]
@@ -312,6 +365,7 @@ def test_runtime_binds_receipt_ledger_resources_and_publishes_completion(
         b"checkpoint"
     ).hexdigest()
     assert completion["payload"]["scheduler_logs_terminal_verified"] is False
+    assert completion["payload"]["protocol_metadata_allowance_bytes"] == 3_000_000
     assert completion["sha256"] == hashlib.sha256(
         _canonical(
             {
@@ -321,6 +375,26 @@ def test_runtime_binds_receipt_ledger_resources_and_publishes_completion(
             }
         )
     ).hexdigest()
+
+
+def test_post_stage_environment_drift_prevents_completion(tmp_path, monkeypatch):
+    module = _load()
+    exact, scripts, completion_path, _receipt = _runtime_fixture(
+        tmp_path, monkeypatch
+    )
+    stage = scripts / "formal_train_v2_clf_identity_stage1.sh"
+    stage.write_text("#!/bin/bash\nexit 0\n")
+    stage.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+    def reject(_root):
+        raise ValueError("post-stage formal environment verification failed")
+
+    monkeypatch.setattr(module, "_verify_formal_environment", reject)
+    with pytest.raises(ValueError, match="post-stage formal environment"):
+        module.main(
+            ["--exact-root", str(exact), "--mode", "rope", "--stage", "1"]
+        )
+    assert not completion_path.exists()
 
 
 def test_main_uses_the_startup_validated_ledger_snapshot(tmp_path, monkeypatch):
@@ -433,6 +507,7 @@ def test_stable_reader_rejects_symlink_and_path_replacement(
         ("CANDIDATE_REPOSITORY_REF", "refs/heads/other"),
         ("FORMAL_REPOSITORY_QUERY_SHA256", "f" * 64),
         ("FORMAL_MANIFEST_CEILING_BYTES", "9999"),
+        ("FORMAL_PROTOCOL_METADATA_ALLOWANCE_BYTES", "3000001"),
         ("FORMAL_TIME_LIMIT", "13-23:59:59"),
     ],
 )
@@ -446,6 +521,24 @@ def test_runtime_fails_closed_on_scheduler_or_identity_drift(
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError):
         module._validate_runtime(mode="rope", stage_index="1", exact_root=exact)
+    assert not completion_path.exists()
+
+
+def test_runtime_rejects_protocol_metadata_allowance_above_ceiling(
+    tmp_path, monkeypatch
+):
+    module = _load()
+    exact, _scripts, completion_path, _receipt = _runtime_fixture(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setenv(
+        "FORMAL_PROTOCOL_METADATA_ALLOWANCE_BYTES",
+        str(module.FORMAL_METADATA_CEILING_BYTES + 1),
+    )
+
+    with pytest.raises(ValueError, match="outside its allowed range"):
+        module._validate_runtime(mode="rope", stage_index="1", exact_root=exact)
+
     assert not completion_path.exists()
 
 
@@ -491,6 +584,7 @@ def test_success_exit_cannot_publish_completion_for_tampered_checkpoint(
     stage = scripts / "formal_train_v2_clf_identity_stage1.sh"
     stage.write_text("#!/bin/bash\nexit 0\n")
     stage.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    monkeypatch.setattr(module, "_verify_formal_environment", lambda _root: None)
     checkpoint = (
         tmp_path
         / "artifacts"

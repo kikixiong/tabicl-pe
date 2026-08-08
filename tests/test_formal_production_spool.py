@@ -44,6 +44,23 @@ def _fixture(tmp_path: Path, exit_code: int):
         Path(__file__).parents[1] / "scripts/verify_git_repository.py",
         scripts / "verify_git_repository.py",
     )
+    shutil.copy2(
+        Path(__file__).parents[1] / "scripts/exec_digest_bound_nvidia_smi.py",
+        scripts / "exec_digest_bound_nvidia_smi.py",
+    )
+    environment_verifier = scripts / "verify_formal_environment.py"
+    environment_verifier.write_text(
+        "import argparse, os, sys\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--exact-root', required=True)\n"
+        "p.add_argument('--expected-sha256', required=True)\n"
+        "p.add_argument('--expected-gpus', required=True, type=int)\n"
+        "a=p.parse_args()\n"
+        "assert sys.flags.isolated and sys.dont_write_bytecode\n"
+        "assert os.environ.get('PYTHONNOUSERSITE') == '1'\n"
+        "assert a.expected_gpus == 1 and len(a.expected_sha256) == 64\n"
+    )
+    environment_verifier.chmod(0o755)
     shutil.copy2(SPOOL_SOURCE, scripts / "slurm_h100_identity_formal.sh")
     _git("init", "-q", candidate)
     _git("-C", candidate, "config", "user.name", "fixture")
@@ -52,6 +69,7 @@ def _fixture(tmp_path: Path, exit_code: int):
     _git("-C", candidate, "commit", "-q", "-m", "fixture")
     commit = _git("-C", candidate, "rev-parse", "HEAD", stdout=True).stdout.strip()
     tree = _git("-C", candidate, "rev-parse", "HEAD^{tree}", stdout=True).stdout.strip()
+    _git("-C", candidate, "checkout", "-q", "--detach", commit)
 
     spool_dir = tmp_path / "slurm-spool"
     spool_dir.mkdir()
@@ -78,8 +96,8 @@ def _fixture(tmp_path: Path, exit_code: int):
     nvidia = tmp_path / "nvidia-smi"
     nvidia.write_text(
         "#!/bin/bash\n"
-        "printf '%s\\n' \"$@\" > \"$NVIDIA_ARGS\"\n"
-        "printf '%s\\n' 'NVIDIA H100 80GB HBM3, GPU-fixture'\n"
+        f"printf '%s\\n' \"$@\" > {str(nvidia_args)!r}\n"
+        "printf '%s\\n' 'NVIDIA H100 80GB HBM3, GPU-fixture, 570.00'\n"
     )
     nvidia.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
     fake_git = tmp_path / "git"
@@ -138,6 +156,9 @@ def _fixture(tmp_path: Path, exit_code: int):
         "CANDIDATE_REPOSITORY_REF": "refs/heads/codex/position-identity-v1",
         "FORMAL_SOURCE_COMMIT_SHA": commit,
         "FORMAL_SOURCE_TREE_SHA": tree,
+        "FORMAL_ENVIRONMENT_SHA256": "e" * 64,
+        "FORMAL_EXPECTED_GPU_MODEL": "NVIDIA H100 80GB HBM3",
+        "FORMAL_EXPECTED_DRIVER_VERSION": "570.00",
         "FORMAL_GIT_SHA256": git_sha256,
         "FORMAL_REPOSITORY_IDENTITY_SHA256": repository_binding[
             "repository_identity_sha256"
@@ -149,6 +170,9 @@ def _fixture(tmp_path: Path, exit_code: int):
         "PYTHON": sys.executable,
         "GIT": str(fake_git),
         "NVIDIA_SMI": str(nvidia),
+        "FORMAL_NVIDIA_SMI_SHA256": hashlib.sha256(
+            nvidia.read_bytes()
+        ).hexdigest(),
         "CUDA_VISIBLE_DEVICES": "7",
         "RUNTIME_MARKER": str(marker),
         "RUNTIME_EXIT": str(exit_code),
@@ -178,7 +202,10 @@ def test_spooled_wrapper_uses_allocated_gpu_and_cleans_checkout_on_all_exits(
     assert not checkout.exists()
     assert list(work_root.iterdir()) == []
     assert "--id=7" in nvidia_args.read_text().splitlines()
-    assert "--query-gpu=name,uuid" in nvidia_args.read_text().splitlines()
+    assert (
+        "--query-gpu=name,uuid,driver_version"
+        in nvidia_args.read_text().splitlines()
+    )
     assert list(spool.parent.iterdir()) == [spool]
     work_root.rmdir()
 
@@ -217,5 +244,51 @@ def test_spooled_wrapper_rejects_work_on_artifact_filesystem_before_clone(tmp_pa
     assert completed.returncode != 0
     assert "different filesystem" in completed.stderr
     assert not marker.exists()
+    assert list(work_root.iterdir()) == []
+    work_root.rmdir()
+
+
+@pytest.mark.parametrize(
+    "helper_name",
+    (
+        "exec_digest_bound_nvidia_smi.py",
+        "verify_git_repository.py",
+        "verify_filesystem_isolation.py",
+        "verify_formal_environment.py",
+    ),
+)
+def test_trusted_spool_rejects_modified_exact_helper_without_executing_it(
+    tmp_path, helper_name
+):
+    spool, work_root, runtime_marker, _nvidia_args, environment = _fixture(
+        tmp_path, 0
+    )
+    malicious_marker = tmp_path / "modified-helper-executed"
+    helper = (
+        Path(environment["FORMAL_SUBMISSION_EXACT_ROOT"])
+        / "scripts"
+        / helper_name
+    )
+    helper.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(malicious_marker)!r}).write_text('executed')\n"
+        "raise SystemExit(97)\n"
+    )
+    helper.chmod(0o755)
+    completed = subprocess.run(
+        ["/bin/bash", str(spool)],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert "trusted static production bootstrap failed: exact root is dirty" in (
+        completed.stderr
+    )
+    assert not malicious_marker.exists()
+    assert not runtime_marker.exists()
     assert list(work_root.iterdir()) == []
     work_root.rmdir()

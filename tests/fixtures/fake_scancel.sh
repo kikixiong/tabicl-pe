@@ -20,6 +20,11 @@ if [[ -f fail_cancel_ids ]]; then
     [[ "$1" != "$FAILED" ]] || exit 43
   done < fail_cancel_ids
 fi
+if [[ -f sleep_cancel_ids ]]; then
+  while IFS= read -r SLEEPING; do
+    [[ "$1" != "$SLEEPING" ]] || /bin/sleep 60
+  done < sleep_cancel_ids
+fi
 awk -F'|' -v id="$1" -v cluster="$CLUSTER" '
   $1 == id && $5 == cluster {printf "%s|CANCELLED\n", $1; found=1}
   END {if (!found) exit 44}

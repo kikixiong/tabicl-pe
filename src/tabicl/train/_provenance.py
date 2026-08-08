@@ -15,8 +15,11 @@ publishing principal.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import copy
 import hashlib
+import importlib
+from importlib import metadata as importlib_metadata
 import json
 import math
 import os
@@ -27,6 +30,8 @@ import re
 import secrets
 import stat
 import subprocess
+import sys
+import sysconfig
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -52,6 +57,7 @@ _FORMAL_SUPPORTED_SEEDS = frozenset({42, 43, 44})
 _FORMAL_WORLD_SIZE = 1
 _FORMAL_CUDA_DEVICE_COUNT = 1
 _FORMAL_MAX_CHECKPOINT_BYTES_LIMIT = 1 << 40
+FORMAL_METADATA_CEILING_BYTES = 128 << 20
 ARCHITECTURE_TREATMENT_FIELD = "row_identity_mode"
 TREATMENT_CONFIG_FIELDS = frozenset({ARCHITECTURE_TREATMENT_FIELD})
 # These are the only run-config fields removed from the scientific manifest.
@@ -107,6 +113,68 @@ REQUIRED_MANIFESTS = frozenset(
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX_40 = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_DISTRIBUTION_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_DISTRIBUTION_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.!+_-]{0,255}$")
+_SLURM_DURATION = re.compile(
+    r"^(?:(?P<days>[1-9][0-9]{0,3})-)?"
+    r"(?P<hours>[0-9]{2}):(?P<minutes>[0-5][0-9]):(?P<seconds>[0-5][0-9])$"
+)
+_ENVIRONMENT_FINGERPRINT_SCHEMA_VERSION = 2
+_FORMAL_RECORD_MAX_FILES_PER_DISTRIBUTION = 100_000
+_FORMAL_RECORD_MAX_BYTES_PER_DISTRIBUTION = 64 << 30
+_FORMAL_RECORD_MAX_FILE_BYTES = 16 << 30
+_FORMAL_RECORD_MAX_PATH_BYTES = 4_096
+_FORMAL_RUNTIME_DISTRIBUTIONS = (
+    "einops",
+    "flash-attn-3",
+    "huggingface-hub",
+    "numpy",
+    "psutil",
+    "scikit-learn",
+    "scipy",
+    "threadpoolctl",
+    "torch",
+    "tqdm",
+    "transformers",
+    "wandb",
+    "xgboost",
+)
+_FORMAL_RUNTIME_MODULES = {
+    "einops": "einops",
+    "flash-attn-3": "flash_attn_interface",
+    "huggingface-hub": "huggingface_hub",
+    "numpy": "numpy",
+    "psutil": "psutil",
+    "scikit-learn": "sklearn",
+    "scipy": "scipy",
+    "threadpoolctl": "threadpoolctl",
+    "torch": "torch",
+    "tqdm": "tqdm",
+    "transformers": "transformers",
+    "wandb": "wandb",
+    "xgboost": "xgboost",
+}
+_ENVIRONMENT_PAYLOAD_KEYS = {
+    "python_version",
+    "python_implementation",
+    "python_executable_sha256",
+    "python_cache_tag",
+    "python_soabi",
+    "platform_system",
+    "platform_release",
+    "platform_machine",
+    "torch_version",
+    "numpy_version",
+    "cuda_runtime_version",
+    "cudnn_version",
+    "environment_fingerprint_schema_version",
+    "installed_distributions_sha256",
+    "formal_runtime_distributions",
+    "unavailable_formal_runtime_distributions",
+    "flash_attn3_available",
+    "nccl_version",
+    "visible_cuda_device_count",
+}
 _SOURCE_MODES = frozenset({"100644", "100755"})
 _LINK_SUPPORTS_DIR_FD = os.link in os.supports_dir_fd
 _UNLINK_SUPPORTS_DIR_FD = os.unlink in os.supports_dir_fd
@@ -242,6 +310,7 @@ def _open_regular_nofollow(path: str | os.PathLike[str]) -> tuple[int, os.stat_r
     flags = os.O_RDONLY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(candidate.name, flags, dir_fd=parent_fd)
     except OSError as error:
@@ -364,6 +433,7 @@ def _source_bytes(root: Path, relative: str, mode: str) -> bytes:
         file_flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         file_flags |= os.O_NOFOLLOW
+    file_flags |= getattr(os, "O_NONBLOCK", 0)
     directory_fds: list[int] = []
     try:
         directory_fds.append(
@@ -617,28 +687,765 @@ def load_source_manifest(
     return value
 
 
-def runtime_environment_manifest() -> dict[str, Any]:
+def _distribution_fingerprint(distribution: Any) -> dict[str, Any]:
+    raw_name = distribution.metadata.get("Name")
+    version = distribution.version
+    if not isinstance(raw_name, str) or not raw_name:
+        raise ValueError("installed distribution is missing its canonical name")
+    name = re.sub(r"[-_.]+", "-", raw_name).lower()
+    if _DISTRIBUTION_NAME.fullmatch(name) is None:
+        raise ValueError("installed distribution name is malformed")
+    if (
+        not isinstance(version, str)
+        or _DISTRIBUTION_VERSION.fullmatch(version) is None
+    ):
+        raise ValueError(f"installed distribution version is malformed: {name}")
+
+    digests: dict[str, str | None] = {}
+    for filename, field in (
+        ("METADATA", "metadata_sha256"),
+        ("RECORD", "record_sha256"),
+        ("WHEEL", "wheel_sha256"),
+    ):
+        content = distribution.read_text(filename)
+        if content is not None and not isinstance(content, str):
+            raise ValueError(f"installed distribution {filename} is malformed: {name}")
+        digests[field] = (
+            None
+            if content is None
+            else hashlib.sha256(content.encode("utf-8")).hexdigest()
+        )
+    return {"name": name, "version": version, **digests}
+
+
+def _sha256_regular_file(path: Path, *, where: str) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("no-follow file hashing is unavailable")
+    flags |= os.O_NOFOLLOW
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"{where} is unavailable or is a symlink") from error
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{where} is not a regular file")
+        digest = hashlib.sha256()
+        observed_size = 0
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            observed_size += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(fd)
+        if (
+            observed_size != metadata.st_size
+            or (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        ):
+            raise ValueError(f"{where} changed while it was hashed")
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def _runtime_installation_roots() -> tuple[Path, ...]:
+    """Return the physical Python prefixes allowed to own wheel RECORD files."""
+    candidates: list[Path] = []
+    seen: set[tuple[int, int]] = set()
+    for raw in (sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix):
+        configured = Path(raw)
+        if not configured.is_absolute():
+            raise ValueError("Python installation prefix is not a normalized absolute path")
+        # Some managed Python installations advertise a stable prefix through
+        # a cluster-wide alias.  Canonicalize that prefix once, then perform
+        # every RECORD traversal below it with O_NOFOLLOW on every component.
+        candidate = configured.resolve(strict=True)
+        fd = _open_directory_components_nofollow(
+            candidate, where="Python installation prefix"
+        )
+        try:
+            metadata = os.fstat(fd)
+            identity = (metadata.st_dev, metadata.st_ino)
+        finally:
+            os.close(fd)
+        if identity not in seen:
+            candidates.append(candidate)
+            seen.add(identity)
+    return tuple(candidates)
+
+
+def _record_sha256(value: Any, *, distribution_name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"formal runtime RECORD hash is malformed: {distribution_name}"
+        )
+    try:
+        decoded = base64.b64decode(
+            value + "=" * (-len(value) % 4), altchars=b"-_", validate=True
+        )
+    except (ValueError, TypeError) as error:
+        raise ValueError(
+            f"formal runtime RECORD hash is malformed: {distribution_name}"
+        ) from error
+    if len(decoded) != hashlib.sha256().digest_size:
+        raise ValueError(
+            f"formal runtime RECORD hash is malformed: {distribution_name}"
+        )
+    return decoded.hex()
+
+
+def _record_target_relative_path(
+    raw_path: Any,
+    *,
+    distribution_root: Path,
+    installation_root: Path,
+    distribution_name: str,
+) -> str:
+    path = str(raw_path)
+    if (
+        not path
+        or "\x00" in path
+        or "\\" in path
+        or len(path.encode("utf-8")) > _FORMAL_RECORD_MAX_PATH_BYTES
+    ):
+        raise ValueError(
+            f"formal runtime RECORD path is malformed: {distribution_name}"
+        )
+    pure = PurePosixPath(path)
+    if pure.is_absolute() or pure.as_posix() != path:
+        raise ValueError(
+            f"formal runtime RECORD path is malformed: {distribution_name}"
+        )
+    # Wheel RECORD paths may legitimately address prefix-level scripts via
+    # ../../../bin.  Resolve those lexically, then require containment in the
+    # selected physical Python installation prefix before opening any bytes.
+    target = Path(os.path.normpath(os.fspath(distribution_root / Path(*pure.parts))))
+    try:
+        relative = target.relative_to(installation_root).as_posix()
+    except ValueError as error:
+        raise ValueError(
+            f"formal runtime RECORD path escapes its installation: {distribution_name}"
+        ) from error
+    return _validate_relative_path(
+        relative, where=f"formal runtime RECORD {distribution_name}"
+    )
+
+
+def _hash_record_file(
+    root_fd: int,
+    relative: str,
+    *,
+    distribution_name: str,
+) -> tuple[int, str]:
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    directory_fds: list[int] = []
+    fd = -1
+    try:
+        directory_fds.append(os.dup(root_fd))
+        parts = PurePosixPath(relative).parts
+        for part in parts[:-1]:
+            directory_fds.append(
+                os.open(part, directory_flags, dir_fd=directory_fds[-1])
+            )
+        fd = os.open(parts[-1], file_flags, dir_fd=directory_fds[-1])
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(
+                f"formal runtime RECORD file is not regular: {distribution_name}"
+            )
+        if before.st_size > _FORMAL_RECORD_MAX_FILE_BYTES:
+            raise ValueError(
+                f"formal runtime RECORD file exceeds its byte ceiling: {distribution_name}"
+            )
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1 << 20, remaining))
+            if not chunk:
+                raise ValueError(
+                    f"formal runtime RECORD file is truncated: {distribution_name}"
+                )
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise ValueError(
+                f"formal runtime RECORD file grew while hashing: {distribution_name}"
+            )
+        after = os.fstat(fd)
+        _same_file_snapshot(
+            before,
+            after,
+            where=f"formal runtime RECORD file {distribution_name}:{relative}",
+        )
+        return before.st_size, digest.hexdigest()
+    except OSError as error:
+        raise ValueError(
+            "formal runtime RECORD file is missing, a symlink, or has an invalid "
+            f"path component: {distribution_name}:{relative}"
+        ) from error
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+def _distribution_record_integrity(
+    distribution: Any,
+    *,
+    distribution_name: str,
+    installation_roots: Sequence[Path] | None = None,
+) -> tuple[dict[str, int | str], list[dict[str, int | str]]]:
+    """Verify every hashed RECORD entry and return a bounded path-free proof."""
+    roots = tuple(installation_roots or _runtime_installation_roots())
+    if not roots:
+        raise ValueError("no Python installation roots are available")
+    configured_distribution_root = Path(distribution.locate_file(""))
+    if (
+        not configured_distribution_root.is_absolute()
+        or os.path.abspath(os.fspath(configured_distribution_root))
+        != os.fspath(configured_distribution_root)
+    ):
+        raise ValueError(
+            f"formal runtime distribution root is malformed: {distribution_name}"
+        )
+    raw_distribution_root = configured_distribution_root.resolve(strict=True)
+    distribution_fd = _open_directory_components_nofollow(
+        raw_distribution_root, where=f"formal runtime distribution {distribution_name}"
+    )
+    os.close(distribution_fd)
+    containing = []
+    for root in roots:
+        try:
+            raw_distribution_root.relative_to(root)
+        except ValueError:
+            continue
+        containing.append(root)
+    if not containing:
+        raise ValueError(
+            f"formal runtime distribution is outside Python installations: {distribution_name}"
+        )
+    installation_root = max(containing, key=lambda root: len(root.parts))
+    root_fd = _open_directory_components_nofollow(
+        installation_root, where="formal runtime Python installation"
+    )
+    try:
+        files = distribution.files
+        if files is None:
+            raise ValueError(
+                f"formal runtime distribution has no RECORD: {distribution_name}"
+            )
+        verified: list[dict[str, int | str]] = []
+        seen: set[str] = set()
+        total_bytes = 0
+        declared_total_bytes = 0
+        pyc_mismatch_count = 0
+        for record_entry in files:
+            record_hash = record_entry.hash
+            if record_hash is None:
+                continue
+            if record_hash.mode != "sha256":
+                raise ValueError(
+                    f"formal runtime RECORD uses a non-SHA-256 hash: {distribution_name}"
+                )
+            if len(verified) >= _FORMAL_RECORD_MAX_FILES_PER_DISTRIBUTION:
+                raise ValueError(
+                    f"formal runtime RECORD file-count ceiling exceeded: {distribution_name}"
+                )
+            size = record_entry.size
+            if (
+                isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 0
+                or size > _FORMAL_RECORD_MAX_FILE_BYTES
+            ):
+                raise ValueError(
+                    f"formal runtime RECORD size is malformed or unbounded: {distribution_name}"
+                )
+            declared_total_bytes += size
+            if declared_total_bytes > _FORMAL_RECORD_MAX_BYTES_PER_DISTRIBUTION:
+                raise ValueError(
+                    f"formal runtime RECORD byte ceiling exceeded: {distribution_name}"
+                )
+            relative = _record_target_relative_path(
+                record_entry,
+                distribution_root=raw_distribution_root,
+                installation_root=installation_root,
+                distribution_name=distribution_name,
+            )
+            if relative in seen:
+                raise ValueError(
+                    f"formal runtime RECORD path is duplicated: {distribution_name}"
+                )
+            seen.add(relative)
+            expected = _record_sha256(
+                record_hash.value, distribution_name=distribution_name
+            )
+            actual_size, actual = _hash_record_file(
+                root_fd,
+                relative,
+                distribution_name=distribution_name,
+            )
+            total_bytes += actual_size
+            if total_bytes > _FORMAL_RECORD_MAX_BYTES_PER_DISTRIBUTION:
+                raise ValueError(
+                    f"formal runtime RECORD byte ceiling exceeded: {distribution_name}"
+                )
+            matches_record = actual_size == size and actual == expected
+            if not matches_record and not relative.endswith(".pyc"):
+                raise ValueError(
+                    f"formal runtime RECORD hash mismatch: {distribution_name}:{relative}"
+                )
+            if not matches_record:
+                pyc_mismatch_count += 1
+            verified.append(
+                {
+                    "path": relative,
+                    "declared_size": size,
+                    "declared_sha256": expected,
+                    "actual_size": actual_size,
+                    "actual_sha256": actual,
+                    "matches_record": matches_record,
+                }
+            )
+    finally:
+        os.close(root_fd)
+    if not verified:
+        raise ValueError(
+            f"formal runtime distribution has no hashed RECORD files: {distribution_name}"
+        )
+    verified.sort(key=lambda item: str(item["path"]))
+    proof: dict[str, int | str] = {
+        "record_verified_file_count": len(verified),
+        "record_verified_total_bytes": total_bytes,
+        "record_verified_files_sha256": canonical_sha256(verified),
+        "record_pyc_mismatch_count": pyc_mismatch_count,
+    }
+    return proof, verified
+
+
+def _module_origin_fingerprint(
+    distribution: Any, module: Any, *, distribution_name: str
+) -> dict[str, str]:
+    raw_origin = getattr(module, "__file__", None)
+    if not isinstance(raw_origin, str) or not raw_origin:
+        raise ValueError(f"formal runtime module has no file: {distribution_name}")
+    distribution_root = Path(distribution.locate_file("")).resolve(strict=True)
+    origin = Path(raw_origin).resolve(strict=True)
+    try:
+        relative = origin.relative_to(distribution_root).as_posix()
+    except ValueError as error:
+        raise ValueError(
+            f"formal runtime module is outside its distribution: {distribution_name}"
+        ) from error
+    _validate_relative_path(relative, where="formal runtime module origin")
+    matching = [
+        entry
+        for entry in distribution.files or ()
+        if PurePosixPath(str(entry).replace("\\", "/")).as_posix() == relative
+    ]
+    if len(matching) != 1:
+        raise ValueError(
+            f"formal runtime module is not unique in RECORD: {distribution_name}"
+        )
+    record_hash = matching[0].hash
+    if record_hash is None or record_hash.mode != "sha256":
+        raise ValueError(
+            f"formal runtime module lacks a RECORD SHA-256: {distribution_name}"
+        )
+    expected = _record_sha256(
+        record_hash.value, distribution_name=distribution_name
+    )
+    actual = _sha256_regular_file(
+        origin, where=f"formal runtime module {distribution_name}"
+    )
+    if actual != expected:
+        raise ValueError(
+            f"formal runtime module differs from RECORD: {distribution_name}"
+        )
+    return {
+        "module_origin_relative_path": relative,
+        "module_origin_sha256": actual,
+    }
+
+
+def _distribution_environment_snapshot(
+    *, require_formal_runtime: bool
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bind effective formal packages plus a path-free full inventory hash."""
+    inventory = [
+        _distribution_fingerprint(distribution)
+        for distribution in importlib_metadata.distributions()
+    ]
+    if not inventory:
+        raise ValueError("installed distribution inventory is empty")
+    inventory.sort(
+        key=lambda entry: tuple(
+            "" if entry[field] is None else entry[field]
+            for field in (
+                "name",
+                "version",
+                "metadata_sha256",
+                "record_sha256",
+                "wheel_sha256",
+            )
+        )
+    )
+
+    formal: list[dict[str, Any]] = []
+    private_formal: list[dict[str, Any]] = []
+    unavailable: list[str] = []
+    for expected_name in _FORMAL_RUNTIME_DISTRIBUTIONS:
+        try:
+            distribution = importlib_metadata.distribution(expected_name)
+        except importlib_metadata.PackageNotFoundError:
+            unavailable.append(expected_name)
+            continue
+        entry = _distribution_fingerprint(distribution)
+        if entry["name"] != expected_name:
+            raise ValueError(
+                f"formal runtime distribution resolved to the wrong name: {expected_name}"
+            )
+        module_name = _FORMAL_RUNTIME_MODULES[expected_name]
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            unavailable.append(expected_name)
+            continue
+        module_version = getattr(module, "__version__", None)
+        if module_version is not None:
+            module_version = str(module_version)
+            if _DISTRIBUTION_VERSION.fullmatch(module_version) is None:
+                raise ValueError(
+                    f"formal runtime module version is malformed: {expected_name}"
+                )
+        try:
+            origin = _module_origin_fingerprint(
+                distribution, module, distribution_name=expected_name
+            )
+        except (OSError, ValueError):
+            if require_formal_runtime:
+                raise
+            unavailable.append(expected_name)
+            continue
+        try:
+            record_proof, record_files = _distribution_record_integrity(
+                distribution, distribution_name=expected_name
+            )
+        except (OSError, ValueError):
+            if require_formal_runtime:
+                raise
+            unavailable.append(expected_name)
+            continue
+        entry.update(
+            {
+                "module": module_name,
+                "module_version": module_version,
+                **origin,
+                **record_proof,
+            }
+        )
+        if any(
+            entry[field] is None
+            for field in ("metadata_sha256", "record_sha256", "wheel_sha256")
+        ):
+            if require_formal_runtime:
+                raise ValueError(
+                    "formal runtime distribution metadata is incomplete: "
+                    f"{expected_name}"
+                )
+            unavailable.append(expected_name)
+            continue
+        formal.append(entry)
+        private_formal.append({**entry, "record_verified_files": record_files})
+
+    try:
+        nccl_raw = torch.cuda.nccl.version()
+    except Exception:
+        nccl_raw = None
+    if isinstance(nccl_raw, (tuple, list)):
+        nccl_version: list[int] | None = list(nccl_raw)
+    elif isinstance(nccl_raw, int) and not isinstance(nccl_raw, bool):
+        nccl_version = [nccl_raw]
+    else:
+        nccl_version = nccl_raw
+    from tabicl._model.attention import HAS_FLASH_ATTN3
+
+    flash_attn3_available = bool(HAS_FLASH_ATTN3)
+    if require_formal_runtime and (
+        unavailable
+        or not flash_attn3_available
+        or nccl_version is None
+    ):
+        raise ValueError(
+            "formal runtime distribution fingerprint is incomplete; "
+            f"unavailable={unavailable}, "
+            f"flash_attn3_available={flash_attn3_available}, "
+            f"nccl_available={nccl_version is not None}"
+        )
+    full_fingerprint = {
+        "visible_distribution_multiset": inventory,
+        "effective_formal_runtime_distributions": private_formal,
+    }
+    payload = {
+        "environment_fingerprint_schema_version": (
+            _ENVIRONMENT_FINGERPRINT_SCHEMA_VERSION
+        ),
+        "installed_distributions_sha256": canonical_sha256(full_fingerprint),
+        "formal_runtime_distributions": formal,
+        "unavailable_formal_runtime_distributions": unavailable,
+        "flash_attn3_available": flash_attn3_available,
+        "nccl_version": nccl_version,
+    }
+    return payload, full_fingerprint
+
+
+def _distribution_environment_fingerprint(
+    *, require_formal_runtime: bool
+) -> dict[str, Any]:
+    payload, _preimage = _distribution_environment_snapshot(
+        require_formal_runtime=require_formal_runtime
+    )
+    return payload
+
+
+def validate_environment_payload(
+    payload: Mapping[str, Any], *, require_formal_runtime: bool = True
+) -> None:
+    _require_exact_keys(payload, _ENVIRONMENT_PAYLOAD_KEYS, where="environment payload")
+    for field in (
+        "python_version",
+        "python_implementation",
+        "python_cache_tag",
+        "python_soabi",
+        "platform_system",
+        "platform_release",
+        "platform_machine",
+        "torch_version",
+        "numpy_version",
+    ):
+        value = payload[field]
+        if (
+            not isinstance(value, str)
+            or not value
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError(f"environment {field} is malformed")
+    _require_digest("environment Python executable", payload["python_executable_sha256"])
+    _require_digest(
+        "environment installed-distribution inventory",
+        payload["installed_distributions_sha256"],
+    )
+    fingerprint_schema = payload["environment_fingerprint_schema_version"]
+    if (
+        isinstance(fingerprint_schema, bool)
+        or not isinstance(fingerprint_schema, int)
+        or fingerprint_schema != _ENVIRONMENT_FINGERPRINT_SCHEMA_VERSION
+    ):
+        raise ValueError("environment fingerprint schema is unsupported")
+    cuda_runtime_version = payload["cuda_runtime_version"]
+    cudnn_version = payload["cudnn_version"]
+    cuda_valid = isinstance(cuda_runtime_version, str) and bool(cuda_runtime_version)
+    cudnn_valid = (
+        not isinstance(cudnn_version, bool)
+        and isinstance(cudnn_version, int)
+        and cudnn_version >= 1
+    )
+    if require_formal_runtime and (not cuda_valid or not cudnn_valid):
+        raise ValueError("environment CUDA/cuDNN versions are malformed")
+    if not require_formal_runtime and (
+        (cuda_runtime_version is not None and not cuda_valid)
+        or (cudnn_version is not None and not cudnn_valid)
+    ):
+        raise ValueError("environment CUDA/cuDNN versions are malformed")
+    visible_count = payload["visible_cuda_device_count"]
+    if (
+        isinstance(visible_count, bool)
+        or not isinstance(visible_count, int)
+        or visible_count < 0
+    ):
+        raise ValueError("environment visible CUDA device count is malformed")
+
+    unavailable = payload["unavailable_formal_runtime_distributions"]
+    if (
+        not isinstance(unavailable, list)
+        or any(name not in _FORMAL_RUNTIME_DISTRIBUTIONS for name in unavailable)
+        or unavailable
+        != sorted(set(unavailable), key=_FORMAL_RUNTIME_DISTRIBUTIONS.index)
+    ):
+        raise ValueError("environment unavailable formal distributions are malformed")
+    formal = payload["formal_runtime_distributions"]
+    if not isinstance(formal, list):
+        raise ValueError("environment formal runtime distributions must be a list")
+    expected_names = [
+        name for name in _FORMAL_RUNTIME_DISTRIBUTIONS if name not in unavailable
+    ]
+    if len(formal) != len(expected_names):
+        raise ValueError("environment formal runtime distribution set is incomplete")
+    for expected_name, entry in zip(expected_names, formal):
+        if not isinstance(entry, Mapping):
+            raise ValueError("environment formal runtime distribution is malformed")
+        _require_exact_keys(
+            entry,
+            {
+                "name",
+                "version",
+                "metadata_sha256",
+                "record_sha256",
+                "wheel_sha256",
+                "module",
+                "module_version",
+                "module_origin_relative_path",
+                "module_origin_sha256",
+                "record_verified_file_count",
+                "record_verified_total_bytes",
+                "record_verified_files_sha256",
+                "record_pyc_mismatch_count",
+            },
+            where="environment formal runtime distribution",
+        )
+        if entry["name"] != expected_name:
+            raise ValueError("environment formal runtime distribution order is invalid")
+        version = entry["version"]
+        if not isinstance(version, str) or _DISTRIBUTION_VERSION.fullmatch(version) is None:
+            raise ValueError("environment formal runtime distribution version is malformed")
+        if entry["module"] != _FORMAL_RUNTIME_MODULES[expected_name]:
+            raise ValueError("environment formal runtime module is malformed")
+        _validate_relative_path(
+            entry["module_origin_relative_path"],
+            where="environment formal runtime module origin",
+        )
+        _require_digest(
+            "environment formal runtime module origin",
+            entry["module_origin_sha256"],
+        )
+        verified_count = entry["record_verified_file_count"]
+        verified_bytes = entry["record_verified_total_bytes"]
+        if (
+            isinstance(verified_count, bool)
+            or not isinstance(verified_count, int)
+            or verified_count < 1
+            or verified_count > _FORMAL_RECORD_MAX_FILES_PER_DISTRIBUTION
+        ):
+            raise ValueError(
+                "environment formal runtime RECORD file count is malformed"
+            )
+        if (
+            isinstance(verified_bytes, bool)
+            or not isinstance(verified_bytes, int)
+            or verified_bytes < 0
+            or verified_bytes > _FORMAL_RECORD_MAX_BYTES_PER_DISTRIBUTION
+        ):
+            raise ValueError("environment formal runtime RECORD bytes are malformed")
+        _require_digest(
+            "environment formal runtime verified RECORD files",
+            entry["record_verified_files_sha256"],
+        )
+        pyc_mismatch_count = entry["record_pyc_mismatch_count"]
+        if (
+            isinstance(pyc_mismatch_count, bool)
+            or not isinstance(pyc_mismatch_count, int)
+            or pyc_mismatch_count < 0
+            or pyc_mismatch_count > verified_count
+        ):
+            raise ValueError(
+                "environment formal runtime RECORD pyc mismatch count is malformed"
+            )
+        module_version = entry["module_version"]
+        if module_version is not None and (
+            not isinstance(module_version, str)
+            or _DISTRIBUTION_VERSION.fullmatch(module_version) is None
+        ):
+            raise ValueError("environment formal runtime module version is malformed")
+        for field in ("metadata_sha256", "record_sha256", "wheel_sha256"):
+            _require_digest(f"environment formal runtime {field}", entry[field])
+
+    flash_available = payload["flash_attn3_available"]
+    if not isinstance(flash_available, bool):
+        raise ValueError("environment FlashAttention 3 availability is malformed")
+    nccl_version = payload["nccl_version"]
+    nccl_valid = (
+        isinstance(nccl_version, list)
+        and bool(nccl_version)
+        and all(
+            not isinstance(item, bool) and isinstance(item, int) and item >= 0
+            for item in nccl_version
+        )
+    )
+    if require_formal_runtime and (
+        unavailable or not flash_available or not nccl_valid
+    ):
+        raise ValueError("environment formal runtime requirements are not satisfied")
+    if not require_formal_runtime and nccl_version is not None and not nccl_valid:
+        raise ValueError("environment NCCL version is malformed")
+
+
+def runtime_environment_manifest(
+    *, require_formal_runtime: bool = False
+) -> dict[str, Any]:
     """Describe reproducibility-relevant runtime versions without local paths."""
+    manifest, _fingerprint_preimage = runtime_environment_snapshot(
+        require_formal_runtime=require_formal_runtime
+    )
+    return manifest
+
+
+def runtime_environment_snapshot(
+    *, require_formal_runtime: bool = False
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the public manifest and its path-free private inventory preimage."""
+    distribution_fingerprint, fingerprint_preimage = (
+        _distribution_environment_snapshot(
+            require_formal_runtime=require_formal_runtime
+        )
+    )
+    executable = Path(sys.executable).resolve(strict=True)
+    cache_tag = sys.implementation.cache_tag
+    soabi = sysconfig.get_config_var("SOABI")
+    if not isinstance(cache_tag, str) or not cache_tag:
+        raise ValueError("Python cache tag is unavailable")
+    if not isinstance(soabi, str) or not soabi:
+        raise ValueError("Python SOABI is unavailable")
     cudnn_version = (
         torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None
     )
-    return make_manifest(
-        "environment",
-        {
-            "python_version": platform.python_version(),
-            "python_implementation": platform.python_implementation(),
-            "platform_system": platform.system(),
-            "platform_release": platform.release(),
-            "platform_machine": platform.machine(),
-            "torch_version": str(torch.__version__),
-            "numpy_version": str(np.__version__),
-            "cuda_runtime_version": torch.version.cuda,
-            "cudnn_version": cudnn_version,
-            "visible_cuda_device_count": (
-                torch.cuda.device_count() if torch.cuda.is_available() else 0
-            ),
-        },
+    payload = {
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "python_executable_sha256": checkpoint_sha256(executable),
+        "python_cache_tag": cache_tag,
+        "python_soabi": soabi,
+        "platform_system": platform.system(),
+        "platform_release": platform.release(),
+        "platform_machine": platform.machine(),
+        "torch_version": str(torch.__version__),
+        "numpy_version": str(np.__version__),
+        "cuda_runtime_version": torch.version.cuda,
+        "cudnn_version": cudnn_version,
+        **distribution_fingerprint,
+        "visible_cuda_device_count": (
+            torch.cuda.device_count() if torch.cuda.is_available() else 0
+        ),
+    }
+    validate_environment_payload(
+        payload, require_formal_runtime=require_formal_runtime
     )
+    return make_manifest("environment", payload), fingerprint_preimage
 
 
 def state_dict_schema(state_dict: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -910,6 +1717,7 @@ def build_checkpoint_provenance(
     parent_manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
     validate_source_manifest(source_manifest)
+    validate_environment_payload(environment, require_formal_runtime=True)
     _validate_optimizer_protocol(optimizer_config)
     if stage not in FORMAL_STAGES:
         raise ValueError("formal stage must be stage1, stage2, or stage3")
@@ -1002,6 +1810,9 @@ def validate_provenance_bundle(bundle: Mapping[str, Any]) -> str:
         raise ValueError("provenance manifests are incomplete or contain unknown names")
     for name, manifest in manifests.items():
         validate_manifest(manifest, expected_kind=name)
+    validate_environment_payload(
+        manifests["environment"]["payload"], require_formal_runtime=True
+    )
     _validate_optimizer_protocol(manifests["optimizer"]["payload"])
     stage_payload = manifests["stage"]["payload"]
     _require_exact_keys(
@@ -1229,6 +2040,44 @@ _LEDGER_INTEGER_FIELDS = (
     ("cuda_device_count", 0),
     ("max_checkpoint_bytes", 1),
 )
+_LEDGER_H100_GATE_KEYS = {
+    "attestation_sha256",
+    "checkpoint_ceiling_bytes",
+    "nvidia_smi_sha256",
+    "gpu_model",
+    "driver_version",
+}
+_LEDGER_CAMPAIGN_BINDING_KEYS = {
+    "campaign_id",
+    "campaign_manifest_sha256",
+    "training_commit_sha",
+    "training_tree_sha",
+    "source_manifest_sha256",
+    "environment_sha256",
+    "h100_attestation_sha256",
+    "nvidia_smi_sha256",
+    "checkpoint_ceiling_bytes",
+    "static_protocol_sha256_by_stage",
+    "time_limit_by_stage",
+    "predecessor_acceptance_sha256_by_seed",
+}
+
+
+def _validate_slurm_duration(value: Any, *, where: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{where} must be a canonical Slurm duration")
+    match = _SLURM_DURATION.fullmatch(value)
+    if match is None or int(match.group("hours")) > 23:
+        raise ValueError(f"{where} must be a canonical Slurm duration")
+    seconds = (
+        (int(match.group("days") or "0") * 24 + int(match.group("hours")))
+        * 3600
+        + int(match.group("minutes")) * 60
+        + int(match.group("seconds"))
+    )
+    if seconds <= 0:
+        raise ValueError(f"{where} must be a positive Slurm duration")
+    return value
 
 
 def _validate_ledger_entry(entry: Any) -> Mapping[str, Any]:
@@ -1266,10 +2115,29 @@ def validate_canonical_transaction_ledger(
 
     if not isinstance(payload, Mapping):
         raise ValueError("transaction ledger payload must be an object")
-    _require_exact_keys(payload, {"study_id", "entries"}, where="transaction ledger")
+    _require_exact_keys(
+        payload,
+        {
+            "study_id",
+            "entries",
+            "h100_gate",
+            "campaign_binding",
+            "runtime_tools",
+            "protocol_metadata_allowance_bytes",
+        },
+        where="transaction ledger",
+    )
     study_id = payload["study_id"]
     if not isinstance(study_id, str) or _SAFE_ID.fullmatch(study_id) is None:
         raise ValueError("transaction ledger study_id is invalid")
+    protocol_metadata_allowance = payload["protocol_metadata_allowance_bytes"]
+    if (
+        isinstance(protocol_metadata_allowance, bool)
+        or not isinstance(protocol_metadata_allowance, int)
+        or protocol_metadata_allowance < 1
+        or protocol_metadata_allowance > FORMAL_METADATA_CEILING_BYTES
+    ):
+        raise ValueError("transaction ledger protocol metadata allowance is invalid")
     _absolute_lexical_path(artifact_root, where="artifact root")
 
     raw_entries = payload["entries"]
@@ -1294,6 +2162,141 @@ def validate_canonical_transaction_ledger(
         raise ValueError("transaction ledger checkpoint ceiling is too large")
     source_sha256 = entries[0]["source_sha256"]
     environment_sha256 = entries[0]["environment_sha256"]
+
+    h100_gate = payload["h100_gate"]
+    if not isinstance(h100_gate, Mapping):
+        raise ValueError("transaction ledger H100 gate must be an object")
+    _require_exact_keys(
+        h100_gate, _LEDGER_H100_GATE_KEYS, where="transaction ledger H100 gate"
+    )
+    _require_digest(
+        "transaction ledger H100 attestation", h100_gate["attestation_sha256"]
+    )
+    _require_digest(
+        "transaction ledger nvidia-smi executable", h100_gate["nvidia_smi_sha256"]
+    )
+    gate_ceiling = h100_gate["checkpoint_ceiling_bytes"]
+    if (
+        isinstance(gate_ceiling, bool)
+        or not isinstance(gate_ceiling, int)
+        or gate_ceiling < 1
+        or gate_ceiling > _FORMAL_MAX_CHECKPOINT_BYTES_LIMIT
+    ):
+        raise ValueError("transaction ledger H100 checkpoint ceiling is invalid")
+    gpu_model = h100_gate["gpu_model"]
+    if (
+        not isinstance(gpu_model, str)
+        or not gpu_model
+        or len(gpu_model) > 256
+        or "H100" not in gpu_model
+        or any(character in gpu_model for character in ("\x00", "\n", "\r"))
+    ):
+        raise ValueError("transaction ledger H100 GPU model is invalid")
+    driver_version = h100_gate["driver_version"]
+    if (
+        not isinstance(driver_version, str)
+        or not driver_version
+        or len(driver_version) > 128
+        or any(
+            character in driver_version for character in ("\x00", "\n", "\r", ",")
+        )
+    ):
+        raise ValueError("transaction ledger H100 driver version is invalid")
+
+    campaign = payload["campaign_binding"]
+    if not isinstance(campaign, Mapping):
+        raise ValueError("transaction ledger campaign binding must be an object")
+    _require_exact_keys(
+        campaign,
+        _LEDGER_CAMPAIGN_BINDING_KEYS,
+        where="transaction ledger campaign binding",
+    )
+    if (
+        not isinstance(campaign["campaign_id"], str)
+        or _SAFE_ID.fullmatch(campaign["campaign_id"]) is None
+    ):
+        raise ValueError("transaction ledger campaign_id is invalid")
+    for field in (
+        "campaign_manifest_sha256",
+        "source_manifest_sha256",
+        "environment_sha256",
+        "h100_attestation_sha256",
+        "nvidia_smi_sha256",
+    ):
+        _require_digest(f"transaction ledger campaign {field}", campaign[field])
+    for field in ("training_commit_sha", "training_tree_sha"):
+        if not isinstance(campaign[field], str) or _HEX_40.fullmatch(campaign[field]) is None:
+            raise ValueError(f"transaction ledger campaign {field} is invalid")
+    campaign_ceiling = campaign["checkpoint_ceiling_bytes"]
+    if (
+        isinstance(campaign_ceiling, bool)
+        or not isinstance(campaign_ceiling, int)
+        or campaign_ceiling < 1
+        or campaign_ceiling > _FORMAL_MAX_CHECKPOINT_BYTES_LIMIT
+    ):
+        raise ValueError("transaction ledger campaign checkpoint ceiling is invalid")
+    static_protocols = campaign["static_protocol_sha256_by_stage"]
+    time_limits = campaign["time_limit_by_stage"]
+    if not isinstance(static_protocols, Mapping):
+        raise ValueError("transaction ledger campaign static protocols are invalid")
+    if not isinstance(time_limits, Mapping):
+        raise ValueError("transaction ledger campaign time limits are invalid")
+    _require_exact_keys(
+        static_protocols,
+        set(_FORMAL_STAGE_ORDER),
+        where="transaction ledger campaign static protocols",
+    )
+    _require_exact_keys(
+        time_limits,
+        set(_FORMAL_STAGE_ORDER),
+        where="transaction ledger campaign time limits",
+    )
+    for stage in _FORMAL_STAGE_ORDER:
+        _require_digest(
+            f"transaction ledger campaign {stage} static protocol",
+            static_protocols[stage],
+        )
+        _validate_slurm_duration(
+            time_limits[stage], where=f"transaction ledger campaign {stage} time limit"
+        )
+    predecessors = campaign["predecessor_acceptance_sha256_by_seed"]
+    expected_predecessor_keys = {
+        str(candidate) for candidate in sorted(_FORMAL_SUPPORTED_SEEDS) if candidate < seed
+    }
+    if not isinstance(predecessors, Mapping):
+        raise ValueError("transaction ledger campaign predecessor prefix is invalid")
+    _require_exact_keys(
+        predecessors,
+        expected_predecessor_keys,
+        where="transaction ledger campaign predecessor prefix",
+    )
+    for predecessor_seed, digest in predecessors.items():
+        _require_digest(
+            f"transaction ledger predecessor seed {predecessor_seed}", digest
+        )
+    runtime_tools = payload["runtime_tools"]
+    if not isinstance(runtime_tools, Mapping):
+        raise ValueError("transaction ledger runtime tools must be an object")
+    _require_exact_keys(
+        runtime_tools,
+        {"nvidia_smi_sha256"},
+        where="transaction ledger runtime tools",
+    )
+    _require_digest(
+        "transaction ledger runtime nvidia-smi executable",
+        runtime_tools["nvidia_smi_sha256"],
+    )
+    if (
+        gate_ceiling != max_checkpoint_bytes
+        or campaign_ceiling != max_checkpoint_bytes
+        or study_id != f"{campaign['campaign_id']}-seed{seed}"
+        or campaign["source_manifest_sha256"] != source_sha256
+        or campaign["environment_sha256"] != environment_sha256
+        or campaign["h100_attestation_sha256"] != h100_gate["attestation_sha256"]
+        or campaign["nvidia_smi_sha256"] != h100_gate["nvidia_smi_sha256"]
+        or runtime_tools["nvidia_smi_sha256"] != h100_gate["nvidia_smi_sha256"]
+    ):
+        raise ValueError("transaction ledger gate/campaign global binding mismatch")
     global_fields = {
         "np_seed": seed,
         "torch_seed": seed,
@@ -1398,6 +2401,26 @@ def validate_canonical_transaction_ledger(
                 raise ValueError(
                     "transaction ledger arm protocol digest is not derived"
                 )
+        expected_static = make_manifest(
+            "formal_campaign_stage_static_protocol",
+            {
+                "training_commit_sha": campaign["training_commit_sha"],
+                "training_tree_sha": campaign["training_tree_sha"],
+                "source_manifest_sha256": source_sha256,
+                "environment_sha256": environment_sha256,
+                "stage": stage,
+                "terminal_step": _FORMAL_STAGE_BUDGETS[stage],
+                "time_limit": time_limits[stage],
+                "prior_sha256": exemplar["prior_sha256"],
+                "architecture_sha256": exemplar["architecture_sha256"],
+                "optimizer_sha256": exemplar["optimizer_sha256"],
+                "scientific_sha256": exemplar["scientific_sha256"],
+            },
+        )["sha256"]
+        if static_protocols[stage] != expected_static:
+            raise ValueError(
+                "transaction ledger campaign stage static protocol is not derived"
+            )
     return by_key
 
 
@@ -3166,6 +4189,7 @@ def _strict_json_load_at(
     flags = os.O_RDONLY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError as error:

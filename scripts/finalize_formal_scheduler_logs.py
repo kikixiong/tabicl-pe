@@ -23,8 +23,10 @@ import sys
 from typing import Any, Mapping, Sequence
 
 
+SCHEDULER_QUERY_TIMEOUT_SECONDS = 30
 ARMS = ("rope", "temporary", "none")
 STAGES = ("stage1", "stage2", "stage3")
+FORMAL_SEEDS = (42, 43, 44)
 TERMINAL_STEPS = {"stage1": 500_000, "stage2": 40_000, "stage3": 10_000}
 PAIR_ORDER = tuple((arm, stage) for stage in STAGES for arm in ARMS)
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -41,6 +43,7 @@ SLURM_DURATION = re.compile(
 RUNTIME_COMPLETION_CEILING_BYTES = 65_536
 TERMINAL_LOG_ATTESTATION_CEILING_BYTES = 131_072
 COMMAND_CEILING_BYTES = 128 * 1024 * 1024
+FORMAL_METADATA_CEILING_BYTES = 128 << 20
 QUERY_CEILING_BYTES = 1_000_000
 TREATMENT_SCHEMA_VERSION = 1
 SEED_POLICY = "sha256-domain-separated-base-seed-and-rank-v1"
@@ -76,10 +79,12 @@ COMPLETION_PAYLOAD_KEYS = {
     "cuda_visible_devices",
     "gpu_name",
     "gpu_uuid",
+    "gpu_driver_version",
     "scheduler_stdout_path",
     "scheduler_stderr_path",
     "scheduler_log_ceiling_bytes",
     "manifest_ceiling_bytes",
+    "protocol_metadata_allowance_bytes",
     "scheduler_stdout_observed_size_at_completion",
     "scheduler_stderr_observed_size_at_completion",
     "scheduler_logs_terminal_verified",
@@ -177,6 +182,27 @@ COMPLETION_SCHEDULER_KEYS = {
     "time_limit",
     "query_sha256",
 }
+CAMPAIGN_BINDING_KEYS = {
+    "campaign_id",
+    "campaign_manifest_sha256",
+    "training_commit_sha",
+    "training_tree_sha",
+    "source_manifest_sha256",
+    "environment_sha256",
+    "h100_attestation_sha256",
+    "nvidia_smi_sha256",
+    "checkpoint_ceiling_bytes",
+    "static_protocol_sha256_by_stage",
+    "time_limit_by_stage",
+    "predecessor_acceptance_sha256_by_seed",
+}
+H100_GATE_KEYS = {
+    "attestation_sha256",
+    "checkpoint_ceiling_bytes",
+    "nvidia_smi_sha256",
+    "gpu_model",
+    "driver_version",
+}
 
 
 def _normalize(value: Any) -> Any:
@@ -222,8 +248,7 @@ def _slurm_duration(value: Any, where: str) -> str:
     if match is None or int(match.group("hours")) > 23:
         raise ValueError(f"{where} is not a canonical Slurm duration")
     seconds = (
-        (int(match.group("days") or "0") * 24 + int(match.group("hours")))
-        * 3600
+        (int(match.group("days") or "0") * 24 + int(match.group("hours"))) * 3600
         + int(match.group("minutes")) * 60
         + int(match.group("seconds"))
     )
@@ -278,11 +303,7 @@ def _require_physical_directory(path: Path, *, where: str) -> None:
 def _read_stable_regular(
     path: Path, *, max_bytes: int, where: str, executable: bool = False
 ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
-    if (
-        isinstance(max_bytes, bool)
-        or not isinstance(max_bytes, int)
-        or max_bytes < 0
-    ):
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
         raise ValueError(f"{where} byte ceiling is invalid")
     try:
         before = path.lstat()
@@ -295,10 +316,13 @@ def _read_stable_regular(
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(path, flags)
     except OSError as error:
-        raise ValueError(f"{where} could not be opened without following links") from error
+        raise ValueError(
+            f"{where} could not be opened without following links"
+        ) from error
     try:
         opened = os.fstat(fd)
         if _signature(opened) != _signature(before):
@@ -362,9 +386,7 @@ def _decode_manifest(raw: bytes, *, kind: str) -> Mapping[str, Any]:
 
 
 def _read_manifest(path: Path, *, max_bytes: int, kind: str) -> Mapping[str, Any]:
-    raw, _signature_value = _read_stable_regular(
-        path, max_bytes=max_bytes, where=kind
-    )
+    raw, _signature_value = _read_stable_regular(path, max_bytes=max_bytes, where=kind)
     return _decode_manifest(raw, kind=kind)
 
 
@@ -429,7 +451,9 @@ def _read_relative_stable_regular(
     try:
         directory_fd = os.open(root, directory_flags)
     except OSError as error:
-        raise ValueError(f"{where} root could not be opened without following links") from error
+        raise ValueError(
+            f"{where} root could not be opened without following links"
+        ) from error
     try:
         for component in parts[:-1]:
             try:
@@ -447,13 +471,18 @@ def _read_relative_stable_regular(
             raise ValueError(f"{where} is unavailable") from error
         if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
             raise ValueError(f"{where} is not a bounded physical regular file")
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-            os, "O_NOFOLLOW", 0
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
         )
         try:
             fd = os.open(name, flags, dir_fd=directory_fd)
         except OSError as error:
-            raise ValueError(f"{where} could not be opened without following links") from error
+            raise ValueError(
+                f"{where} could not be opened without following links"
+            ) from error
         try:
             opened = os.fstat(fd)
             if _signature(opened) != _signature(before):
@@ -508,7 +537,9 @@ def _hash_relative_bounded_regular(
     try:
         directory_fd = os.open(root, directory_flags)
     except OSError as error:
-        raise ValueError(f"{where} root could not be opened without following links") from error
+        raise ValueError(
+            f"{where} root could not be opened without following links"
+        ) from error
     try:
         for component in parts[:-1]:
             try:
@@ -526,13 +557,18 @@ def _hash_relative_bounded_regular(
             raise ValueError(f"{where} is unavailable") from error
         if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
             raise ValueError(f"{where} is not a bounded physical regular file")
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-            os, "O_NOFOLLOW", 0
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
         )
         try:
             fd = os.open(name, flags, dir_fd=directory_fd)
         except OSError as error:
-            raise ValueError(f"{where} could not be opened without following links") from error
+            raise ValueError(
+                f"{where} could not be opened without following links"
+            ) from error
         try:
             opened = os.fstat(fd)
             if _signature(opened) != _signature(before):
@@ -596,20 +632,47 @@ def _expected_treatment_sha256(arm: str, seed: int) -> str:
 
 
 def _validate_ledger(
-    *, ledger: Mapping[str, Any], study_id: str, seed: int
+    *,
+    ledger: Mapping[str, Any],
+    study_id: str,
+    seed: int,
+    protocol_metadata_allowance_bytes: int,
 ) -> tuple[
     dict[tuple[str, str], Mapping[str, Any]],
     str,
     dict[str, str],
 ]:
-    ledger_payload = _exact(ledger["payload"], {"study_id", "entries"}, "ledger payload")
+    ledger_payload = _exact(
+        ledger["payload"],
+        {
+            "study_id",
+            "campaign_binding",
+            "h100_gate",
+            "runtime_tools",
+            "protocol_metadata_allowance_bytes",
+            "entries",
+        },
+        "ledger payload",
+    )
     entries = ledger_payload["entries"]
     if (
         ledger_payload["study_id"] != study_id
+        or isinstance(ledger_payload["protocol_metadata_allowance_bytes"], bool)
+        or not isinstance(ledger_payload["protocol_metadata_allowance_bytes"], int)
+        or ledger_payload["protocol_metadata_allowance_bytes"]
+        != protocol_metadata_allowance_bytes
         or not isinstance(entries, list)
         or len(entries) != len(PAIR_ORDER)
     ):
         raise ValueError("transaction ledger formal matrix mismatch")
+    runtime_tools = _exact(
+        ledger_payload["runtime_tools"], {"nvidia_smi_sha256"}, "runtime tools"
+    )
+    if (
+        not isinstance(runtime_tools["nvidia_smi_sha256"], str)
+        or HEX64.fullmatch(runtime_tools["nvidia_smi_sha256"]) is None
+    ):
+        raise ValueError("runtime tools nvidia-smi digest is malformed")
     by_pair: dict[tuple[str, str], Mapping[str, Any]] = {}
     for raw_entry, pair in zip(entries, PAIR_ORDER):
         entry = _exact(raw_entry, LEDGER_ENTRY_KEYS, "transaction ledger entry")
@@ -641,8 +704,7 @@ def _validate_ledger(
             entry["finalized_manifest_relpath"], where="ledger finalized manifest"
         )
         if any(
-            not isinstance(entry[field], str)
-            or HEX64.fullmatch(entry[field]) is None
+            not isinstance(entry[field], str) or HEX64.fullmatch(entry[field]) is None
             for field in LEDGER_DIGEST_FIELDS
         ):
             raise ValueError("transaction ledger digest is invalid")
@@ -651,14 +713,16 @@ def _validate_ledger(
     if len({entry["source_sha256"] for entry in entries}) != 1:
         raise ValueError("transaction ledger source digest differs across the cohort")
     if len({entry["environment_sha256"] for entry in entries}) != 1:
-        raise ValueError("transaction ledger environment digest differs across the cohort")
+        raise ValueError(
+            "transaction ledger environment digest differs across the cohort"
+        )
     if len({entry["max_checkpoint_bytes"] for entry in entries}) != 1:
-        raise ValueError("transaction ledger checkpoint ceiling differs across the cohort")
+        raise ValueError(
+            "transaction ledger checkpoint ceiling differs across the cohort"
+        )
 
     seed_sha256 = _expected_seed_sha256(seed)
-    treatment_by_arm = {
-        arm: _expected_treatment_sha256(arm, seed) for arm in ARMS
-    }
+    treatment_by_arm = {arm: _expected_treatment_sha256(arm, seed) for arm in ARMS}
     for stage in STAGES:
         stage_entries = [by_pair[(arm, stage)] for arm in ARMS]
         for field in (
@@ -699,8 +763,120 @@ def _validate_ledger(
                 },
             )
             if by_pair[(arm, stage)]["arm_protocol_sha256"] != expected_arm:
-                raise ValueError("transaction ledger arm protocol digest is not derived")
+                raise ValueError(
+                    "transaction ledger arm protocol digest is not derived"
+                )
     return by_pair, seed_sha256, treatment_by_arm
+
+
+def _validated_campaign_binding(
+    value: Any,
+    *,
+    study_id: str,
+    seed: int,
+    source_commit_sha: str,
+    source_tree_sha: str,
+    time_limit_by_stage: Mapping[str, str],
+    ledger_by_pair: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate the submission-time campaign binding against ledger facts.
+
+    The campaign manifest digest and predecessor acceptance digests are
+    intentionally opaque here: the campaign registry owns those external
+    immutable files and compares them exactly during seed acceptance.  Every
+    value that can be derived from this transaction is recomputed here before
+    the finalizer copies the binding into terminal evidence.
+    """
+
+    binding = _exact(value, CAMPAIGN_BINDING_KEYS, "campaign binding")
+    campaign_id = binding["campaign_id"]
+    selected_seed = seed
+    if (
+        not isinstance(campaign_id, str)
+        or SAFE_ID.fullmatch(campaign_id) is None
+        or selected_seed not in FORMAL_SEEDS
+        or study_id != f"{campaign_id}-seed{selected_seed}"
+    ):
+        raise ValueError("campaign binding study or seed is invalid")
+    if (
+        binding["training_commit_sha"] != source_commit_sha
+        or binding["training_tree_sha"] != source_tree_sha
+        or HEX40.fullmatch(str(binding["training_commit_sha"])) is None
+        or HEX40.fullmatch(str(binding["training_tree_sha"])) is None
+    ):
+        raise ValueError("campaign binding training source differs from receipt")
+    for field in (
+        "campaign_manifest_sha256",
+        "source_manifest_sha256",
+        "environment_sha256",
+        "h100_attestation_sha256",
+        "nvidia_smi_sha256",
+    ):
+        if (
+            not isinstance(binding[field], str)
+            or HEX64.fullmatch(binding[field]) is None
+        ):
+            raise ValueError(f"campaign binding {field} is malformed")
+
+    stage_names = set(STAGES)
+    supplied_time_limits = _exact(
+        binding["time_limit_by_stage"], stage_names, "campaign stage time limits"
+    )
+    supplied_static = _exact(
+        binding["static_protocol_sha256_by_stage"],
+        stage_names,
+        "campaign static protocols",
+    )
+    if dict(supplied_time_limits) != dict(time_limit_by_stage):
+        raise ValueError("campaign stage time limits differ from submission receipt")
+    checkpoint_ceiling = binding["checkpoint_ceiling_bytes"]
+    if (
+        isinstance(checkpoint_ceiling, bool)
+        or not isinstance(checkpoint_ceiling, int)
+        or checkpoint_ceiling <= 0
+    ):
+        raise ValueError("campaign checkpoint ceiling is invalid")
+
+    for stage in STAGES:
+        entries = [ledger_by_pair[(arm, stage)] for arm in ARMS]
+        exemplar = entries[0]
+        if any(
+            entry["source_sha256"] != binding["source_manifest_sha256"]
+            or entry["environment_sha256"] != binding["environment_sha256"]
+            or entry["max_checkpoint_bytes"] != checkpoint_ceiling
+            for entry in entries
+        ):
+            raise ValueError("campaign binding differs from transaction ledger")
+        expected_static = _manifest_sha256(
+            "formal_campaign_stage_static_protocol",
+            {
+                "training_commit_sha": source_commit_sha,
+                "training_tree_sha": source_tree_sha,
+                "source_manifest_sha256": binding["source_manifest_sha256"],
+                "environment_sha256": binding["environment_sha256"],
+                "stage": stage,
+                "terminal_step": TERMINAL_STEPS[stage],
+                "time_limit": supplied_time_limits[stage],
+                "prior_sha256": exemplar["prior_sha256"],
+                "architecture_sha256": exemplar["architecture_sha256"],
+                "optimizer_sha256": exemplar["optimizer_sha256"],
+                "scientific_sha256": exemplar["scientific_sha256"],
+            },
+        )
+        if supplied_static[stage] != expected_static:
+            raise ValueError("campaign static protocol differs from transaction ledger")
+
+    predecessors = _exact(
+        binding["predecessor_acceptance_sha256_by_seed"],
+        {str(value) for value in FORMAL_SEEDS if value < selected_seed},
+        "campaign predecessor acceptance prefix",
+    )
+    for previous_seed, digest in predecessors.items():
+        if not isinstance(digest, str) or HEX64.fullmatch(digest) is None:
+            raise ValueError(
+                f"campaign predecessor acceptance for seed {previous_seed} is malformed"
+            )
+    return dict(binding)
 
 
 def _validate_finalized_artifact(
@@ -753,7 +929,9 @@ def _validate_finalized_artifact(
     if (
         isinstance(finalized_payload["checkpoint_size"], bool)
         or not isinstance(finalized_payload["checkpoint_size"], int)
-        or not 0 <= finalized_payload["checkpoint_size"] <= entry["max_checkpoint_bytes"]
+        or not 0
+        <= finalized_payload["checkpoint_size"]
+        <= entry["max_checkpoint_bytes"]
         or isinstance(finalized_payload["cuda_device_count"], bool)
         or not isinstance(finalized_payload["cuda_device_count"], int)
         or isinstance(finalized_payload["max_checkpoint_bytes"], bool)
@@ -807,6 +985,7 @@ def _trusted_executable(path: Path, expected_sha256: str) -> int:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    flags |= getattr(os, "O_NONBLOCK", 0)
     fd = os.open(path, flags)
     try:
         opened = os.fstat(fd)
@@ -872,6 +1051,7 @@ def _query_terminal_jobs(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                timeout=SCHEDULER_QUERY_TIMEOUT_SECONDS,
                 pass_fds=(command_fd,),
             )
         finally:
@@ -896,11 +1076,7 @@ def _query_terminal_jobs(
             if job_id in seen:
                 raise ValueError("sacct returned a duplicate allocation row")
             state = raw_state.split()[0].split("+")[0] if raw_state.split() else ""
-            if (
-                state != "COMPLETED"
-                or exit_code != "0:0"
-                or derived_exit_code != "0:0"
-            ):
+            if state != "COMPLETED" or exit_code != "0:0" or derived_exit_code != "0:0":
                 raise ValueError("formal allocation is not successfully terminal")
             seen[job_id] = {
                 "state": state,
@@ -914,9 +1090,7 @@ def _query_terminal_jobs(
             {
                 "cluster": cluster,
                 "job_ids": job_ids,
-                "query_argv_sha256": hashlib.sha256(
-                    _canonical(argv[1:])
-                ).hexdigest(),
+                "query_argv_sha256": hashlib.sha256(_canonical(argv[1:])).hexdigest(),
                 "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
                 "stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
             }
@@ -935,7 +1109,9 @@ def _stable_log_evidence(path: Path, *, max_bytes: int, stream: str) -> dict[str
     )
     findings = _fatal_findings(first)
     if findings:
-        raise ValueError("scheduler log contains fatal signatures: " + ", ".join(findings))
+        raise ValueError(
+            "scheduler log contains fatal signatures: " + ", ".join(findings)
+        )
     digest = hashlib.sha256(first).hexdigest()
     second, second_signature = _read_stable_regular(
         path, max_bytes=max_bytes, where=f"scheduler {stream} log second read"
@@ -957,7 +1133,9 @@ def _stable_log_evidence(path: Path, *, max_bytes: int, stream: str) -> dict[str
     }
 
 
-def _publish_no_replace(path: Path, value: Mapping[str, Any], *, max_bytes: int) -> None:
+def _publish_no_replace(
+    path: Path, value: Mapping[str, Any], *, max_bytes: int
+) -> None:
     raw = _canonical(value) + b"\n"
     if len(raw) > max_bytes:
         raise ValueError("terminal scheduler-log attestation exceeds its byte ceiling")
@@ -986,9 +1164,7 @@ def _publish_no_replace(path: Path, value: Mapping[str, Any], *, max_bytes: int)
         os.link(temporary, path, follow_symlinks=False)
         directory_fd = os.open(
             parent,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
         try:
             os.fsync(directory_fd)
@@ -1001,7 +1177,7 @@ def _publish_no_replace(path: Path, value: Mapping[str, Any], *, max_bytes: int)
             pass
 
 
-def finalize(
+def _derive_terminal_attestation(
     *,
     submission_receipt: Path,
     transaction_ledger: Path,
@@ -1013,10 +1189,13 @@ def finalize(
         or not isinstance(max_metadata_bytes, int)
         or not TERMINAL_LOG_ATTESTATION_CEILING_BYTES
         <= max_metadata_bytes
-        <= 1 << 40
+        <= FORMAL_METADATA_CEILING_BYTES
     ):
         raise ValueError("formal metadata byte ceiling is invalid")
-    if not artifact_root.is_absolute() or artifact_root.resolve(strict=True) != artifact_root:
+    if (
+        not artifact_root.is_absolute()
+        or artifact_root.resolve(strict=True) != artifact_root
+    ):
         raise ValueError("artifact root must be an absolute physical directory")
     _require_physical_directory(artifact_root, where="artifact root")
     if (
@@ -1044,9 +1223,13 @@ def finalize(
             "source_commit_sha",
             "source_tree_sha",
             "repository_binding",
+            "campaign_binding",
+            "h100_gate",
+            "runtime_tools",
             "jobs_held_at_publication",
             "run_log_ceiling_bytes",
             "manifest_ceiling_bytes",
+            "protocol_metadata_allowance_bytes",
             "runtime_completion_ceiling_bytes",
             "terminal_log_attestation_path",
             "transaction_commit_path",
@@ -1083,6 +1266,9 @@ def finalize(
         or isinstance(payload["manifest_ceiling_bytes"], bool)
         or not isinstance(payload["manifest_ceiling_bytes"], int)
         or not 1 <= payload["manifest_ceiling_bytes"] <= max_metadata_bytes
+        or isinstance(payload["protocol_metadata_allowance_bytes"], bool)
+        or not isinstance(payload["protocol_metadata_allowance_bytes"], int)
+        or payload["protocol_metadata_allowance_bytes"] != max_metadata_bytes
     ):
         raise ValueError("submission receipt terminal-evidence binding mismatch")
     repository_binding = _validated_repository_binding(
@@ -1112,6 +1298,10 @@ def finalize(
             "transaction_id",
             "submission_receipt_sha256",
             "transaction_ledger_sha256",
+            "campaign_binding",
+            "h100_gate",
+            "runtime_tools",
+            "protocol_metadata_allowance_bytes",
             "job_ids",
         },
         "formal submission commit payload",
@@ -1121,6 +1311,10 @@ def finalize(
         or commit_payload["transaction_id"] != payload["transaction_id"]
         or commit_payload["submission_receipt_sha256"] != receipt["sha256"]
         or commit_payload["transaction_ledger_sha256"] != ledger["sha256"]
+        or commit_payload["campaign_binding"] != payload["campaign_binding"]
+        or commit_payload["h100_gate"] != payload["h100_gate"]
+        or commit_payload["runtime_tools"] != payload["runtime_tools"]
+        or commit_payload["protocol_metadata_allowance_bytes"] != max_metadata_bytes
         or commit_payload["job_ids"] != payload["job_ids"]
     ):
         raise ValueError("formal submission commit binding mismatch")
@@ -1169,8 +1363,7 @@ def finalize(
             "gpus_per_job": 1,
         }
         or any(
-            isinstance(scheduler[key], bool)
-            or not isinstance(scheduler[key], int)
+            isinstance(scheduler[key], bool) or not isinstance(scheduler[key], int)
             for key in ("cpus_per_task", "memory_mb", "gpus_per_job")
         )
         or not isinstance(scheduler["sacct_sha256"], str)
@@ -1188,14 +1381,16 @@ def finalize(
     if not isinstance(jobs, list) or len(jobs) != 9:
         raise ValueError("submission receipt must contain exactly nine formal jobs")
     job_ids = payload["job_ids"]
-    if not isinstance(job_ids, list) or len(job_ids) != 9 or any(
-        not isinstance(value, str) or JOB_ID.fullmatch(value) is None
-        for value in job_ids
+    if (
+        not isinstance(job_ids, list)
+        or len(job_ids) != 9
+        or any(
+            not isinstance(value, str) or JOB_ID.fullmatch(value) is None
+            for value in job_ids
+        )
     ):
         raise ValueError("submission receipt job ID set is invalid")
-    expected_job_ids = [
-        job.get("job_id") for job in jobs if isinstance(job, Mapping)
-    ]
+    expected_job_ids = [job.get("job_id") for job in jobs if isinstance(job, Mapping)]
     if job_ids != expected_job_ids or len(set(job_ids)) != 9:
         raise ValueError("submission receipt job ID set is invalid")
     expected_pairs = {(arm, stage) for stage in STAGES for arm in ARMS}
@@ -1213,6 +1408,7 @@ def finalize(
                 "cluster",
                 "job_name",
                 "parent_job_id",
+                "sbatch_argv_sha256",
                 "scheduler_stdout",
                 "scheduler_stderr",
                 "completion_path",
@@ -1220,7 +1416,11 @@ def finalize(
             "submission receipt job",
         )
         pair = (job["arm"], job["stage"])
-        if pair != expected_pair or pair in observed_pairs or pair not in expected_pairs:
+        if (
+            pair != expected_pair
+            or pair in observed_pairs
+            or pair not in expected_pairs
+        ):
             raise ValueError("submission receipt formal matrix is invalid")
         observed_pairs.add(pair)
         if (
@@ -1229,6 +1429,8 @@ def finalize(
             or job["time_limit"] != normalized_time_limits[job["stage"]]
             or not isinstance(job["job_name"], str)
             or not job["job_name"]
+            or not isinstance(job["sbatch_argv_sha256"], str)
+            or HEX64.fullmatch(job["sbatch_argv_sha256"]) is None
             or job["cluster"] is not None
             and (
                 not isinstance(job["cluster"], str)
@@ -1241,7 +1443,9 @@ def finalize(
                 raise ValueError("submission receipt artifact path is invalid")
             path = Path(job[key])
             if not path.is_absolute() or artifact_root not in path.parents:
-                raise ValueError("submission receipt artifact path escaped its namespace")
+                raise ValueError(
+                    "submission receipt artifact path escaped its namespace"
+                )
         expected_slug = f"{job['arm']}-{job['stage']}"
         if (
             Path(job["scheduler_stdout"])
@@ -1298,7 +1502,54 @@ def finalize(
         ledger=ledger,
         study_id=payload["study_id"],
         seed=payload["seed"],
+        protocol_metadata_allowance_bytes=max_metadata_bytes,
     )
+    if payload["campaign_binding"] != ledger["payload"]["campaign_binding"]:
+        raise ValueError("receipt and ledger bind different campaigns")
+    campaign_binding = _validated_campaign_binding(
+        payload["campaign_binding"],
+        study_id=payload["study_id"],
+        seed=payload["seed"],
+        source_commit_sha=payload["source_commit_sha"],
+        source_tree_sha=payload["source_tree_sha"],
+        time_limit_by_stage=normalized_time_limits,
+        ledger_by_pair=ledger_by_pair,
+    )
+    if payload["h100_gate"] != ledger["payload"]["h100_gate"]:
+        raise ValueError("receipt and ledger bind different H100 gates")
+    if payload["runtime_tools"] != ledger["payload"]["runtime_tools"]:
+        raise ValueError("receipt and ledger bind different runtime tools")
+    h100_gate = _exact(payload["h100_gate"], H100_GATE_KEYS, "H100 gate binding")
+    if (
+        not isinstance(h100_gate["attestation_sha256"], str)
+        or HEX64.fullmatch(h100_gate["attestation_sha256"]) is None
+        or h100_gate["attestation_sha256"]
+        != campaign_binding["h100_attestation_sha256"]
+        or h100_gate["nvidia_smi_sha256"]
+        != campaign_binding["nvidia_smi_sha256"]
+        or isinstance(h100_gate["checkpoint_ceiling_bytes"], bool)
+        or not isinstance(h100_gate["checkpoint_ceiling_bytes"], int)
+        or h100_gate["checkpoint_ceiling_bytes"]
+        != campaign_binding["checkpoint_ceiling_bytes"]
+        or not isinstance(h100_gate["gpu_model"], str)
+        or not 1 <= len(h100_gate["gpu_model"]) <= 256
+        or "H100" not in h100_gate["gpu_model"]
+        or any(
+            character in h100_gate["gpu_model"] for character in ("\x00", "\n", "\r")
+        )
+        or not isinstance(h100_gate["driver_version"], str)
+        or not 1 <= len(h100_gate["driver_version"]) <= 128
+        or any(
+            character in h100_gate["driver_version"]
+            for character in ("\x00", "\n", "\r")
+        )
+    ):
+        raise ValueError("H100 gate binding is malformed or differs from campaign")
+    runtime_tools = _exact(
+        payload["runtime_tools"], {"nvidia_smi_sha256"}, "runtime tools binding"
+    )
+    if runtime_tools["nvidia_smi_sha256"] != h100_gate["nvidia_smi_sha256"]:
+        raise ValueError("runtime tools nvidia-smi differs from H100 gate")
 
     initial_artifacts: dict[tuple[str, str], dict[str, Any]] = {}
     for pair in PAIR_ORDER:
@@ -1375,7 +1626,8 @@ def finalize(
             or completion_payload.get("transaction_id") != payload["transaction_id"]
             or completion_payload.get("submission_receipt_sha256") != receipt["sha256"]
             or completion_payload.get("transaction_ledger_sha256") != ledger["sha256"]
-            or completion_payload.get("source_commit_sha") != payload["source_commit_sha"]
+            or completion_payload.get("source_commit_sha")
+            != payload["source_commit_sha"]
             or completion_payload.get("source_tree_sha") != payload["source_tree_sha"]
             or completion_payload.get("repository_binding") != repository_binding
             or completion_payload.get("job_id") != job["job_id"]
@@ -1383,10 +1635,7 @@ def finalize(
             or completion_payload.get("arm") != job["arm"]
             or completion_payload.get("stage") != job["stage"]
             or completion_payload.get("seed") != payload["seed"]
-            or {
-                key: completion_scheduler[key]
-                for key in expected_scheduler_resources
-            }
+            or {key: completion_scheduler[key] for key in expected_scheduler_resources}
             != expected_scheduler_resources
             or any(
                 isinstance(completion_scheduler[key], bool)
@@ -1396,23 +1645,33 @@ def finalize(
             or not isinstance(completion_scheduler["query_sha256"], str)
             or HEX64.fullmatch(completion_scheduler["query_sha256"]) is None
             or not isinstance(completion_payload.get("cuda_visible_devices"), str)
-            or VISIBLE_DEVICE.fullmatch(
-                completion_payload["cuda_visible_devices"]
-            )
+            or VISIBLE_DEVICE.fullmatch(completion_payload["cuda_visible_devices"])
             is None
             or not isinstance(completion_payload.get("gpu_name"), str)
             or not 1 <= len(completion_payload["gpu_name"]) <= 256
             or "\n" in completion_payload["gpu_name"]
             or "\r" in completion_payload["gpu_name"]
             or "H100" not in completion_payload["gpu_name"]
+            or completion_payload["gpu_name"] != h100_gate["gpu_model"]
             or not isinstance(completion_payload.get("gpu_uuid"), str)
             or GPU_UUID.fullmatch(completion_payload["gpu_uuid"]) is None
-            or completion_payload.get("scheduler_stdout_path") != job["scheduler_stdout"]
-            or completion_payload.get("scheduler_stderr_path") != job["scheduler_stderr"]
+            or not isinstance(completion_payload.get("gpu_driver_version"), str)
+            or not 1 <= len(completion_payload["gpu_driver_version"]) <= 128
+            or any(
+                character in completion_payload["gpu_driver_version"]
+                for character in ("\x00", "\n", "\r")
+            )
+            or completion_payload["gpu_driver_version"] != h100_gate["driver_version"]
+            or completion_payload.get("scheduler_stdout_path")
+            != job["scheduler_stdout"]
+            or completion_payload.get("scheduler_stderr_path")
+            != job["scheduler_stderr"]
             or completion_payload.get("scheduler_log_ceiling_bytes")
             != payload["run_log_ceiling_bytes"]
             or completion_payload.get("manifest_ceiling_bytes")
             != payload["manifest_ceiling_bytes"]
+            or completion_payload.get("protocol_metadata_allowance_bytes")
+            != max_metadata_bytes
             or isinstance(observed_stdout_size, bool)
             or not isinstance(observed_stdout_size, int)
             or not 0 <= observed_stdout_size <= payload["run_log_ceiling_bytes"]
@@ -1444,8 +1703,10 @@ def finalize(
             "cuda_visible_devices": completion_payload["cuda_visible_devices"],
             "gpu_name": completion_payload["gpu_name"],
             "gpu_uuid": completion_payload["gpu_uuid"],
+            "gpu_driver_version": completion_payload["gpu_driver_version"],
             "repository_binding": dict(repository_binding),
             "manifest_ceiling_bytes": payload["manifest_ceiling_bytes"],
+            "protocol_metadata_allowance_bytes": max_metadata_bytes,
         }
 
     terminal, terminal_queries = _query_terminal_jobs(
@@ -1478,7 +1739,9 @@ def finalize(
             logs[0]["size"] < completion_record["stdout_observed_size"]
             or logs[1]["size"] < completion_record["stderr_observed_size"]
         ):
-            raise ValueError("terminal scheduler log was truncated after job completion")
+            raise ValueError(
+                "terminal scheduler log was truncated after job completion"
+            )
         final_jobs.append(
             {
                 "arm": job["arm"],
@@ -1488,9 +1751,7 @@ def finalize(
                 "job_name": job["job_name"],
                 "state": terminal[job["job_id"]]["state"],
                 "exit_code": terminal[job["job_id"]]["exit_code"],
-                "derived_exit_code": terminal[job["job_id"]][
-                    "derived_exit_code"
-                ],
+                "derived_exit_code": terminal[job["job_id"]]["derived_exit_code"],
                 "completion": completion_record,
                 "scheduler_logs": logs,
             }
@@ -1537,9 +1798,7 @@ def finalize(
         if completion_again != completion_envelopes[job["job_id"]]:
             raise ValueError("runtime completion changed before publication")
 
-    final_jobs_by_pair = {
-        (item["arm"], item["stage"]): item for item in final_jobs
-    }
+    final_jobs_by_pair = {(item["arm"], item["stage"]): item for item in final_jobs}
     for pair in PAIR_ORDER:
         relative_artifact = {
             **final_artifacts[pair],
@@ -1560,13 +1819,9 @@ def finalize(
             else {
                 **_relative_artifact_binding(
                     artifact_root,
-                    final_artifacts[(pair[0], STAGES[stage_index - 1])][
-                        "binding"
-                    ],
+                    final_artifacts[(pair[0], STAGES[stage_index - 1])]["binding"],
                 ),
-                "job_id": jobs_by_pair[(pair[0], STAGES[stage_index - 1])][
-                    "job_id"
-                ],
+                "job_id": jobs_by_pair[(pair[0], STAGES[stage_index - 1])]["job_id"],
                 "stage": STAGES[stage_index - 1],
             }
         )
@@ -1579,7 +1834,10 @@ def finalize(
         "source_commit_sha": payload["source_commit_sha"],
         "source_tree_sha": payload["source_tree_sha"],
         "repository_binding": dict(repository_binding),
+        "campaign_binding": campaign_binding,
+        "runtime_tools": dict(runtime_tools),
         "manifest_ceiling_bytes": payload["manifest_ceiling_bytes"],
+        "protocol_metadata_allowance_bytes": max_metadata_bytes,
         "sacct_sha256": scheduler["sacct_sha256"],
         "path_format": "artifact_root_relative_posix_v1",
         "terminal_verified": True,
@@ -1591,13 +1849,85 @@ def finalize(
         "kind": "formal_terminal_scheduler_logs",
         "payload": terminal_payload,
     }
-    attestation = {**body, "sha256": _sha256(body)}
+    return {**body, "sha256": _sha256(body)}
+
+
+def finalize(
+    *,
+    submission_receipt: Path,
+    transaction_ledger: Path,
+    artifact_root: Path,
+    max_metadata_bytes: int,
+) -> Mapping[str, Any]:
+    """Derive and write-once publish one terminal scheduler attestation."""
+
+    attestation = _derive_terminal_attestation(
+        submission_receipt=submission_receipt,
+        transaction_ledger=transaction_ledger,
+        artifact_root=artifact_root,
+        max_metadata_bytes=max_metadata_bytes,
+    )
     _publish_no_replace(
-        output,
+        artifact_root / "terminal-scheduler-logs.json",
         attestation,
         max_bytes=TERMINAL_LOG_ATTESTATION_CEILING_BYTES,
     )
     return attestation
+
+
+def validate_existing_terminal(
+    *,
+    terminal_attestation: Path,
+    submission_receipt: Path,
+    transaction_ledger: Path,
+    artifact_root: Path,
+    max_metadata_bytes: int,
+    expected_terminal_sha256: str | None = None,
+) -> Mapping[str, Any]:
+    """Rebuild and validate an already-published terminal attestation.
+
+    The terminal file is stably read both before and after all receipt, ledger,
+    commit, artifact, completion, scheduler-log, and live ``sacct`` checks.  It
+    is accepted only when both reads exactly equal the independently derived
+    attestation.  This function never publishes or mutates an artifact.
+    """
+
+    if (
+        not artifact_root.is_absolute()
+        or artifact_root.resolve(strict=True) != artifact_root
+    ):
+        raise ValueError("artifact root must be an absolute physical directory")
+    _require_physical_directory(artifact_root, where="artifact root")
+    expected_path = artifact_root / "terminal-scheduler-logs.json"
+    if terminal_attestation != expected_path:
+        raise ValueError("terminal attestation path is outside the formal namespace")
+    initial = _read_manifest(
+        terminal_attestation,
+        max_bytes=TERMINAL_LOG_ATTESTATION_CEILING_BYTES,
+        kind="formal_terminal_scheduler_logs",
+    )
+    if expected_terminal_sha256 is not None and (
+        not isinstance(expected_terminal_sha256, str)
+        or HEX64.fullmatch(expected_terminal_sha256) is None
+        or initial["sha256"] != expected_terminal_sha256
+    ):
+        raise ValueError("terminal attestation differs from its external digest")
+    derived = _derive_terminal_attestation(
+        submission_receipt=submission_receipt,
+        transaction_ledger=transaction_ledger,
+        artifact_root=artifact_root,
+        max_metadata_bytes=max_metadata_bytes,
+    )
+    final = _read_manifest(
+        terminal_attestation,
+        max_bytes=TERMINAL_LOG_ATTESTATION_CEILING_BYTES,
+        kind="formal_terminal_scheduler_logs",
+    )
+    if initial != derived or final != derived:
+        raise ValueError(
+            "existing terminal attestation differs from independently derived evidence"
+        )
+    return final
 
 
 def main(argv: list[str] | None = None) -> int:

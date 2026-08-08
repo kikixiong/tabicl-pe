@@ -26,7 +26,7 @@ _HEX_40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _MODES = frozenset({"100644", "100755"})
 _CODE_SUFFIXES = frozenset(
-    {".py", ".pyi", ".pyc", ".so", ".pyd", ".dylib", ".dll", ".pth"}
+    {".py", ".pyi", ".pyc", ".sh", ".so", ".pyd", ".dylib", ".dll", ".pth"}
 )
 
 
@@ -134,6 +134,7 @@ def _open_regular(path):
     flags = os.O_RDONLY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
+    flags |= getattr(os, "O_NONBLOCK", 0)
     parent = Path(os.path.sep, *parts[:-1])
     parent_fd = _open_directory_absolute(parent, "source path parent")
     try:
@@ -180,6 +181,7 @@ def _open_regular_beneath(root, relative):
     file_flags = os.O_RDONLY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         file_flags |= os.O_CLOEXEC
+    file_flags |= getattr(os, "O_NONBLOCK", 0)
 
     directory_fds = []
     try:
@@ -367,6 +369,27 @@ def verify_archive(root, manifest):
     return root
 
 
+def require_manifest_coverage(manifest, required_paths=(), required_code_roots=()):
+    """Require controller-selected runtime files and scan roots in a manifest."""
+
+    tracked = {entry["path"] for entry in manifest["payload"]["entries"]}
+    required = {
+        _relative(value, "required source path") for value in required_paths
+    }
+    missing = sorted(required - tracked)
+    if missing:
+        _fail(f"source manifest omits required runtime files: {missing}")
+    roots = set(manifest["payload"]["code_roots"])
+    expected_roots = {
+        _relative(value, "required source code root")
+        for value in required_code_roots
+    }
+    missing_roots = sorted(expected_roots - roots)
+    if missing_roots:
+        _fail(f"source manifest omits required code roots: {missing_roots}")
+    return manifest
+
+
 def validate_environment(root):
     expected_src = root / "src"
     raw_pythonpath = os.environ.get("PYTHONPATH")
@@ -459,6 +482,8 @@ def build_parser():
     parser.add_argument("--expected-manifest-sha256", required=True)
     parser.add_argument("--expected-commit-sha", required=True)
     parser.add_argument("--expected-tree-sha", required=True)
+    parser.add_argument("--required-path", action="append", default=[])
+    parser.add_argument("--required-code-root", action="append", default=[])
     parser.add_argument("--run-trainer", action="store_true")
     return parser
 
@@ -487,6 +512,11 @@ def main(argv=None):
         args.expected_manifest_sha256,
         args.expected_commit_sha,
         args.expected_tree_sha,
+    )
+    require_manifest_coverage(
+        manifest,
+        required_paths=args.required_path,
+        required_code_roots=args.required_code_root,
     )
     root = verify_archive(args.archive_root, manifest)
     expected_src = validate_environment(root)

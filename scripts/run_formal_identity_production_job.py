@@ -13,20 +13,25 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import time
 from typing import Any, Mapping
 
 
+SCHEDULER_QUERY_TIMEOUT_SECONDS = 30
 ARMS = ("rope", "temporary", "none")
 STAGES = {"1": ("stage1", 500_000), "2": ("stage2", 40_000), "3": ("stage3", 10_000)}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
 JOB_ID = re.compile(r"^[1-9][0-9]{0,19}$")
+SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SLURM_DURATION = re.compile(
     r"^(?:(?P<days>[1-9][0-9]{0,3})-)?"
     r"(?P<hours>[0-9]{2}):(?P<minutes>[0-5][0-9]):(?P<seconds>[0-5][0-9])$"
 )
 RUNTIME_COMPLETION_CEILING_BYTES = 65_536
 TERMINAL_LOG_ATTESTATION_CEILING_BYTES = 131_072
+FORMAL_METADATA_CEILING_BYTES = 128 << 20
 LEDGER_ENTRY_KEYS = {
     "arm",
     "stage",
@@ -49,6 +54,27 @@ LEDGER_ENTRY_KEYS = {
     "scientific_sha256",
     "cohort_protocol_sha256",
     "arm_protocol_sha256",
+}
+H100_GATE_KEYS = {
+    "attestation_sha256",
+    "checkpoint_ceiling_bytes",
+    "gpu_model",
+    "driver_version",
+    "nvidia_smi_sha256",
+}
+CAMPAIGN_BINDING_KEYS = {
+    "campaign_id",
+    "campaign_manifest_sha256",
+    "training_commit_sha",
+    "training_tree_sha",
+    "source_manifest_sha256",
+    "environment_sha256",
+    "h100_attestation_sha256",
+    "nvidia_smi_sha256",
+    "checkpoint_ceiling_bytes",
+    "static_protocol_sha256_by_stage",
+    "time_limit_by_stage",
+    "predecessor_acceptance_sha256_by_seed",
 }
 FINALIZED_PAYLOAD_KEYS = {
     "study_id",
@@ -196,6 +222,7 @@ def _open_stable_regular(
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(path, flags)
     except OSError as error:
@@ -344,6 +371,7 @@ def _scheduler_observation(job_id: str, expected_sha256: str) -> dict[str, Any]:
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            timeout=SCHEDULER_QUERY_TIMEOUT_SECONDS,
             pass_fds=(command_fd,),
         )
     finally:
@@ -515,7 +543,10 @@ def _validate_runtime(
     if mode not in ARMS or stage_index not in STAGES:
         raise ValueError("formal arm or stage is invalid")
     stage, terminal_step = STAGES[stage_index]
-    metadata_ceiling = _bounded_int("FORMAL_PROTOCOL_METADATA_ALLOWANCE_BYTES")
+    metadata_ceiling = _bounded_int(
+        "FORMAL_PROTOCOL_METADATA_ALLOWANCE_BYTES",
+        maximum=FORMAL_METADATA_CEILING_BYTES,
+    )
     receipt_path = Path(_required_env("FORMAL_SUBMISSION_RECEIPT"))
     ledger_path = Path(_required_env("FORMAL_TRANSACTION_LEDGER"))
     if not receipt_path.is_absolute() or not ledger_path.is_absolute():
@@ -539,9 +570,13 @@ def _validate_runtime(
             "source_commit_sha",
             "source_tree_sha",
             "repository_binding",
+            "h100_gate",
+            "campaign_binding",
+            "runtime_tools",
             "jobs_held_at_publication",
             "run_log_ceiling_bytes",
             "manifest_ceiling_bytes",
+            "protocol_metadata_allowance_bytes",
             "runtime_completion_ceiling_bytes",
             "terminal_log_attestation_path",
             "transaction_commit_path",
@@ -560,6 +595,7 @@ def _validate_runtime(
         or receipt_payload["source_commit_sha"]
         != _required_env("FORMAL_SOURCE_COMMIT_SHA")
         or receipt_payload["source_tree_sha"] != _required_env("FORMAL_SOURCE_TREE_SHA")
+        or receipt_payload["protocol_metadata_allowance_bytes"] != metadata_ceiling
         or receipt_payload["jobs_held_at_publication"] is not True
     ):
         raise ValueError("submission receipt binding mismatch")
@@ -583,6 +619,10 @@ def _validate_runtime(
             "transaction_id",
             "submission_receipt_sha256",
             "transaction_ledger_sha256",
+            "protocol_metadata_allowance_bytes",
+            "h100_gate",
+            "campaign_binding",
+            "runtime_tools",
             "job_ids",
         },
         "formal submission commit payload",
@@ -592,6 +632,11 @@ def _validate_runtime(
         or commit_payload["transaction_id"] != receipt_payload["transaction_id"]
         or commit_payload["submission_receipt_sha256"] != receipt["sha256"]
         or commit_payload["transaction_ledger_sha256"] != ledger["sha256"]
+        or commit_payload["protocol_metadata_allowance_bytes"] != metadata_ceiling
+        or commit_payload["h100_gate"] != receipt_payload["h100_gate"]
+        or commit_payload["campaign_binding"]
+        != receipt_payload["campaign_binding"]
+        or commit_payload["runtime_tools"] != receipt_payload["runtime_tools"]
         or commit_payload["job_ids"] != receipt_payload["job_ids"]
     ):
         raise ValueError("formal submission commit binding mismatch")
@@ -721,6 +766,7 @@ def _validate_runtime(
             "cluster",
             "job_name",
             "parent_job_id",
+            "sbatch_argv_sha256",
             "scheduler_stdout",
             "scheduler_stderr",
             "completion_path",
@@ -733,12 +779,130 @@ def _validate_runtime(
         or job["time_limit"]
         != _slurm_duration(_required_env("FORMAL_TIME_LIMIT"), "FORMAL_TIME_LIMIT")
         or job["job_name"] != job_name
+        or not isinstance(job["sbatch_argv_sha256"], str)
+        or HEX64.fullmatch(job["sbatch_argv_sha256"]) is None
         or job["scheduler_stdout"] != _required_env("FORMAL_SCHEDULER_STDOUT")
         or job["scheduler_stderr"] != _required_env("FORMAL_SCHEDULER_STDERR")
         or job["completion_path"] != _required_env("FORMAL_COMPLETION_EVIDENCE")
     ):
         raise ValueError("receipt job path or identity mismatch")
-    ledger_payload = _exact(ledger["payload"], {"study_id", "entries"}, "ledger payload")
+    ledger_payload = _exact(
+        ledger["payload"],
+        {
+            "study_id",
+            "protocol_metadata_allowance_bytes",
+            "entries",
+            "h100_gate",
+            "campaign_binding",
+            "runtime_tools",
+        },
+        "ledger payload",
+    )
+    h100_gate = _exact(
+        ledger_payload["h100_gate"], H100_GATE_KEYS, "ledger H100 gate"
+    )
+    campaign_binding = _exact(
+        ledger_payload["campaign_binding"],
+        CAMPAIGN_BINDING_KEYS,
+        "ledger campaign binding",
+    )
+    receipt_h100_gate = _exact(
+        receipt_payload["h100_gate"], H100_GATE_KEYS, "receipt H100 gate"
+    )
+    receipt_campaign_binding = _exact(
+        receipt_payload["campaign_binding"],
+        CAMPAIGN_BINDING_KEYS,
+        "receipt campaign binding",
+    )
+    runtime_tools = _exact(
+        ledger_payload["runtime_tools"],
+        {"nvidia_smi_sha256"},
+        "ledger runtime tools",
+    )
+    receipt_runtime_tools = _exact(
+        receipt_payload["runtime_tools"],
+        {"nvidia_smi_sha256"},
+        "receipt runtime tools",
+    )
+    selected_seed = int(_required_env("FORMAL_SEED"))
+    expected_predecessors = {
+        str(candidate) for candidate in (42, 43, 44) if candidate < selected_seed
+    }
+    predecessor_map = _exact(
+        campaign_binding["predecessor_acceptance_sha256_by_seed"],
+        expected_predecessors,
+        "campaign predecessor acceptances",
+    )
+    static_protocols = _exact(
+        campaign_binding["static_protocol_sha256_by_stage"],
+        {stage_name for stage_name, _terminal_step in STAGES.values()},
+        "campaign static protocols",
+    )
+    campaign_times = _exact(
+        campaign_binding["time_limit_by_stage"],
+        {stage_name for stage_name, _terminal_step in STAGES.values()},
+        "campaign time limits",
+    )
+    if (
+        h100_gate != receipt_h100_gate
+        or campaign_binding != receipt_campaign_binding
+        or runtime_tools != receipt_runtime_tools
+        or ledger_payload["protocol_metadata_allowance_bytes"] != metadata_ceiling
+        or ledger_payload["protocol_metadata_allowance_bytes"]
+        != receipt_payload["protocol_metadata_allowance_bytes"]
+        or runtime_tools["nvidia_smi_sha256"]
+        != _required_env("FORMAL_NVIDIA_SMI_SHA256")
+        or h100_gate["nvidia_smi_sha256"]
+        != runtime_tools["nvidia_smi_sha256"]
+        or campaign_binding["nvidia_smi_sha256"]
+        != runtime_tools["nvidia_smi_sha256"]
+        or HEX64.fullmatch(runtime_tools["nvidia_smi_sha256"]) is None
+        or not isinstance(h100_gate["attestation_sha256"], str)
+        or HEX64.fullmatch(h100_gate["attestation_sha256"]) is None
+        or h100_gate["attestation_sha256"]
+        != _required_env("FORMAL_H100_ATTESTATION_SHA256")
+        or h100_gate["gpu_model"] != _required_env("FORMAL_EXPECTED_GPU_MODEL")
+        or h100_gate["driver_version"]
+        != _required_env("FORMAL_EXPECTED_DRIVER_VERSION")
+        or not isinstance(h100_gate["gpu_model"], str)
+        or "H100" not in h100_gate["gpu_model"]
+        or not isinstance(h100_gate["driver_version"], str)
+        or not h100_gate["driver_version"]
+        or any(
+            character in h100_gate["driver_version"]
+            for character in ("\x00", "\n", "\r", ",")
+        )
+        or not isinstance(campaign_binding["campaign_manifest_sha256"], str)
+        or HEX64.fullmatch(campaign_binding["campaign_manifest_sha256"]) is None
+        or not isinstance(campaign_binding["campaign_id"], str)
+        or SAFE_ID.fullmatch(campaign_binding["campaign_id"]) is None
+        or receipt_payload["study_id"]
+        != f"{campaign_binding['campaign_id']}-seed{selected_seed}"
+        or not isinstance(campaign_binding["training_commit_sha"], str)
+        or HEX40.fullmatch(campaign_binding["training_commit_sha"]) is None
+        or not isinstance(campaign_binding["training_tree_sha"], str)
+        or HEX40.fullmatch(campaign_binding["training_tree_sha"]) is None
+        or campaign_binding["training_commit_sha"]
+        != _required_env("FORMAL_SOURCE_COMMIT_SHA")
+        or campaign_binding["training_tree_sha"]
+        != _required_env("FORMAL_SOURCE_TREE_SHA")
+        or campaign_binding["source_manifest_sha256"]
+        != _required_env("FORMAL_SOURCE_SHA256")
+        or campaign_binding["environment_sha256"]
+        != _required_env("FORMAL_ENVIRONMENT_SHA256")
+        or campaign_binding["h100_attestation_sha256"]
+        != h100_gate["attestation_sha256"]
+        or campaign_binding["checkpoint_ceiling_bytes"]
+        != h100_gate["checkpoint_ceiling_bytes"]
+        or campaign_times != normalized_time_limits
+        or _sha256(campaign_binding)
+        != _required_env("FORMAL_CAMPAIGN_BINDING_SHA256")
+        or any(
+            not isinstance(value, str) or HEX64.fullmatch(value) is None
+            for value in (*predecessor_map.values(), *static_protocols.values())
+        )
+    ):
+        raise ValueError("immutable H100 gate or campaign binding mismatch")
     matching_entries = [
         item
         for item in ledger_payload["entries"]
@@ -764,12 +928,26 @@ def _validate_runtime(
         or not isinstance(ledger_ceiling, int)
         or ledger_ceiling < 1
         or ledger_ceiling != checkpoint_ceiling
+        or h100_gate["checkpoint_ceiling_bytes"] != ledger_ceiling
+        or campaign_binding["checkpoint_ceiling_bytes"] != ledger_ceiling
     ):
         raise ValueError(
             "runtime checkpoint ceiling differs from the immutable ledger"
         )
+    if (
+        _required_env("FORMAL_ENVIRONMENT_SHA256")
+        != ledger_entry["environment_sha256"]
+    ):
+        raise ValueError("runtime environment digest differs from the immutable ledger")
     if Path(_required_env("TABICL_EXACT_ROOT")) != exact_root:
         raise ValueError("runtime exact root mismatch")
+    if (
+        _required_env("FORMAL_VISIBLE_GPU_NAME")
+        != _required_env("FORMAL_EXPECTED_GPU_MODEL")
+        or _required_env("FORMAL_VISIBLE_GPU_DRIVER_VERSION")
+        != _required_env("FORMAL_EXPECTED_DRIVER_VERSION")
+    ):
+        raise ValueError("runtime GPU model/driver differs from the H100 gate")
     return (
         receipt,
         job,
@@ -777,6 +955,32 @@ def _validate_runtime(
         ledger_entry,
         tuple(ledger_payload["entries"]),
     )
+
+
+def _verify_formal_environment(exact_root: Path) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(exact_root / "scripts" / "verify_formal_environment.py"),
+            "--exact-root",
+            str(exact_root),
+            "--expected-sha256",
+            _required_env("FORMAL_ENVIRONMENT_SHA256"),
+            "--expected-gpus",
+            "1",
+        ],
+        env=dict(os.environ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    if completed.returncode != 0 or completed.stdout:
+        raise ValueError("post-stage formal environment verification failed")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -799,6 +1003,7 @@ def main(argv: list[str] | None = None) -> int:
         stdin=subprocess.DEVNULL,
         check=False,
     )
+    _verify_formal_environment(exact_root)
     log_ceiling = _bounded_int("FORMAL_RUN_LOG_CEILING_BYTES")
     stdout_size = _observe_bounded_regular_size(
         Path(job["scheduler_stdout"]), log_ceiling
@@ -887,10 +1092,17 @@ def main(argv: list[str] | None = None) -> int:
         "cuda_visible_devices": _required_env("CUDA_VISIBLE_DEVICES"),
         "gpu_name": _required_env("FORMAL_VISIBLE_GPU_NAME"),
         "gpu_uuid": _required_env("FORMAL_VISIBLE_GPU_UUID"),
+        "gpu_driver_version": _required_env(
+            "FORMAL_VISIBLE_GPU_DRIVER_VERSION"
+        ),
         "scheduler_stdout_path": job["scheduler_stdout"],
         "scheduler_stderr_path": job["scheduler_stderr"],
         "scheduler_log_ceiling_bytes": log_ceiling,
         "manifest_ceiling_bytes": manifest_ceiling,
+        "protocol_metadata_allowance_bytes": _bounded_int(
+            "FORMAL_PROTOCOL_METADATA_ALLOWANCE_BYTES",
+            maximum=FORMAL_METADATA_CEILING_BYTES,
+        ),
         "scheduler_stdout_observed_size_at_completion": stdout_size,
         "scheduler_stderr_observed_size_at_completion": stderr_size,
         "scheduler_logs_terminal_verified": False,

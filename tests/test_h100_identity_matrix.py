@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -43,6 +44,38 @@ def _repository_binding(matrix, *, commit: str = "1" * 40, git_sha256: str = "9"
 @pytest.fixture(scope="module")
 def matrix():
     return _load("h100_identity_matrix", MATRIX_SCRIPT)
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    ("_read_regular_bytes", "_hash_regular_file", "scheduler_sacct"),
+)
+def test_fifo_artifact_and_sacct_inputs_are_rejected_without_blocking(
+    tmp_path, function_name
+):
+    fifo = tmp_path / ("sacct" if function_name == "scheduler_sacct" else "artifact")
+    os.mkfifo(fifo, stat.S_IRUSR | stat.S_IWUSR)
+    code = (
+        "import importlib.util, pathlib, sys\n"
+        "spec=importlib.util.spec_from_file_location('fifo_h100_matrix', sys.argv[1])\n"
+        "module=importlib.util.module_from_spec(spec)\n"
+        "sys.modules[spec.name]=module\n"
+        "spec.loader.exec_module(module)\n"
+        "path=pathlib.Path(sys.argv[2])\n"
+        "if sys.argv[3] == 'scheduler_sacct':\n"
+        "    module._open_trusted_scheduler_executable(path, '0' * 64)\n"
+        "else:\n"
+        "    getattr(module, sys.argv[3])(path, max_bytes=1024)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code, str(MATRIX_SCRIPT), str(fifo), function_name],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert completed.returncode != 0
+    assert "regular" in completed.stderr
 
 
 def test_canonical_matrix_is_exactly_twelve_cases_with_frozen_composition(matrix):
@@ -210,9 +243,30 @@ def _case_evidence(
             "python_no_user_site": "1",
         }
     )
+    formal_runtime = [
+        {
+            "name": name,
+            "version": "1.0",
+            "metadata_sha256": "a" * 64,
+            "record_sha256": "b" * 64,
+            "wheel_sha256": "c" * 64,
+            "module": matrix._FORMAL_RUNTIME_MODULES[name],
+            "module_version": "1.0",
+            "module_origin_relative_path": f"{name}/__init__.py",
+            "module_origin_sha256": "f" * 64,
+            "record_verified_file_count": 1,
+            "record_verified_total_bytes": 1,
+            "record_verified_files_sha256": "9" * 64,
+            "record_pyc_mismatch_count": 0,
+        }
+        for name in matrix._FORMAL_RUNTIME_DISTRIBUTIONS
+    ]
     environment_payload = {
         "python_version": "3.11.0",
         "python_implementation": "CPython",
+        "python_executable_sha256": "e" * 64,
+        "python_cache_tag": "cpython-311",
+        "python_soabi": "cpython-311-x86_64-linux-gnu",
         "platform_system": "Linux",
         "platform_release": "test",
         "platform_machine": "x86_64",
@@ -220,6 +274,12 @@ def _case_evidence(
         "numpy_version": "2.0.0",
         "cuda_runtime_version": "12.8",
         "cudnn_version": 9000,
+        "environment_fingerprint_schema_version": 2,
+        "installed_distributions_sha256": "d" * 64,
+        "formal_runtime_distributions": formal_runtime,
+        "unavailable_formal_runtime_distributions": [],
+        "flash_attn3_available": True,
+        "nccl_version": [2, 27, 5],
         "visible_cuda_device_count": case.world_size,
     }
     environment = envelope("environment", environment_payload)
@@ -291,6 +351,7 @@ def _case_evidence(
             "world_size": case.world_size,
             "environment": environment,
             "gpu_devices": devices,
+            "nvidia_smi_sha256": "9" * 64,
             "scheduler_binding": scheduler_binding,
         }
     )
@@ -485,6 +546,7 @@ def _attestation(matrix):
         "environment_sha256": cases[0]["runtime_evidence"]["payload"]["environment"]["sha256"],
         "source_manifest_sha256": "4" * 64,
         "repository_binding": _repository_binding(matrix, commit=commit),
+        "nvidia_smi_sha256": "9" * 64,
         "gpu_model": "NVIDIA H100 80GB HBM3",
         "driver_version": "570.00",
         "checkpoint_ceiling_bytes": 1_000,
@@ -534,6 +596,123 @@ def test_runtime_evidence_is_bound_to_receipt_job_cluster_and_resource(matrix):
                 source_manifest_sha256="4" * 64,
                 expected_job_binding=wrong,
             )
+
+
+@pytest.mark.parametrize(
+    "mutation,error",
+    [
+        (lambda payload: payload.update(formal_runtime_distributions=[]), "inventory is incomplete"),
+        (
+            lambda payload: payload.update(
+                environment_fingerprint_schema_version=True
+            ),
+            "schema is unsupported",
+        ),
+        (
+            lambda payload: payload.update(
+                unavailable_formal_runtime_distributions=["wandb"]
+            ),
+            "inventory is incomplete",
+        ),
+        (
+            lambda payload: payload["formal_runtime_distributions"][0].update(
+                name="bad-name"
+            ),
+            "name is malformed",
+        ),
+        (
+            lambda payload: payload["formal_runtime_distributions"][0].update(
+                version="../2.0"
+            ),
+            "version is malformed",
+        ),
+        (
+            lambda payload: payload["formal_runtime_distributions"][0].update(
+                module_origin_relative_path="../outside.py"
+            ),
+            "module origin is malformed",
+        ),
+        (
+            lambda payload: payload["formal_runtime_distributions"][0].update(
+                record_verified_file_count=0
+            ),
+            "RECORD count is malformed",
+        ),
+        (
+            lambda payload: payload["formal_runtime_distributions"][0].update(
+                record_pyc_mismatch_count=2
+            ),
+            "pyc mismatch count is malformed",
+        ),
+        (lambda payload: payload.update(flash_attn3_available=False), "backend is unavailable"),
+        (lambda payload: payload.update(nccl_version=[]), "NCCL version is malformed"),
+    ],
+)
+def test_runtime_evidence_rejects_malformed_distribution_inventory(
+    matrix, mutation, error
+):
+    case = matrix.build_matrix()[0]
+    runtime = copy.deepcopy(_case_evidence(case, matrix)["runtime_evidence"])
+    environment = runtime["payload"]["environment"]
+    mutation(environment["payload"])
+    environment_body = {
+        key: environment[key] for key in ("schema_version", "kind", "payload")
+    }
+    environment["sha256"] = hashlib.sha256(
+        matrix._canonical(environment_body)
+    ).hexdigest()
+    runtime_body = {
+        key: runtime[key] for key in ("schema_version", "kind", "payload")
+    }
+    runtime["sha256"] = hashlib.sha256(matrix._canonical(runtime_body)).hexdigest()
+
+    with pytest.raises(ValueError, match=error):
+        matrix.validate_runtime_evidence(
+            runtime,
+            case=case,
+            commit_sha="1" * 40,
+            tree_sha="2" * 40,
+            source_manifest_sha256="4" * 64,
+        )
+
+
+def test_formal_runtime_distribution_contract_is_literal(matrix):
+    expected = (
+        "einops",
+        "flash-attn-3",
+        "huggingface-hub",
+        "numpy",
+        "psutil",
+        "scikit-learn",
+        "scipy",
+        "threadpoolctl",
+        "torch",
+        "tqdm",
+        "transformers",
+        "wandb",
+        "xgboost",
+    )
+    expected_modules = {
+        "einops": "einops",
+        "flash-attn-3": "flash_attn_interface",
+        "huggingface-hub": "huggingface_hub",
+        "numpy": "numpy",
+        "psutil": "psutil",
+        "scikit-learn": "sklearn",
+        "scipy": "scipy",
+        "threadpoolctl": "threadpoolctl",
+        "torch": "torch",
+        "tqdm": "tqdm",
+        "transformers": "transformers",
+        "wandb": "wandb",
+        "xgboost": "xgboost",
+    }
+    from tabicl.train import _provenance as provenance
+
+    assert matrix._FORMAL_RUNTIME_DISTRIBUTIONS == expected
+    assert provenance._FORMAL_RUNTIME_DISTRIBUTIONS == expected
+    assert matrix._FORMAL_RUNTIME_MODULES == expected_modules
+    assert provenance._FORMAL_RUNTIME_MODULES == expected_modules
 
 
 @pytest.mark.parametrize(
@@ -641,6 +820,7 @@ def _install_runtime_scheduler_fixture(
             "squeue": "c" * 64,
             "sacct": "d" * 64,
         },
+        "nvidia_smi_sha256": "9" * 64,
         "cases": planned_cases,
     }
     body = {"schema_version": 1, "kind": "h100_gate_held_plan", "payload": payload}
@@ -944,6 +1124,7 @@ def _assemble(
         expected_scheduler_log_ceiling_bytes=1_000,
         expected_final_attestation_ceiling_bytes=final_ceiling,
         expected_submission_receipt_sha256="5" * 64,
+        expected_nvidia_smi_sha256="9" * 64,
         sacct_path=sacct,
         expected_sacct_sha256=hashlib.sha256(sacct.read_bytes()).hexdigest(),
         max_input_bytes=1 << 20,
@@ -1488,6 +1669,29 @@ def test_gpu_recorder_waits_for_harness_active_signal_and_keeps_every_sample(
     assert [record.kind for record in records].count("sample") == 10
     assert records[0].kind == "training_start"
     assert records[-1].kind == "training_end"
+
+
+def test_gpu_recorder_query_timeout_fails_closed(tmp_path, monkeypatch):
+    summary = _load("formal_gpu_summary_query_timeout", SUMMARY_SCRIPT)
+    monkeypatch.setenv("NVIDIA_SMI", sys.executable)
+    monkeypatch.setenv("FORMAL_VISIBLE_GPU_TOKENS", "0")
+
+    def query(argv, **kwargs):
+        assert kwargs["timeout"] == summary.QUERY_TIMEOUT_SECONDS
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        summary.record_gpu_window(
+            tmp_path / "gpu.csv",
+            tmp_path / "gpu.jsonl",
+            ready_path=tmp_path / "ready",
+            stop_path=tmp_path / "stop",
+            active_start_path=tmp_path / "start",
+            active_end_path=tmp_path / "end",
+            max_bytes=1 << 20,
+            expected_gpu_count=1,
+            query_fn=query,
+        )
 
 
 def test_strict_attestation_loader_rejects_symlink_duplicate_and_oversize(

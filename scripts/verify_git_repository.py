@@ -139,7 +139,12 @@ def _trusted_git_fd(path: Path, expected_sha256: str) -> int:
     if not isinstance(expected_sha256, str) or HEX64.fullmatch(expected_sha256) is None:
         raise ValueError("Git executable SHA-256 is malformed")
     parent_fd = _open_directory_nofollow(path.parent, where="Git executable parent")
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         fd = os.open(path.name, flags, dir_fd=parent_fd)
     except OSError as error:

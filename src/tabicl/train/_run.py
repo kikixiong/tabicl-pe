@@ -614,7 +614,7 @@ class Trainer:
             expected_commit_sha=self.config.formal_source_commit_sha,
             expected_tree_sha=self.config.formal_source_tree_sha,
         )
-        environment = runtime_environment_manifest()
+        environment = runtime_environment_manifest(require_formal_runtime=True)
         if environment["sha256"] != self.config.formal_environment_sha256:
             raise ValueError("environment does not match external expected sha256")
         parent = self._formal_parent_manifest()

@@ -15,7 +15,7 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
@@ -25,6 +25,8 @@ import time
 from typing import Any, Mapping, Sequence
 
 
+NVIDIA_QUERY_TIMEOUT_SECONDS = 15
+SCHEDULER_QUERY_TIMEOUT_SECONDS = 30
 ARMS = ("rope", "temporary", "none")
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -32,6 +34,9 @@ _SAFE_VALIDATION_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
 _RUNTIME_ENVIRONMENT_KEYS = {
     "python_version",
     "python_implementation",
+    "python_executable_sha256",
+    "python_cache_tag",
+    "python_soabi",
     "platform_system",
     "platform_release",
     "platform_machine",
@@ -39,7 +44,45 @@ _RUNTIME_ENVIRONMENT_KEYS = {
     "numpy_version",
     "cuda_runtime_version",
     "cudnn_version",
+    "environment_fingerprint_schema_version",
+    "installed_distributions_sha256",
+    "formal_runtime_distributions",
+    "unavailable_formal_runtime_distributions",
+    "flash_attn3_available",
+    "nccl_version",
     "visible_cuda_device_count",
+}
+_DISTRIBUTION_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_DISTRIBUTION_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.!+_-]{0,255}$")
+_FORMAL_RUNTIME_DISTRIBUTIONS = (
+    "einops",
+    "flash-attn-3",
+    "huggingface-hub",
+    "numpy",
+    "psutil",
+    "scikit-learn",
+    "scipy",
+    "threadpoolctl",
+    "torch",
+    "tqdm",
+    "transformers",
+    "wandb",
+    "xgboost",
+)
+_FORMAL_RUNTIME_MODULES = {
+    "einops": "einops",
+    "flash-attn-3": "flash_attn_interface",
+    "huggingface-hub": "huggingface_hub",
+    "numpy": "numpy",
+    "psutil": "psutil",
+    "scikit-learn": "sklearn",
+    "scipy": "scipy",
+    "threadpoolctl": "threadpoolctl",
+    "torch": "torch",
+    "tqdm": "tqdm",
+    "transformers": "transformers",
+    "wandb": "wandb",
+    "xgboost": "xgboost",
 }
 
 
@@ -613,6 +656,7 @@ def make_runtime_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def _query_visible_gpu_devices() -> list[dict[str, str]]:
     executable = os.environ.get("NVIDIA_SMI")
+    raw_fd = os.environ.get("FORMAL_NVIDIA_SMI_FD")
     if (
         not executable
         or not os.path.isabs(executable)
@@ -620,6 +664,17 @@ def _query_visible_gpu_devices() -> list[dict[str, str]]:
         or not os.access(executable, os.X_OK)
     ):
         raise RuntimeError("NVIDIA_SMI must be an absolute executable")
+    if (
+        raw_fd is None
+        or not raw_fd.isdecimal()
+        or executable != f"/proc/self/fd/{raw_fd}"
+    ):
+        raise RuntimeError("NVIDIA_SMI must use its verified open descriptor")
+    nvidia_fd = int(raw_fd)
+    _digest(
+        os.environ.get("FORMAL_NVIDIA_SMI_SHA256"),
+        "runtime nvidia-smi executable",
+    )
     raw_tokens = os.environ.get("FORMAL_VISIBLE_GPU_TOKENS", "")
     tokens = raw_tokens.split(",") if raw_tokens else []
     if not tokens or any(
@@ -630,17 +685,24 @@ def _query_visible_gpu_devices() -> list[dict[str, str]]:
         raise RuntimeError("runtime evidence lacks valid CUDA-visible GPU tokens")
     devices: list[dict[str, str]] = []
     for token in tokens:
-        result = subprocess.run(
-            [
-                executable,
-                f"--id={token}",
-                "--query-gpu=uuid,name,driver_version",
-                "--format=csv,noheader,nounits",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    executable,
+                    f"--id={token}",
+                    "--query-gpu=uuid,name,driver_version",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=NVIDIA_QUERY_TIMEOUT_SECONDS,
+                pass_fds=(nvidia_fd,),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                "CUDA-visible nvidia-smi runtime evidence query timed out"
+            ) from error
         rows = [line for line in result.stdout.splitlines() if line.strip()]
         if result.returncode != 0 or len(rows) != 1:
             raise RuntimeError("CUDA-visible nvidia-smi runtime evidence query failed")
@@ -875,6 +937,7 @@ def _capture_scontrol_allocation(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=SCHEDULER_QUERY_TIMEOUT_SECONDS,
             pass_fds=(fd,),
         )
         _revalidate_trusted_scheduler_executable(
@@ -1060,7 +1123,7 @@ def capture_runtime_evidence(
     case = cases.get(case_id)
     if case is None:
         raise ValueError("unknown runtime-evidence case")
-    environment = runtime_environment_manifest()
+    environment = runtime_environment_manifest(require_formal_runtime=True)
     devices = _query_visible_gpu_devices()
     if environment["payload"]["visible_cuda_device_count"] != case.world_size:
         raise RuntimeError("PyTorch visible CUDA count does not match case world size")
@@ -1082,6 +1145,10 @@ def capture_runtime_evidence(
             "world_size": case.world_size,
             "environment": environment,
             "gpu_devices": devices,
+            "nvidia_smi_sha256": _digest(
+                os.environ.get("FORMAL_NVIDIA_SMI_SHA256"),
+                "runtime nvidia-smi executable",
+            ),
             "scheduler_binding": scheduler_binding,
         }
     )
@@ -1108,6 +1175,7 @@ def validate_runtime_evidence(
     tree_sha: str,
     source_manifest_sha256: str,
     expected_job_binding: Mapping[str, Any] | None = None,
+    expected_nvidia_smi_sha256: str | None = None,
 ) -> str:
     actual = _validate_manifest_envelope(
         value, expected_kind="h100_runtime_evidence", where="runtime evidence"
@@ -1123,6 +1191,7 @@ def validate_runtime_evidence(
             "world_size",
             "environment",
             "gpu_devices",
+            "nvidia_smi_sha256",
             "scheduler_binding",
         },
         "runtime evidence payload",
@@ -1136,6 +1205,11 @@ def validate_runtime_evidence(
     }
     if any(payload[key] != expected[key] for key in expected):
         raise ValueError("runtime evidence is not bound to exact case/source")
+    _digest(payload["nvidia_smi_sha256"], "runtime nvidia-smi executable")
+    if expected_nvidia_smi_sha256 is not None and payload[
+        "nvidia_smi_sha256"
+    ] != _digest(expected_nvidia_smi_sha256, "expected runtime nvidia-smi"):
+        raise ValueError("runtime nvidia-smi digest mismatch")
     environment = payload["environment"]
     _validate_manifest_envelope(
         environment, expected_kind="environment", where="runtime environment"
@@ -1143,6 +1217,152 @@ def validate_runtime_evidence(
     _exact_keys(
         environment["payload"], _RUNTIME_ENVIRONMENT_KEYS, "runtime environment payload"
     )
+    environment_payload = environment["payload"]
+    _digest(
+        environment_payload["python_executable_sha256"],
+        "runtime Python executable",
+    )
+    for field in ("python_cache_tag", "python_soabi"):
+        if (
+            not isinstance(environment_payload[field], str)
+            or not environment_payload[field]
+            or any(ord(character) < 33 for character in environment_payload[field])
+        ):
+            raise ValueError(f"runtime {field} is malformed")
+    fingerprint_schema = environment_payload[
+        "environment_fingerprint_schema_version"
+    ]
+    if (
+        isinstance(fingerprint_schema, bool)
+        or not isinstance(fingerprint_schema, int)
+        or fingerprint_schema != 2
+    ):
+        raise ValueError("runtime environment fingerprint schema is unsupported")
+    _digest(
+        environment_payload["installed_distributions_sha256"],
+        "runtime installed-distribution inventory",
+    )
+    if environment_payload["unavailable_formal_runtime_distributions"] != []:
+        raise ValueError("runtime formal-distribution inventory is incomplete")
+    if environment_payload["flash_attn3_available"] is not True:
+        raise ValueError("runtime FlashAttention 3 backend is unavailable")
+    nccl_version = environment_payload["nccl_version"]
+    if (
+        not isinstance(nccl_version, list)
+        or not nccl_version
+        or any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+            for item in nccl_version
+        )
+    ):
+        raise ValueError("runtime NCCL version is malformed")
+    installed = environment_payload["formal_runtime_distributions"]
+    if not isinstance(installed, list) or len(installed) != len(
+        _FORMAL_RUNTIME_DISTRIBUTIONS
+    ):
+        raise ValueError("runtime formal-distribution inventory is incomplete")
+    for expected_name, entry in zip(_FORMAL_RUNTIME_DISTRIBUTIONS, installed):
+        _exact_keys(
+            entry,
+            {
+                "name",
+                "version",
+                "metadata_sha256",
+                "record_sha256",
+                "wheel_sha256",
+                "module",
+                "module_version",
+                "module_origin_relative_path",
+                "module_origin_sha256",
+                "record_verified_file_count",
+                "record_verified_total_bytes",
+                "record_verified_files_sha256",
+                "record_pyc_mismatch_count",
+            },
+            "runtime formal distribution",
+        )
+        name, version = entry["name"], entry["version"]
+        if name != expected_name or _DISTRIBUTION_NAME.fullmatch(name) is None:
+            raise ValueError("runtime formal-distribution name is malformed")
+        if (
+            not isinstance(version, str)
+            or _DISTRIBUTION_VERSION.fullmatch(version) is None
+        ):
+            raise ValueError("runtime formal-distribution version is malformed")
+        if entry["module"] != _FORMAL_RUNTIME_MODULES[expected_name]:
+            raise ValueError("runtime formal-distribution module is malformed")
+        origin = entry["module_origin_relative_path"]
+        if (
+            not isinstance(origin, str)
+            or not origin
+            or PurePosixPath(origin).is_absolute()
+            or any(part in {"", ".", ".."} for part in PurePosixPath(origin).parts)
+            or PurePosixPath(origin).as_posix() != origin
+        ):
+            raise ValueError("runtime formal-distribution module origin is malformed")
+        _digest(
+            entry["module_origin_sha256"],
+            "runtime formal-distribution module origin",
+        )
+        verified_count = entry["record_verified_file_count"]
+        verified_bytes = entry["record_verified_total_bytes"]
+        mismatch_count = entry["record_pyc_mismatch_count"]
+        if (
+            isinstance(verified_count, bool)
+            or not isinstance(verified_count, int)
+            or not 1 <= verified_count <= 100_000
+        ):
+            raise ValueError("runtime formal-distribution RECORD count is malformed")
+        if (
+            isinstance(verified_bytes, bool)
+            or not isinstance(verified_bytes, int)
+            or not 0 <= verified_bytes <= (64 << 30)
+        ):
+            raise ValueError("runtime formal-distribution RECORD bytes are malformed")
+        if (
+            isinstance(mismatch_count, bool)
+            or not isinstance(mismatch_count, int)
+            or not 0 <= mismatch_count <= verified_count
+        ):
+            raise ValueError(
+                "runtime formal-distribution RECORD pyc mismatch count is malformed"
+            )
+        _digest(
+            entry["record_verified_files_sha256"],
+            "runtime formal-distribution verified RECORD files",
+        )
+        module_version = entry["module_version"]
+        if module_version is not None and (
+            not isinstance(module_version, str)
+            or _DISTRIBUTION_VERSION.fullmatch(module_version) is None
+        ):
+            raise ValueError("runtime formal-distribution module version is malformed")
+        for field in ("metadata_sha256", "record_sha256", "wheel_sha256"):
+            _digest(entry[field], f"runtime formal-distribution {field}")
+    for field in (
+        "python_version",
+        "python_implementation",
+        "platform_system",
+        "platform_release",
+        "platform_machine",
+        "torch_version",
+        "numpy_version",
+        "cuda_runtime_version",
+    ):
+        value = environment_payload[field]
+        if (
+            not isinstance(value, str)
+            or not value
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError(f"runtime environment {field} is malformed")
+    cudnn_version = environment_payload["cudnn_version"]
+    if (
+        isinstance(cudnn_version, bool)
+        or not isinstance(cudnn_version, int)
+        or cudnn_version < 1
+    ):
+        raise ValueError("runtime environment cuDNN version is malformed")
     visible_count = environment["payload"]["visible_cuda_device_count"]
     if (
         isinstance(visible_count, bool)
@@ -1470,6 +1690,7 @@ def validate_smoke_attestation(
     expected_git_sha256: str | None = None,
     expected_repository_identity_sha256: str | None = None,
     expected_repository_query_sha256: str | None = None,
+    expected_nvidia_smi_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Validate integrity against trust inputs held outside this payload."""
     _exact_keys(
@@ -1495,6 +1716,7 @@ def validate_smoke_attestation(
             "environment_sha256",
             "source_manifest_sha256",
             "repository_binding",
+            "nvidia_smi_sha256",
             "gpu_model",
             "driver_version",
             "checkpoint_ceiling_bytes",
@@ -1522,6 +1744,13 @@ def validate_smoke_attestation(
         payload["repository_binding"],
         expected_commit_sha=expected_commit_sha,
     )
+    nvidia_smi_sha256 = _digest(
+        payload["nvidia_smi_sha256"], "smoke nvidia-smi executable"
+    )
+    if expected_nvidia_smi_sha256 is not None and nvidia_smi_sha256 != _digest(
+        expected_nvidia_smi_sha256, "expected smoke nvidia-smi executable"
+    ):
+        raise ValueError("smoke nvidia-smi binding mismatch")
     for key, external, label in (
         ("git_sha256", expected_git_sha256, "Git executable"),
         (
@@ -1682,6 +1911,7 @@ def validate_smoke_attestation(
             commit_sha=expected_commit_sha,
             tree_sha=expected_tree_sha,
             source_manifest_sha256=payload["source_manifest_sha256"],
+            expected_nvidia_smi_sha256=nvidia_smi_sha256,
         )
         scheduler_binding = item["runtime_evidence"]["payload"]["scheduler_binding"]
         terminal_observation = terminal_by_case.get(case_id)
@@ -1847,6 +2077,9 @@ def validate_smoke_attestation(
         "valid": True,
         "sha256": actual,
         "case_count": len(evidence_by_id),
+        "gpu_model": payload["gpu_model"],
+        "driver_version": payload["driver_version"],
+        "nvidia_smi_sha256": nvidia_smi_sha256,
     }
 
 
@@ -1889,6 +2122,7 @@ def _open_trusted_scheduler_executable(
         )
     parent_fd = _open_directory_nofollow(path.parent)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(path.name, flags, dir_fd=parent_fd)
     except OSError as error:
@@ -2029,6 +2263,7 @@ def capture_scheduler_terminal_manifest(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                timeout=SCHEDULER_QUERY_TIMEOUT_SECONDS,
                 pass_fds=(fd,),
             )
             stdout = completed.stdout
@@ -2111,6 +2346,7 @@ def _read_regular_bytes(path: Path, *, max_bytes: int) -> bytes:
     candidate = Path(os.path.abspath(candidate))
     parent_fd = _open_directory_nofollow(candidate.parent)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(candidate.name, flags, dir_fd=parent_fd)
     except OSError as error:
@@ -2148,6 +2384,7 @@ def _hash_regular_file(path: Path, *, max_bytes: int) -> tuple[str, int]:
     candidate = Path(os.path.abspath(candidate))
     parent_fd = _open_directory_nofollow(candidate.parent)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(candidate.name, flags, dir_fd=parent_fd)
     except OSError as error:
@@ -2237,11 +2474,13 @@ def validate_gate_submission_receipt(
             "source_manifest_sha256",
             "repository_binding",
             "environment_sha256_by_world_size",
+            "environment_transaction",
             "checkpoint_ceiling_bytes",
             "limits",
             "capacity",
             "scheduler",
             "scheduler_command_sha256",
+            "nvidia_smi_sha256",
             "jobs_held_at_publication",
             "all_jobs_released",
             "held_plan_sha256",
@@ -2268,6 +2507,9 @@ def validate_gate_submission_receipt(
     repository_binding = _validated_repository_binding(
         payload["repository_binding"],
         expected_commit_sha=expected_commit_sha,
+    )
+    nvidia_smi_sha256 = _digest(
+        payload["nvidia_smi_sha256"], "submission receipt nvidia-smi"
     )
     if payload["checkpoint_ceiling_bytes"] != expected_checkpoint_ceiling_bytes:
         raise ValueError("submission receipt checkpoint ceiling mismatch")
@@ -2355,6 +2597,13 @@ def validate_gate_submission_receipt(
     }
     if environments["1"] == environments["2"]:
         raise ValueError("one- and two-GPU expected environment digests must differ")
+    environment_transaction = _validated_environment_transaction_summary(
+        payload["environment_transaction"],
+        expected_commit_sha=expected_commit_sha,
+        expected_tree_sha=expected_tree_sha,
+        expected_git_sha256=repository_binding["git_sha256"],
+        expected_environments=environments,
+    )
 
     limits = payload["limits"]
     _exact_keys(
@@ -2559,9 +2808,11 @@ def validate_gate_submission_receipt(
         "artifact_identities": identities,
         "job_bindings": job_bindings,
         "environment_sha256_by_world_size": environments,
+        "environment_transaction": environment_transaction,
         "scheduler_log_ceiling_bytes": limits["scheduler_log_ceiling_bytes"],
         "final_attestation_ceiling_bytes": limits["attestation_ceiling_bytes"],
         "sacct_sha256": scheduler_digests["sacct"],
+        "nvidia_smi_sha256": nvidia_smi_sha256,
     }
 
 
@@ -2597,6 +2848,77 @@ def _validated_repository_binding(
         expected_commit_sha=expected_commit_sha,
         expected_git_sha256=git_sha256,
     )
+
+
+def _validated_environment_transaction_summary(
+    value: Mapping[str, Any] | Any,
+    *,
+    expected_commit_sha: str,
+    expected_tree_sha: str,
+    expected_git_sha256: str,
+    expected_environments: Mapping[str, str],
+) -> dict[str, Any]:
+    """Validate the path-free exact-T environment publication proof."""
+
+    _exact_keys(
+        value,
+        {
+            "schema_version",
+            "kind",
+            "completion_raw_sha256",
+            "transaction_sha256",
+            "source_commit_sha",
+            "source_tree_sha",
+            "git_sha256",
+            "one_gpu_environment_sha256",
+            "two_gpu_environment_sha256",
+            "inventory_sha256",
+            "installed_distributions_sha256",
+            "capture_visible_cuda_device_count",
+            "output_raw_sha256_by_role",
+        },
+        "environment transaction verification summary",
+    )
+    if (
+        value["schema_version"] != 1
+        or value["kind"] != "formal_environment_transaction_verification"
+        or value["source_commit_sha"] != expected_commit_sha
+        or value["source_tree_sha"] != expected_tree_sha
+        or value["git_sha256"] != _digest(
+            expected_git_sha256, "expected environment transaction Git"
+        )
+        or value["one_gpu_environment_sha256"] != expected_environments["1"]
+        or value["two_gpu_environment_sha256"] != expected_environments["2"]
+    ):
+        raise ValueError("environment transaction verification binding mismatch")
+    for key in (
+        "completion_raw_sha256",
+        "transaction_sha256",
+        "one_gpu_environment_sha256",
+        "two_gpu_environment_sha256",
+        "inventory_sha256",
+        "installed_distributions_sha256",
+    ):
+        _digest(value[key], f"environment transaction {key}")
+    capture_count = value["capture_visible_cuda_device_count"]
+    if (
+        isinstance(capture_count, bool)
+        or not isinstance(capture_count, int)
+        or capture_count < 0
+    ):
+        raise ValueError("environment transaction capture GPU count is invalid")
+    output_digests = value["output_raw_sha256_by_role"]
+    _exact_keys(
+        output_digests,
+        {"one_gpu", "two_gpu", "inventory"},
+        "environment transaction raw-output map",
+    )
+    for role, digest in output_digests.items():
+        _digest(digest, f"environment transaction {role} raw output")
+    return {
+        **dict(value),
+        "output_raw_sha256_by_role": dict(output_digests),
+    }
 
 
 def _artifact_file(name: str, raw: bytes) -> dict[str, Any]:
@@ -2774,6 +3096,7 @@ def assemble_smoke_attestation(
     expected_environment_sha256_by_world_size: Mapping[str, str] | None = None,
     expected_job_bindings: Mapping[str, Mapping[str, Any]] | None = None,
     expected_repository_binding: Mapping[str, Any] | None = None,
+    expected_nvidia_smi_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Validate all raw case artifacts and no-replace publish one attestation."""
     if _HEX40.fullmatch(expected_commit_sha or "") is None:
@@ -2928,6 +3251,7 @@ def assemble_smoke_attestation(
                 if expected_job_bindings is not None
                 else None
             ),
+            expected_nvidia_smi_sha256=expected_nvidia_smi_sha256,
         )
         completion = _strict_json(
             read("action-completion.json", case_root / "action-completion.json"),
@@ -3135,6 +3459,9 @@ def assemble_smoke_attestation(
             "environment_sha256": one_environment["sha256"],
             "source_manifest_sha256": expected_source_manifest_sha256,
             "repository_binding": repository_binding,
+            "nvidia_smi_sha256": _digest(
+                expected_nvidia_smi_sha256, "receipt nvidia-smi executable"
+            ),
             "gpu_model": next(iter(models)),
             "driver_version": next(iter(drivers)),
             "checkpoint_ceiling_bytes": expected_checkpoint_ceiling_bytes,
@@ -3165,6 +3492,7 @@ def assemble_smoke_attestation(
             "repository_identity_sha256"
         ],
         expected_repository_query_sha256=repository_binding["query_sha256"],
+        expected_nvidia_smi_sha256=expected_nvidia_smi_sha256,
     )
     _publish_no_replace(output, attestation, max_bytes=max_output_bytes)
     return attestation
@@ -3613,6 +3941,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-git-sha256")
     parser.add_argument("--expected-repository-identity-sha256")
     parser.add_argument("--expected-repository-query-sha256")
+    parser.add_argument("--expected-nvidia-smi-sha256")
     parser.add_argument("--submission-receipt", type=Path)
     parser.add_argument("--submission-receipt-max-bytes", type=int)
     parser.add_argument("--sacct", type=Path)
@@ -3653,6 +3982,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.expected_repository_identity_sha256
             ),
             expected_repository_query_sha256=args.expected_repository_query_sha256,
+            expected_nvidia_smi_sha256=args.expected_nvidia_smi_sha256,
         )
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))
         return 0
@@ -3700,6 +4030,7 @@ def main(argv: list[str] | None = None) -> int:
             ],
             expected_job_bindings=receipt["job_bindings"],
             expected_repository_binding=receipt["repository_binding"],
+            expected_nvidia_smi_sha256=receipt["nvidia_smi_sha256"],
         )
         print(
             json.dumps(

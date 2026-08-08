@@ -52,6 +52,9 @@ def _run(
     bytecode_disabled=True,
     trainer_args=None,
     bootstrap_args=None,
+    required_paths=(),
+    required_code_roots=(),
+    timeout=30,
     script=SCRIPT,
 ):
     env = os.environ.copy()
@@ -75,6 +78,10 @@ def _run(
         "--expected-tree-sha",
         tree or "2" * 40,
     ]
+    for required in required_paths:
+        command.extend(["--required-path", required])
+    for required in required_code_roots:
+        command.extend(["--required-code-root", required])
     command.extend(bootstrap_args or [])
     if trainer_args is not None:
         command.extend(["--run-trainer", "--", *trainer_args])
@@ -84,6 +91,7 @@ def _run(
         capture_output=True,
         env=env,
         cwd=root,
+        timeout=timeout,
     )
 
 
@@ -422,6 +430,75 @@ def test_unexpected_python_or_native_extension_is_rejected(tmp_path):
     root, manifest, manifest_path = _archive(tmp_path)
     (root / "src/tabicl/injected.py").write_text("PWNED = True\n")
     result = _run(root, manifest, manifest_path)
+    assert result.returncode != 0
+    assert "unexpected code file" in result.stderr
+
+
+def test_required_runtime_path_and_code_root_cannot_be_omitted(tmp_path):
+    root, manifest, manifest_path = _archive(tmp_path)
+
+    missing_path = _run(
+        root,
+        manifest,
+        manifest_path,
+        required_paths=("scripts/runtime.sh",),
+    )
+    assert missing_path.returncode != 0
+    assert "omits required runtime files" in missing_path.stderr
+
+    missing_root = _run(
+        root,
+        manifest,
+        manifest_path,
+        required_code_roots=("scripts",),
+    )
+    assert missing_root.returncode != 0
+    assert "omits required code roots" in missing_root.stderr
+
+
+def test_fifo_source_manifest_is_rejected_without_blocking(tmp_path):
+    root, manifest, manifest_path = _archive(tmp_path)
+    manifest_path.unlink()
+    os.mkfifo(manifest_path)
+
+    result = _run(root, manifest, manifest_path, timeout=5)
+
+    assert result.returncode != 0
+    assert "source path is not a regular file" in result.stderr
+
+
+def test_fifo_tracked_archive_entry_is_rejected_without_blocking(tmp_path):
+    root, manifest, manifest_path = _archive(tmp_path)
+    module = root / "src/tabicl/module.py"
+    module.unlink()
+    os.mkfifo(module)
+
+    result = _run(root, manifest, manifest_path, timeout=5)
+
+    assert result.returncode != 0
+    assert "tracked source is not a regular file" in result.stderr
+
+
+def test_untracked_shell_under_tracked_script_root_is_rejected(tmp_path):
+    root, _manifest, _manifest_path = _archive(tmp_path)
+    scripts = root / "scripts"
+    scripts.mkdir()
+    manifest = build_source_manifest_from_files(
+        root,
+        commit_sha="1" * 40,
+        tree_sha="2" * 40,
+        tracked={
+            "src/tabicl/__init__.py": "100644",
+            "src/tabicl/module.py": "100644",
+        },
+        code_roots=("scripts", "src/tabicl"),
+    )
+    manifest_path = tmp_path / "shell-source.json"
+    manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+    (scripts / "injected.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+
+    result = _run(root, manifest, manifest_path)
+
     assert result.returncode != 0
     assert "unexpected code file" in result.stderr
 

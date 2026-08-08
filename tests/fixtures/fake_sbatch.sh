@@ -10,6 +10,9 @@ printf '%s\n' "$COUNT" > sbatch_count
 printf 'sbatch' >> calls.log
 printf ' <%s>' "$@" >> calls.log
 printf '\n' >> calls.log
+ARGS=("$@")
+SCRIPT_PATH="${ARGS[${#ARGS[@]}-1]}"
+[[ "$SCRIPT_PATH" =~ ^/proc/self/fd/[0-9]+$ && -r "$SCRIPT_PATH" ]] || exit 82
 
 HELD=0
 ONE_GPU=0
@@ -78,6 +81,18 @@ if [[ -f cluster_suffix_at ]]; then
   [[ "$COUNT" -ne "$CLUSTER_SUFFIX_AT" ]] || CLUSTER="cluster-a"
 fi
 printf '%s|%s|PENDING|JobHeldUser|%s\n' "$JOB_ID" "$JOB_NAME" "$CLUSTER" >> jobs.tsv
+
+if [[ -f signal_hup_sbatch_at ]]; then
+  read -r SIGNAL_HUP_AT < signal_hup_sbatch_at
+  if [[ "$COUNT" -eq "$SIGNAL_HUP_AT" ]]; then
+    kill -HUP "$PPID"
+    /bin/sleep 60
+  fi
+fi
+if [[ -f sleep_sbatch_at ]]; then
+  read -r SLEEP_AT < sleep_sbatch_at
+  [[ "$COUNT" -ne "$SLEEP_AT" ]] || /bin/sleep 60
+fi
 
 if [[ -f response_loss_at ]]; then
   read -r RESPONSE_LOSS_AT < response_loss_at

@@ -145,6 +145,11 @@ papers/
 CLAUDE.md
 ckpts/
 artifacts/
+wandb/
+slurm-*.out
+slurm-*.err
+*.ckpt
+*.pt
 src_private/
 
 # Local Git transfer bundles; never publish these repository snapshots.

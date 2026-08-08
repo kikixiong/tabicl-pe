@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 
 import pytest
@@ -137,3 +139,26 @@ def test_git_digest_and_symlink_substitution_fail_before_query(tmp_path):
         module.query_exact_repository(
             git=alias, git_sha256=digest, expected_commit_sha="a" * 40
         )
+
+
+def test_fifo_git_is_rejected_without_blocking(tmp_path):
+    fifo = tmp_path / "git"
+    os.mkfifo(fifo)
+    code = (
+        "import importlib.util,pathlib,sys\n"
+        "spec=importlib.util.spec_from_file_location('fifo_git_repository',sys.argv[1])\n"
+        "module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)\n"
+        "module.query_exact_repository(git=pathlib.Path(sys.argv[2]),"
+        "git_sha256='0'*64,expected_commit_sha='a'*40)\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code, str(SCRIPT), str(fifo)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode != 0
+    assert "bounded executable file" in completed.stderr

@@ -22,6 +22,8 @@ from tabicl.train._provenance import (
     CheckpointExpectations,
     FinalizationTrust,
     ParentTrust,
+    _FORMAL_RUNTIME_DISTRIBUTIONS,
+    _FORMAL_RUNTIME_MODULES,
     build_checkpoint_provenance,
     build_optimizer_protocol,
     canonical_json_bytes,
@@ -47,6 +49,47 @@ _CPU_VALIDATOR_BOOTSTRAP = (
     "script=sys.argv.pop(1);"
     "runpy.run_path(script,run_name='__main__')"
 )
+
+
+def _environment_payload(*, visible_cuda_device_count=0):
+    return {
+        "python_version": "3.test",
+        "python_implementation": "CPython",
+        "python_executable_sha256": "e" * 64,
+        "python_cache_tag": "cpython-test",
+        "python_soabi": "cpython-test-x86_64-linux-gnu",
+        "platform_system": "Linux",
+        "platform_release": "test",
+        "platform_machine": "x86_64",
+        "torch_version": str(torch.__version__),
+        "numpy_version": "2.0.0",
+        "cuda_runtime_version": "12.8",
+        "cudnn_version": 9000,
+        "environment_fingerprint_schema_version": 2,
+        "installed_distributions_sha256": "d" * 64,
+        "formal_runtime_distributions": [
+            {
+                "name": name,
+                "version": "1.0",
+                "metadata_sha256": "a" * 64,
+                "record_sha256": "b" * 64,
+                "wheel_sha256": "c" * 64,
+                "module": _FORMAL_RUNTIME_MODULES[name],
+                "module_version": "1.0",
+                "module_origin_relative_path": f"{name}/__init__.py",
+                "module_origin_sha256": "f" * 64,
+                "record_verified_file_count": 1,
+                "record_verified_total_bytes": 1,
+                "record_verified_files_sha256": "9" * 64,
+                "record_pyc_mismatch_count": 0,
+            }
+            for name in _FORMAL_RUNTIME_DISTRIBUTIONS
+        ],
+        "unavailable_formal_runtime_distributions": [],
+        "flash_attn3_available": True,
+        "nccl_version": [2, 27, 5],
+        "visible_cuda_device_count": visible_cuda_device_count,
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -232,14 +275,11 @@ def _checkpoint(
     checkpoint["provenance"] = build_checkpoint_provenance(
         source_manifest=_source_manifest(),
         environment=environment
-        or {
-            "python": "test",
-            "torch_version": str(torch.__version__),
-            "cuda": None,
-            "visible_cuda_device_count": rng_state["rank_states"]["0"][
+        or _environment_payload(
+            visible_cuda_device_count=rng_state["rank_states"]["0"][
                 "cuda_device_count"
-            ],
-        },
+            ]
+        ),
         model_config=model_config,
         state_dict=state_dict,
         prior_stream=prior_stream,
@@ -259,13 +299,13 @@ def _checkpoint(
             "lr": 1e-4,
             "amp": amp,
             "muon": muon,
-            "checkpoint_dir": f"outputs/study-a-{mode}",
-            "wandb_name": f"study-a-{mode}",
+            "checkpoint_dir": f"outputs/campaign-a-seed42-{mode}",
+            "wandb_name": f"campaign-a-seed42-{mode}",
         },
         operational_context={
-            "study_id": "study-a",
+            "study_id": "campaign-a-seed42",
             "arm": mode,
-            "output_id": f"study-a-{mode}",
+            "output_id": f"campaign-a-seed42-{mode}",
         },
         parent_manifest=parent_manifest or make_manifest("parent", {"parent": None}),
     )
@@ -1284,13 +1324,14 @@ _FORMAL_TEST_BUDGETS = {
 _FORMAL_TEST_SEED = 42
 _FORMAL_TEST_WORLD_SIZE = 1
 _FORMAL_TEST_CUDA_DEVICE_COUNT = 0
+_FORMAL_TEST_PROTOCOL_METADATA_ALLOWANCE_BYTES = 3_000_000
 
 
 def _canonical_ledger_entries(
     manifests: dict,
     *,
     max_checkpoint_bytes: int,
-    study_id: str = "study-a",
+    study_id: str = "campaign-a-seed42",
 ) -> list[dict]:
     """Build the exact production ledger shape with CPU-only test hardware."""
 
@@ -1374,6 +1415,65 @@ def _canonical_ledger_entries(
     return entries
 
 
+def _ledger_payload(*, study_id: str, entries: list[dict]) -> dict:
+    first = entries[0]
+    time_limits = {
+        "stage1": "14-00:00:00",
+        "stage2": "3-00:00:00",
+        "stage3": "1-00:00:00",
+    }
+    static_protocols = {}
+    for stage in _FORMAL_TEST_STAGES:
+        exemplar = next(entry for entry in entries if entry["stage"] == stage)
+        static_protocols[stage] = make_manifest(
+            "formal_campaign_stage_static_protocol",
+            {
+                "training_commit_sha": "1" * 40,
+                "training_tree_sha": "2" * 40,
+                "source_manifest_sha256": first["source_sha256"],
+                "environment_sha256": first["environment_sha256"],
+                "stage": stage,
+                "terminal_step": _FORMAL_TEST_BUDGETS[stage],
+                "time_limit": time_limits[stage],
+                "prior_sha256": exemplar["prior_sha256"],
+                "architecture_sha256": exemplar["architecture_sha256"],
+                "optimizer_sha256": exemplar["optimizer_sha256"],
+                "scientific_sha256": exemplar["scientific_sha256"],
+            },
+        )["sha256"]
+    attestation = "7" * 64
+    ceiling = first["max_checkpoint_bytes"]
+    return {
+        "study_id": study_id,
+        "protocol_metadata_allowance_bytes": (
+            _FORMAL_TEST_PROTOCOL_METADATA_ALLOWANCE_BYTES
+        ),
+        "entries": entries,
+        "h100_gate": {
+            "attestation_sha256": attestation,
+            "checkpoint_ceiling_bytes": ceiling,
+            "nvidia_smi_sha256": "6" * 64,
+            "gpu_model": "NVIDIA H100 80GB HBM3",
+            "driver_version": "570.00",
+        },
+        "campaign_binding": {
+            "campaign_id": "campaign-a",
+            "campaign_manifest_sha256": "8" * 64,
+            "training_commit_sha": "1" * 40,
+            "training_tree_sha": "2" * 40,
+            "source_manifest_sha256": first["source_sha256"],
+            "environment_sha256": first["environment_sha256"],
+            "h100_attestation_sha256": attestation,
+            "nvidia_smi_sha256": "6" * 64,
+            "checkpoint_ceiling_bytes": ceiling,
+            "static_protocol_sha256_by_stage": static_protocols,
+            "time_limit_by_stage": time_limits,
+            "predecessor_acceptance_sha256_by_seed": {},
+        },
+        "runtime_tools": {"nvidia_smi_sha256": "6" * 64},
+    }
+
+
 def _unique_ledger_entry(entries, *, arm: str, stage: str) -> dict:
     matches = [
         entry
@@ -1402,13 +1502,13 @@ def _finalization_setup(tmp_path: Path):
     final_path = stage_root / "finalized-checkpoint.json"
     ledger = make_manifest(
         "transaction_ledger",
-        {
-            "study_id": "study-a",
-            "entries": _canonical_ledger_entries(
+        _ledger_payload(
+            study_id="campaign-a-seed42",
+            entries=_canonical_ledger_entries(
                 manifests,
                 max_checkpoint_bytes=expected.max_checkpoint_bytes,
             ),
-        },
+        ),
     )
     ledger_path = tmp_path / "transaction-ledger.json"
     _write_json(ledger_path, ledger)
@@ -1416,9 +1516,9 @@ def _finalization_setup(tmp_path: Path):
         transaction_ledger_path=ledger_path,
         transaction_ledger_sha256=ledger["sha256"],
         artifact_root=tmp_path,
-        study_id="study-a",
-        upstream_identity="study-a:temporary:stage1",
-        artifact_identity="study-a.temporary.stage1.final",
+        study_id="campaign-a-seed42",
+        upstream_identity="campaign-a-seed42:temporary:stage1",
+        artifact_identity="campaign-a-seed42.temporary.stage1.final",
     )
     return checkpoint_path, final_path, checkpoint, expected, trust
 
@@ -1453,6 +1553,32 @@ def test_canonical_transaction_ledger_accepts_exact_formal_matrix(tmp_path):
         for stage in _FORMAL_TEST_STAGES
         for arm in _FORMAL_TEST_ARMS
     ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(None, id="missing"),
+        True,
+        False,
+        0,
+        -1,
+        pytest.param((128 << 20) + 1, id="too-large"),
+    ],
+)
+def test_canonical_transaction_ledger_rejects_invalid_metadata_allowance(
+    tmp_path, value
+):
+    payload = _canonical_ledger_payload(tmp_path)
+    if value is None:
+        del payload["protocol_metadata_allowance_bytes"]
+        match = "transaction ledger keys mismatch"
+    else:
+        payload["protocol_metadata_allowance_bytes"] = value
+        match = "protocol metadata allowance is invalid"
+
+    with pytest.raises(ValueError, match=match):
+        validate_canonical_transaction_ledger(payload, artifact_root=tmp_path)
 
 
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "permutation"])
@@ -1532,6 +1658,84 @@ def test_canonical_transaction_ledger_rejects_protocol_drift(
             entry["cohort_protocol_sha256"] = "e" * 64
     else:
         stage2[0]["arm_protocol_sha256"] = "e" * 64
+
+    with pytest.raises(ValueError, match=match):
+        validate_canonical_transaction_ledger(payload, artifact_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (
+            lambda payload: payload.update(legacy=True),
+            "transaction ledger keys mismatch",
+        ),
+        (
+            lambda payload: payload["h100_gate"].update(gpu_model="NVIDIA A10"),
+            "GPU model is invalid",
+        ),
+        (
+            lambda payload: payload["h100_gate"].update(driver_version="bad,driver"),
+            "driver version is invalid",
+        ),
+        (
+            lambda payload: payload["h100_gate"].update(
+                checkpoint_ceiling_bytes=payload["h100_gate"][
+                    "checkpoint_ceiling_bytes"
+                ]
+                + 1
+            ),
+            "global binding mismatch",
+        ),
+        (
+            lambda payload: payload["campaign_binding"].update(
+                h100_attestation_sha256="0" * 64
+            ),
+            "global binding mismatch",
+        ),
+        (
+            lambda payload: payload["campaign_binding"].update(
+                source_manifest_sha256="0" * 64
+            ),
+            "global binding mismatch",
+        ),
+        (
+            lambda payload: payload["campaign_binding"].update(
+                environment_sha256="0" * 64
+            ),
+            "global binding mismatch",
+        ),
+        (
+            lambda payload: payload["campaign_binding"].update(
+                campaign_id="different-campaign"
+            ),
+            "global binding mismatch",
+        ),
+        (
+            lambda payload: payload["campaign_binding"][
+                "static_protocol_sha256_by_stage"
+            ].update(stage2="0" * 64),
+            "static protocol is not derived",
+        ),
+        (
+            lambda payload: payload["campaign_binding"]["time_limit_by_stage"].update(
+                stage2="invalid"
+            ),
+            "canonical Slurm duration",
+        ),
+        (
+            lambda payload: payload["campaign_binding"][
+                "predecessor_acceptance_sha256_by_seed"
+            ].update({"42": "0" * 64}),
+            "predecessor prefix keys mismatch",
+        ),
+    ],
+)
+def test_canonical_transaction_ledger_rejects_gate_or_campaign_drift(
+    tmp_path, mutation, match
+):
+    payload = _canonical_ledger_payload(tmp_path)
+    mutation(payload)
 
     with pytest.raises(ValueError, match=match):
         validate_canonical_transaction_ledger(payload, artifact_root=tmp_path)
@@ -1651,25 +1855,26 @@ def test_finalization_study_must_match_checkpoint_operational_provenance(tmp_pat
     )
     ledger = json.loads(trust.transaction_ledger_path.read_text())
     payload = copy.deepcopy(ledger["payload"])
-    payload["study_id"] = "study-b"
+    payload["study_id"] = "campaign-b-seed42"
+    payload["campaign_binding"]["campaign_id"] = "campaign-b"
     for entry in payload["entries"]:
         entry["upstream_identity"] = entry["upstream_identity"].replace(
-            "study-a:", "study-b:", 1
+            "campaign-a-seed42:", "campaign-b-seed42:", 1
         )
         entry["artifact_identity"] = entry["artifact_identity"].replace(
-            "study-a.", "study-b.", 1
+            "campaign-a-seed42.", "campaign-b-seed42.", 1
         )
     attacker_ledger = make_manifest("transaction_ledger", payload)
     _write_json(trust.transaction_ledger_path, attacker_ledger)
     attacker_trust = replace(
         trust,
         transaction_ledger_sha256=attacker_ledger["sha256"],
-        study_id="study-b",
+        study_id="campaign-b-seed42",
         upstream_identity=trust.upstream_identity.replace(
-            "study-a:", "study-b:", 1
+            "campaign-a-seed42:", "campaign-b-seed42:", 1
         ),
         artifact_identity=trust.artifact_identity.replace(
-            "study-a.", "study-b.", 1
+            "campaign-a-seed42.", "campaign-b-seed42.", 1
         ),
     )
 
@@ -1934,12 +2139,12 @@ def _parent_trust(
                     "checkpoint_sha256": "0" * 64,
                     "finalized_manifest_sha256": "1" * 64,
                     "transaction_ledger_sha256": "2" * 64,
-                    "study_id": "study-a",
+                    "study_id": "campaign-a-seed42",
                     "arm": mode,
                     "stage": predecessor,
                     "terminal_step": _FORMAL_TEST_BUDGETS[predecessor],
-                    "upstream_identity": f"study-a:{mode}:{predecessor}",
-                    "artifact_identity": f"study-a.{mode}.{predecessor}.final",
+                    "upstream_identity": f"campaign-a-seed42:{mode}:{predecessor}",
+                    "artifact_identity": f"campaign-a-seed42.{mode}.{predecessor}.final",
                     "np_seed": np_seed,
                     "torch_seed": _FORMAL_TEST_SEED,
                     "identity_rng_seed": _FORMAL_TEST_SEED,
@@ -1965,12 +2170,12 @@ def _parent_trust(
     final = make_manifest(
         "finalized_checkpoint",
         {
-            "study_id": "study-a",
+            "study_id": "campaign-a-seed42",
             "arm": mode,
             "stage": parent_stage,
             "terminal_step": terminal_step,
-            "upstream_identity": f"study-a:{mode}:{parent_stage}",
-            "artifact_identity": f"study-a.{mode}.{parent_stage}.final",
+            "upstream_identity": f"campaign-a-seed42:{mode}:{parent_stage}",
+            "artifact_identity": f"campaign-a-seed42.{mode}.{parent_stage}.final",
             "checkpoint_sha256": parent_digest,
             "checkpoint_size": parent_path.stat().st_size,
             "provenance_sha256": parent["provenance"]["bundle_sha256"],
@@ -2000,10 +2205,7 @@ def _parent_trust(
         )["np_seed"] = ledger_np_seed
     ledger = make_manifest(
         "transaction_ledger",
-        {
-            "study_id": "study-a",
-            "entries": ledger_entries,
-        },
+        _ledger_payload(study_id="campaign-a-seed42", entries=ledger_entries),
     )
     ledger_path = tmp_path / "transaction-ledger.json"
     _write_json(ledger_path, ledger)
@@ -2012,11 +2214,11 @@ def _parent_trust(
         finalized_manifest_path=final_path,
         transaction_ledger_path=ledger_path,
         transaction_ledger_sha256=ledger["sha256"],
-        study_id="study-a",
+        study_id="campaign-a-seed42",
         arm=mode,
         parent_stage=parent_stage,
-        upstream_identity=f"study-a:{mode}:{parent_stage}",
-        artifact_identity=f"study-a.{mode}.{parent_stage}.final",
+        upstream_identity=f"campaign-a-seed42:{mode}:{parent_stage}",
+        artifact_identity=f"campaign-a-seed42.{mode}.{parent_stage}.final",
         artifact_root=tmp_path,
     )
     parent_manifest = make_manifest(
@@ -2026,12 +2228,12 @@ def _parent_trust(
                 "checkpoint_sha256": parent_digest,
                 "finalized_manifest_sha256": final["sha256"],
                 "transaction_ledger_sha256": ledger["sha256"],
-                "study_id": "study-a",
+                "study_id": "campaign-a-seed42",
                 "arm": mode,
                 "stage": parent_stage,
                 "terminal_step": terminal_step,
-                "upstream_identity": f"study-a:{mode}:{parent_stage}",
-                "artifact_identity": f"study-a.{mode}.{parent_stage}.final",
+                "upstream_identity": f"campaign-a-seed42:{mode}:{parent_stage}",
+                "artifact_identity": f"campaign-a-seed42.{mode}.{parent_stage}.final",
                 "np_seed": np_seed,
                 "torch_seed": _FORMAL_TEST_SEED,
                 "identity_rng_seed": _FORMAL_TEST_SEED,
@@ -2072,6 +2274,10 @@ def test_parent_ledger_ceiling_is_enforced_before_deserialization(
     reduced_ceiling = trust.checkpoint_path.stat().st_size - 1
     for entry in ledger["payload"]["entries"]:
         entry["max_checkpoint_bytes"] = reduced_ceiling
+    ledger["payload"]["h100_gate"]["checkpoint_ceiling_bytes"] = reduced_ceiling
+    ledger["payload"]["campaign_binding"][
+        "checkpoint_ceiling_bytes"
+    ] = reduced_ceiling
     ledger = make_manifest("transaction_ledger", ledger["payload"])
     _write_json(trust.transaction_ledger_path, ledger)
     final_payload = json.loads(trust.finalized_manifest_path.read_text())["payload"]
@@ -2275,7 +2481,7 @@ def test_real_trainer_stage_transition_consumes_ledger_derived_parent_fields(
         formal_parent_upstream_identity=trust.upstream_identity,
         formal_parent_artifact_identity=trust.artifact_identity,
         formal_artifact_root=str(trust.artifact_root),
-        formal_study_id="study-a",
+        formal_study_id="campaign-a-seed42",
         checkpoint_path=str(trust.checkpoint_path),
         only_load_model=True,
         row_identity_mode="temporary",
@@ -2324,7 +2530,7 @@ def test_formal_trainer_rejects_symlinked_parent_trust_input(
         "formal_parent_upstream_identity": trust.upstream_identity,
         "formal_parent_artifact_identity": trust.artifact_identity,
         "formal_artifact_root": str(trust.artifact_root),
-        "formal_study_id": "study-a",
+        "formal_study_id": "campaign-a-seed42",
         "checkpoint_path": str(trust.checkpoint_path),
         "only_load_model": True,
         "row_identity_mode": "temporary",
@@ -2362,7 +2568,7 @@ def test_formal_trainer_consumes_same_fd_validated_parent_after_path_swap(
         formal_parent_upstream_identity=trust.upstream_identity,
         formal_parent_artifact_identity=trust.artifact_identity,
         formal_artifact_root=str(trust.artifact_root),
-        formal_study_id="study-a",
+        formal_study_id="campaign-a-seed42",
         checkpoint_path=str(trust.checkpoint_path),
         checkpoint_dir=None,
         only_load_model=True,
@@ -2466,9 +2672,9 @@ def test_real_trainer_builds_formal_stage2_and_stage3_provenance(
             "--formal_environment_sha256",
             environment["sha256"],
             "--formal_study_id",
-            "study-a",
+            "campaign-a-seed42",
             "--formal_output_id",
-            "study-a-temporary",
+            "campaign-a-seed42-temporary",
             "--formal_transaction_ledger",
             str(trust.transaction_ledger_path),
             "--formal_transaction_ledger_sha256",

@@ -55,10 +55,30 @@ for name in (
     "verify_runtime_source.py",
     "run_h100_identity_validation.py",
     "slurm_h100_identity_formal.sh",
+    "run_formal_identity_production_job.py",
+    "formal_train_v2_clf_identity_stage1.sh",
+    "formal_train_v2_clf_identity_stage2.sh",
+    "formal_train_v2_clf_identity_stage3.sh",
+    "run_with_durable_log.sh",
     "verify_filesystem_isolation.py",
     "verify_git_repository.py",
+    "formal_campaign_registry.py",
 ):
     shutil.copy2(REPO / "scripts" / name, EXACT / "scripts" / name)
+
+# This integration targets the production submit transaction. Campaign trust
+# anchors have their own production-path suite, so the detached fixture uses a
+# schema-valid formal campaign without replaying the full H100 publisher.
+registry_fixture = EXACT / "scripts/formal_campaign_registry.py"
+registry_source = registry_fixture.read_text()
+registry_source = registry_source.replace(
+    '\nif __name__ == "__main__":\n',
+    "\ndef _fixture_revalidate_campaign_evidence(campaign):\n"
+    "    return validate_campaign_manifest(campaign)\n\n"
+    "_revalidate_campaign_evidence = _fixture_revalidate_campaign_evidence\n\n"
+    'if __name__ == "__main__":\n',
+)
+registry_fixture.write_text(registry_source)
 
 (EXACT / "src/tabicl/__init__.py").write_text("__version__ = 'task4-fixture'\n")
 (EXACT / "scripts/check_formal_capacity.py").write_text(
@@ -84,6 +104,14 @@ if args.remaining_checkpoints != '15':
 )
 for path in (EXACT / "scripts").iterdir():
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+overlay_fixture_path = EXACT / "scripts/verify_formal_overlay.py"
+overlay_fixture_source = overlay_fixture_path.read_text()
+overlay_fixture_source = overlay_fixture_source.replace(
+    "SCHEDULER_COMMAND_TIMEOUT_SECONDS = 30",
+    "SCHEDULER_COMMAND_TIMEOUT_SECONDS = 1",
+)
+overlay_fixture_path.write_text(overlay_fixture_source)
 
 check(["/usr/bin/git", "init", "-q", str(EXACT)])
 check(["/usr/bin/git", "-C", str(EXACT), "config", "user.name", "fixture"])
@@ -116,6 +144,9 @@ FAKE_GIT_SHA256 = hashlib.sha256(FAKE_GIT.read_bytes()).hexdigest()
 
 overlay_module = load("task4_overlay_fixture", EXACT / "scripts/verify_formal_overlay.py")
 matrix = load("task4_matrix_fixture", EXACT / "scripts/run_h100_identity_validation.py")
+campaign_module = load(
+    "task4_campaign_fixture", EXACT / "scripts/formal_campaign_registry.py"
+)
 repository_helper = load(
     "task4_repository_fixture", EXACT / "scripts/verify_git_repository.py"
 )
@@ -123,6 +154,7 @@ REPOSITORY_BINDING = repository_helper.expected_repository_binding(
     expected_commit_sha=COMMIT,
     git_sha256=FAKE_GIT_SHA256,
 )
+NVIDIA_SMI_SHA256 = hashlib.sha256(Path("/usr/bin/true").read_bytes()).hexdigest()
 tracked = check(
     ["/usr/bin/git", "-C", str(EXACT), "ls-files", "-s"],
     stdout=subprocess.PIPE,
@@ -163,13 +195,39 @@ def envelope(kind, payload):
 runtime_payload = {
     "python_version": "3.test",
     "python_implementation": "CPython",
+    "python_executable_sha256": "e" * 64,
+    "python_cache_tag": "cpython-test",
+    "python_soabi": "cpython-test-x86_64-linux-gnu",
     "platform_system": "Linux",
     "platform_release": "test",
     "platform_machine": "x86_64",
     "torch_version": "test",
     "numpy_version": "test",
     "cuda_runtime_version": "test",
-    "cudnn_version": "test",
+    "cudnn_version": 9000,
+    "environment_fingerprint_schema_version": 2,
+    "installed_distributions_sha256": "d" * 64,
+    "formal_runtime_distributions": [
+        {
+            "name": name,
+            "version": "1.0",
+            "metadata_sha256": "a" * 64,
+            "record_sha256": "b" * 64,
+            "wheel_sha256": "c" * 64,
+            "module": matrix._FORMAL_RUNTIME_MODULES[name],
+            "module_version": "1.0",
+            "module_origin_relative_path": f"{name}/__init__.py",
+            "module_origin_sha256": "f" * 64,
+            "record_verified_file_count": 1,
+            "record_verified_total_bytes": 1,
+            "record_verified_files_sha256": "9" * 64,
+            "record_pyc_mismatch_count": 0,
+        }
+        for name in matrix._FORMAL_RUNTIME_DISTRIBUTIONS
+    ],
+    "unavailable_formal_runtime_distributions": [],
+    "flash_attn3_available": True,
+    "nccl_version": [2, 27, 5],
 }
 ONE_GPU_ENV = envelope("environment", {**runtime_payload, "visible_cuda_device_count": 1})
 TWO_GPU_ENV = envelope("environment", {**runtime_payload, "visible_cuda_device_count": 2})
@@ -249,6 +307,7 @@ def case_evidence(case):
             "world_size": case.world_size,
             "environment": environment,
             "gpu_devices": devices,
+            "nvidia_smi_sha256": NVIDIA_SMI_SHA256,
             "scheduler_binding": scheduler_binding,
         }
     )
@@ -429,6 +488,7 @@ smoke = matrix.make_smoke_attestation(
         "environment_sha256": ENVIRONMENT,
         "source_manifest_sha256": source_manifest["sha256"],
         "repository_binding": REPOSITORY_BINDING,
+        "nvidia_smi_sha256": NVIDIA_SMI_SHA256,
         "gpu_model": GPU_MODEL,
         "driver_version": DRIVER,
         "checkpoint_ceiling_bytes": 1,
@@ -497,8 +557,14 @@ for source_name, target_name in (
     ("fake_squeue.sh", "squeue"),
     ("fake_sacct.sh", "sacct"),
 ):
-    shutil.copy2(REPO / "tests/fixtures" / source_name, FAKEBIN / target_name)
-    (FAKEBIN / target_name).chmod(0o755)
+    target_path = FAKEBIN / target_name
+    shutil.copy2(REPO / "tests/fixtures" / source_name, target_path)
+    target_path.write_text(
+        target_path.read_text().replace(
+            'STATE_DIR="${BASH_SOURCE[0]%/*}"', f'STATE_DIR="{FAKEBIN}"'
+        )
+    )
+    target_path.chmod(0o755)
 
 
 def scheduler_commands():
@@ -508,6 +574,98 @@ def scheduler_commands():
             "sha256": hashlib.sha256((FAKEBIN / name).read_bytes()).hexdigest(),
         }
         for name in ("sbatch", "scontrol", "scancel", "squeue", "sacct")
+    }
+
+
+TIME_LIMITS = {
+    "stage1": "14-00:00:00",
+    "stage2": "3-00:00:00",
+    "stage3": "1-00:00:00",
+}
+
+
+def campaign_config(campaign_id):
+    root = EXTERNAL / f"campaign-{campaign_id}"
+    acceptance_registry = root / "acceptances"
+    evaluations = root / "evaluations"
+    acceptance_registry.mkdir(parents=True, exist_ok=True)
+    evaluations.mkdir(parents=True, exist_ok=True)
+    stage_inputs = [
+        {
+            "stage": stage["stage"],
+            "terminal_step": stage["terminal_step"],
+            "time_limit": TIME_LIMITS[stage["stage"]],
+            "prior_sha256": stage["prior_sha256"],
+            "architecture_sha256": stage["architecture_sha256"],
+            "optimizer_sha256": stage["optimizer_sha256"],
+            "scientific_sha256": stage["scientific_sha256"],
+        }
+        for stage in stage_values()
+    ]
+    campaign_draft = campaign_module.build_campaign_manifest(
+        campaign_id=campaign_id,
+        training_source={
+            "candidate_repository": "https://github.com/kikixiong/tabicl-pe.git",
+            "candidate_ref": "refs/heads/codex/position-identity-v1",
+            "commit_sha": COMMIT,
+            "tree_sha": TREE,
+            "source_manifest_sha256": source_manifest["sha256"],
+            "environment_sha256": ENVIRONMENT,
+        },
+        h100_attestation=smoke,
+        expected_h100_sha256=smoke["sha256"],
+        checkpoint_ceiling_bytes=1,
+        expected_gpu_model=GPU_MODEL,
+        stages=stage_inputs,
+    )
+    evidence_root = EXTERNAL / f"campaign-{campaign_id}-evidence"
+    campaign = campaign_module._formal_campaign_from_draft(
+        campaign_draft,
+        {
+            "exact_root": str(EXACT),
+            "source_manifest_path": str(SOURCE_PATH),
+            "h100_attestation_path": str(SMOKE_PATH),
+            "h100_submission_receipt_path": str(
+                evidence_root / "h100-submission-receipt.json"
+            ),
+            "environment_completion_path": str(
+                evidence_root / "environment-complete.json"
+            ),
+            "git_path": str(FAKE_GIT),
+            "git_sha256": FAKE_GIT_SHA256,
+            "h100_attestation_max_bytes": 1_000_000,
+            "h100_submission_receipt_max_bytes": 1_000_000,
+            "source_manifest_max_bytes": 32_000_000,
+            "environment_completion_max_bytes": (
+                campaign_module.ENVIRONMENT_COMPLETION_CEILING_BYTES
+            ),
+            "environment_manifest_max_bytes": (
+                campaign_module.ENVIRONMENT_MANIFEST_CEILING_BYTES
+            ),
+            "environment_inventory_max_bytes": (
+                campaign_module.ENVIRONMENT_INVENTORY_CEILING_BYTES
+            ),
+            "h100_submission_receipt_sha256": receipt_sha256,
+            "h100_validation_report_sha256": "1" * 64,
+            "environment_transaction_sha256": "2" * 64,
+            "environment_transaction_completion_raw_sha256": "3" * 64,
+            "two_gpu_environment_sha256": "4" * 64,
+            "sacct_sha256": sacct_sha256,
+            "repository_identity_sha256": REPOSITORY_BINDING[
+                "repository_identity_sha256"
+            ],
+            "repository_query_sha256": REPOSITORY_BINDING["query_sha256"],
+        },
+    )
+    campaign_path = root / "campaign.json"
+    campaign_path.write_bytes(campaign_module.canonical_json_bytes(campaign) + b"\n")
+    return {
+        "manifest_path": str(campaign_path),
+        "expected_sha256": campaign["sha256"],
+        "acceptance_registry": str(acceptance_registry),
+        "binding": campaign_module.campaign_binding(
+            campaign, predecessor_acceptance_sha256_by_seed={}
+        ),
     }
 
 
@@ -530,7 +688,9 @@ BASE = {
         "attestation_path": str(SMOKE_PATH),
         "expected_sha256": smoke["sha256"],
         "expected_gpu_model": GPU_MODEL,
+        "expected_driver_version": DRIVER,
     },
+    "campaign": campaign_config("study-a"),
     "capacity": {
         "checkpoint_ceiling_bytes": 1,
         "durable_log_allowance_bytes": 30_000_000,
@@ -544,6 +704,7 @@ BASE = {
         "git": str(FAKE_GIT),
         "git_sha256": FAKE_GIT_SHA256,
         "nvidia_smi": "/usr/bin/true",
+        "nvidia_smi_sha256": NVIDIA_SMI_SHA256,
         "job_work_root": "",
     },
     "scheduler": {
@@ -552,11 +713,7 @@ BASE = {
         "cpus_per_task": 64,
         "memory_mb": 131_072,
         "gpus_per_job": 1,
-        "time_limit_by_stage": {
-            "stage1": "14-00:00:00",
-            "stage2": "3-00:00:00",
-            "stage3": "1-00:00:00",
-        },
+        "time_limit_by_stage": dict(TIME_LIMITS),
         "commands": scheduler_commands(),
     },
     "stages": stage_values(),
@@ -592,6 +749,9 @@ CONTROL_FILES = {
     "delete_scancel_after_release_at",
     "fail_cancel_ids",
     "signal_parent_on_cancel",
+    "signal_hup_sbatch_at",
+    "sleep_sbatch_at",
+    "sleep_cancel_ids",
     "ledger_path",
     "receipt_path",
     "precreate_receipt_at",
@@ -651,6 +811,7 @@ def invoke(
     value = copy.deepcopy(BASE)
     value["study_id"] = study_name(name, value["seed"])
     value["artifact_root"] = str(artifact_dir(name, value["seed"]))
+    value["campaign"] = campaign_config(name)
     # Rebuild safe identity-bearing paths by letting the submitter consume this
     # per-scenario study ID; protocol hashes intentionally exclude it.
     if mutate is not None:
@@ -682,6 +843,7 @@ def invoke(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        timeout=20,
     )
 
 
@@ -776,6 +938,7 @@ require("-temporary-s1>" in submissions[1], submissions[1])
 require("-none-s1>" in submissions[2], submissions[2])
 ledger = json.loads((artifact_dir("success") / "transaction-ledger.json").read_text())
 require(len(ledger["payload"]["entries"]) == 9, ledger)
+require(ledger["payload"]["protocol_metadata_allowance_bytes"] == 3_000_000, ledger)
 require(all("checkpoint_sha256" not in entry for entry in ledger["payload"]["entries"]), ledger)
 require(all(entry["np_seed"] == entry["torch_seed"] == entry["identity_rng_seed"] == 42 for entry in ledger["payload"]["entries"]), ledger)
 receipt = json.loads((artifact_dir("success") / "submission-receipt.json").read_text())
@@ -783,8 +946,22 @@ require(receipt["kind"] == "held_submission_receipt", receipt)
 require(receipt["payload"]["jobs_held_at_publication"] is True, receipt)
 require(receipt["payload"]["job_ids"] == [str(1000 + i) for i in range(1, 10)], receipt)
 require(receipt["payload"]["seed"] == 42, receipt)
+require(receipt["payload"]["h100_gate"] == ledger["payload"]["h100_gate"], receipt)
+require(
+    receipt["payload"]["campaign_binding"]
+    == ledger["payload"]["campaign_binding"],
+    receipt,
+)
+require(
+    all(len(job["sbatch_argv_sha256"]) == 64 for job in receipt["payload"]["jobs"]),
+    receipt,
+)
 require(receipt["payload"]["run_log_ceiling_bytes"] == 1_000, receipt)
 require(receipt["payload"]["manifest_ceiling_bytes"] == 1_000, receipt)
+require(
+    receipt["payload"]["protocol_metadata_allowance_bytes"] == 3_000_000,
+    receipt,
+)
 require(receipt["payload"]["runtime_completion_ceiling_bytes"] == 65_536, receipt)
 require(
     receipt["payload"]["terminal_log_attestation_ceiling_bytes"] == 131_072,
@@ -806,6 +983,16 @@ commit = json.loads(
 require(commit["kind"] == "formal_submission_commit", commit)
 require(commit["payload"]["submission_receipt_sha256"] == receipt["sha256"], commit)
 require(commit["payload"]["job_ids"] == receipt["payload"]["job_ids"], commit)
+require(commit["payload"]["h100_gate"] == receipt["payload"]["h100_gate"], commit)
+require(
+    commit["payload"]["protocol_metadata_allowance_bytes"] == 3_000_000,
+    commit,
+)
+require(
+    commit["payload"]["campaign_binding"]
+    == receipt["payload"]["campaign_binding"],
+    commit,
+)
 require(
     all(
         receipt["payload"]["transaction_id"] in job["job_name"]
@@ -815,6 +1002,28 @@ require(
 )
 require(
     all("FORMAL_RUNTIME_COMPLETION_CEILING_BYTES=65536" in line for line in submissions),
+    submissions,
+)
+require(
+    all(
+        "FORMAL_PROTOCOL_METADATA_ALLOWANCE_BYTES=3000000" in line
+        for line in submissions
+    ),
+    submissions,
+)
+require(
+    all(
+        "FORMAL_EXPECTED_GPU_MODEL=NVIDIA H100 80GB HBM3" in line
+        for line in submissions
+    ),
+    submissions,
+)
+require(
+    all("FORMAL_EXPECTED_DRIVER_VERSION=570.00" in line for line in submissions),
+    submissions,
+)
+require(
+    all(f"FORMAL_H100_ATTESTATION_SHA256={smoke['sha256']}" in line for line in submissions),
     submissions,
 )
 require(receipt["payload"]["scheduler"] == {
@@ -855,7 +1064,7 @@ require(
 )
 
 for selected_seed in (43, 44):
-    scenario = f"success-{selected_seed}"
+    scenario = f"missing-predecessor-{selected_seed}"
 
     def use_selected_seed(value, selected_seed=selected_seed, scenario=scenario):
         value["seed"] = selected_seed
@@ -864,22 +1073,9 @@ for selected_seed in (43, 44):
         value["stages"] = stage_values(seed=selected_seed)
 
     seeded = invoke(scenario, mutate=use_selected_seed)
-    require(seeded.returncode == 0, f"seed {selected_seed} failed: {seeded.stderr}")
     require(
-        all(f"FORMAL_SEED={selected_seed}" in line for line in command_events("sbatch")), calls()
-    )
-    seeded_ledger = json.loads(
-        (artifact_dir(scenario, selected_seed) / "transaction-ledger.json").read_text()
-    )
-    require(
-        all(
-            entry["np_seed"]
-            == entry["torch_seed"]
-            == entry["identity_rng_seed"]
-            == selected_seed
-            for entry in seeded_ledger["payload"]["entries"]
-        ),
-        seeded_ledger,
+        seeded.returncode != 0 and not calls(),
+        f"seed {selected_seed} bypassed predecessor acceptance: {seeded.stderr}",
     )
 
 for failure_position in range(1, 10):
@@ -908,6 +1104,38 @@ for control in ("response_loss_at", "empty_at", "malformed_at", "duplicate_at"):
         else "submit_response_untrusted"
     )
     require(expected_event in event_names, event_names)
+
+timed_submit = invoke("timed-sbatch", controls={"sleep_sbatch_at": 2})
+require(
+    timed_submit.returncode == 0,
+    f"timed-out sbatch was not uniquely reconciled: {timed_submit.stderr}",
+)
+require(len(command_events("sbatch")) == 9, calls())
+require(not command_events("scancel"), calls())
+
+sighup_submit = invoke(
+    "sighup-sbatch",
+    controls={"signal_hup_sbatch_at": 3},
+)
+require(sighup_submit.returncode != 0, "SIGHUP during sbatch reported success")
+require(
+    command_events("scancel")
+    == ["scancel <1003>", "scancel <1002>", "scancel <1001>"],
+    calls(),
+)
+require(
+    not list(artifact_dir("sighup-sbatch").glob("rollback-incomplete-*.json")),
+    calls(),
+)
+
+timed_cancel = invoke(
+    "timed-cancel",
+    controls={"fail_sbatch_at": 3, "sleep_cancel_ids": "1002"},
+)
+require(timed_cancel.returncode != 0, "timed-out scancel reported success")
+timed_cancel_recovery = rollback_record("timed-cancel")
+require(timed_cancel_recovery["payload"]["remaining_job_ids"] == ["1002"], timed_cancel_recovery)
+require(timed_cancel_recovery["payload"]["cancelled_job_ids"] == ["1001"], timed_cancel_recovery)
 
 banner = invoke(
     "squeue-banner",
@@ -1086,11 +1314,14 @@ missing_scancel = invoke(
     commit_fault="write",
 )
 require(missing_scancel.returncode != 0, "missing scancel reported success")
-missing_scancel_recovery = rollback_record("missing-scancel-after-release")
 require(
-    missing_scancel_recovery["payload"]["remaining_job_ids"]
-    == [str(job) for job in range(1009, 1000, -1)],
-    missing_scancel_recovery,
+    [line for line in calls() if line.startswith("scancel ")]
+    == [f"scancel <{job}>" for job in range(1009, 1000, -1)],
+    calls(),
+)
+require(
+    not list(artifact_dir("missing-scancel-after-release").glob("rollback-incomplete-*.json")),
+    "path deletion defeated the already digest-bound scancel descriptor",
 )
 
 capacity_name = "capacity-fail"
@@ -1099,6 +1330,7 @@ reset_fake()
 value = copy.deepcopy(BASE)
 value["study_id"] = study_name(capacity_name)
 value["artifact_root"] = str(artifact_dir(capacity_name))
+value["campaign"] = campaign_config(capacity_name)
 overlay_path = EXTERNAL / f"{capacity_name}-direct.json"
 overlay_path.write_bytes(overlay_module.canonical_json_bytes(value) + b"\n")
 env = {
@@ -1142,6 +1374,12 @@ preflight_cases.append(
     )
 )
 preflight_cases.append(("missing-smoke", lambda value: value["smoke"].update(attestation_path=str(EXTERNAL / "missing.json"))))
+preflight_cases.append(
+    (
+        "wrong-smoke-driver",
+        lambda value: value["smoke"].update(expected_driver_version="999.0"),
+    )
+)
 preflight_cases.append(("smoke-ceiling-mismatch", lambda value: value["capacity"].update(checkpoint_ceiling_bytes=2)))
 preflight_cases.append(("mismatched-commit", lambda value: value["source"].update(commit_sha="f" * 40)))
 preflight_cases.append(("missing-arm", lambda value: value["stages"][0]["arm_protocol_sha256"].pop("none")))
@@ -1262,7 +1500,10 @@ require("gpu:2" not in source_text, "production submitter contains a two-GPU req
 slurm_text = (EXACT / "scripts/slurm_h100_identity_formal.sh").read_text()
 require('"$NVIDIA_SMI"' in slurm_text, "formal Slurm does not use trusted NVIDIA_SMI")
 require("$(nvidia-smi" not in slurm_text, "formal Slurm uses PATH nvidia-smi")
-require("--query-gpu=name,uuid" in slurm_text, "formal Slurm does not inspect GPU model")
+require(
+    "--query-fields name,uuid,driver_version" in slurm_text,
+    "formal Slurm does not inspect GPU model and driver",
+)
 require("H100" in slurm_text, "formal Slurm does not enforce the H100 model")
 print("Task4 hermetic fake-Slurm submit matrix passed")
 PY

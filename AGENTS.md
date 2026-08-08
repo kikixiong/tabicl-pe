@@ -20,10 +20,34 @@ first, followed by the three Stage 2 and three Stage 3 jobs with same-arm
 `afterok` dependencies. Every production job is one H100 on the `long` QoS
 with 64 CPUs and 128 GiB of memory.
 
+Formal seeds are campaign-ordered: the write-once campaign manifest binds T,
+the twelve-case H100 gate, exact GPU model/driver, checkpoint ceiling,
+walltimes, and static protocols. Ledger, receipt, commit, runtime, and terminal
+evidence must preserve that same campaign/H100 binding. Seed 43 requires the
+accepted seed-42 record; seed 44 requires the exact accepted 42/43 prefix.
+Execute digest-bound Git and Slurm tools through their already verified open
+descriptors, never by re-resolving a mutable pathname.
+Execute `nvidia-smi` queries through a no-follow, digest-bound descriptor for
+the same verified inode in H100 and production jobs. Across `close_fds`
+boundaries, reacquire that inode only through the live owner's `/proc` descriptor
+and repeat stable bounded hashing before any query; never reopen the pathname.
+
 Node-local checkout work roots must be physical directories on a different
 filesystem from durable artifact namespaces. Controllers check this before
 creating a namespace and again while jobs are held; compute wrappers repeat it
 before `mktemp` or `git clone`.
+
+Never hand-author or mutate formal environment digests. Generate the paired
+one-/two-GPU manifests and private inventory only with
+`scripts/generate_formal_environment.py` from clean detached exact T under the
+project interpreter with `-I -B` and `PYTHONNOUSERSITE=1`. Treat the three
+artifacts as valid only with their matching marker-last transaction completion
+artifact and a successful externally digest-bound
+`scripts/verify_formal_environment_transaction.py` summary; marker-less partial
+output is recovery state, not evidence. H100 cases must pass
+the preflight and post-compute environment checks. Production must match the
+exact GPU model and driver derived from the successful twelve-case gate and
+must repeat environment verification after every stage.
 
 Do not call a production cohort complete from in-job receipts alone. Require
 the independent receipt-bound accounting check and write-once terminal

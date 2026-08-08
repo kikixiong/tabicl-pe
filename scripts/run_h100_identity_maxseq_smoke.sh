@@ -5,6 +5,26 @@ if [[ "${1:-}" == "--rank-worker" ]]; then
   shift
   CASE_ID="${1:?case ID required}"
   ROOT="${TABICL_EXACT_ROOT:?}"
+  : "${PYTHON:?}"
+  : "${FORMAL_NVIDIA_SMI_FD:?}"
+  : "${FORMAL_NVIDIA_SMI_FD_OWNER_PID:?}"
+  : "${FORMAL_NVIDIA_SMI_SHA256:?}"
+  if [[ "$FORMAL_NVIDIA_SMI_FD_OWNER_PID" != "$BASHPID" ]]; then
+    [[ "$FORMAL_NVIDIA_SMI_FD_OWNER_PID" =~ ^[1-9][0-9]*$ ]] || {
+      echo "invalid retained NVIDIA-SMI owner PID" >&2; exit 2;
+    }
+    [[ "$FORMAL_NVIDIA_SMI_FD" =~ ^[0-9]+$ ]] || {
+      echo "invalid retained NVIDIA-SMI descriptor" >&2; exit 2;
+    }
+    exec "$PYTHON" -I -B "$ROOT/scripts/exec_digest_bound_nvidia_smi.py" \
+      --retained-fd-owner-pid "$FORMAL_NVIDIA_SMI_FD_OWNER_PID" \
+      --retained-fd "$FORMAL_NVIDIA_SMI_FD" \
+      --expected-sha256 "$FORMAL_NVIDIA_SMI_SHA256" -- \
+      "${BASH_SOURCE[0]}" --rank-worker "$CASE_ID"
+  fi
+  [[ "$NVIDIA_SMI" == "/proc/self/fd/$FORMAL_NVIDIA_SMI_FD" && -x "$NVIDIA_SMI" ]] || {
+    echo "rank NVIDIA-SMI is not its reacquired verified descriptor" >&2; exit 2;
+  }
   RANK_ID="${LOCAL_RANK:?}"
   exec "$PYTHON" -I -B "$ROOT/scripts/run_exact_tabicl.py" \
     --archive-root "$ROOT" --source-manifest "$FORMAL_SOURCE_MANIFEST" \
@@ -37,7 +57,26 @@ esac
 
 ROOT="${TABICL_EXACT_ROOT:?}"; ROOT="$(cd "$ROOT" && pwd -P)"
 : "${PYTHON:?}"; [[ "$PYTHON" == /* && -x "$PYTHON" ]] || { echo "invalid PYTHON" >&2; exit 2; }
-: "${NVIDIA_SMI:?}"; [[ "$NVIDIA_SMI" == /* && -x "$NVIDIA_SMI" ]] || { echo "invalid NVIDIA_SMI" >&2; exit 2; }
+: "${NVIDIA_SMI:?}"
+: "${FORMAL_NVIDIA_SMI_FD:?}"
+: "${FORMAL_NVIDIA_SMI_FD_OWNER_PID:?}"
+: "${FORMAL_NVIDIA_SMI_SHA256:?}"
+if [[ "$FORMAL_NVIDIA_SMI_FD_OWNER_PID" != "$BASHPID" ]]; then
+  [[ "$FORMAL_NVIDIA_SMI_FD_OWNER_PID" =~ ^[1-9][0-9]*$ ]] || {
+    echo "invalid retained NVIDIA-SMI owner PID" >&2; exit 2;
+  }
+  [[ "$FORMAL_NVIDIA_SMI_FD" =~ ^[0-9]+$ ]] || {
+    echo "invalid retained NVIDIA-SMI descriptor" >&2; exit 2;
+  }
+  exec "$PYTHON" -I -B "$ROOT/scripts/exec_digest_bound_nvidia_smi.py" \
+    --retained-fd-owner-pid "$FORMAL_NVIDIA_SMI_FD_OWNER_PID" \
+    --retained-fd "$FORMAL_NVIDIA_SMI_FD" \
+    --expected-sha256 "$FORMAL_NVIDIA_SMI_SHA256" -- \
+    "${BASH_SOURCE[0]}" "$CASE_ID"
+fi
+[[ "$NVIDIA_SMI" == "/proc/self/fd/$FORMAL_NVIDIA_SMI_FD" && -x "$NVIDIA_SMI" ]] || {
+  echo "main NVIDIA-SMI is not its reacquired verified descriptor" >&2; exit 2;
+}
 export PYTHONPATH="$ROOT/src" PYTHONNOUSERSITE=1
 for NAME in FORMAL_SOURCE_MANIFEST FORMAL_SOURCE_SHA256 FORMAL_SOURCE_COMMIT_SHA \
   FORMAL_SOURCE_TREE_SHA VALIDATION_ARTIFACT_IDENTITY_SHA256 \
@@ -96,15 +135,23 @@ fi
 CSV_PATH="$CASE_ROOT/gpu.csv"
 JSONL_PATH="$CASE_ROOT/gpu.jsonl"
 COMPUTE_LOG="$CASE_ROOT/compute.log"
+DIGEST_BOUND_COMPUTE=(
+  "$PYTHON" -I -B "$ROOT/scripts/exec_digest_bound_nvidia_smi.py"
+  --retained-fd-owner-pid "$FORMAL_NVIDIA_SMI_FD_OWNER_PID"
+  --retained-fd "$FORMAL_NVIDIA_SMI_FD"
+  --expected-sha256 "$FORMAL_NVIDIA_SMI_SHA256" --
+)
 
 if [[ "$CASE_ID" == "nccl_2gpu" ]]; then
   COMPUTE=(
+    "${DIGEST_BOUND_COMPUTE[@]}"
     "$PYTHON" -I -B -m torch.distributed.run --standalone --nproc_per_node=2
     --no-python "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh"
     --rank-worker "$CASE_ID"
   )
 else
   COMPUTE=(
+    "${DIGEST_BOUND_COMPUTE[@]}"
     "$PYTHON" -I -B "$ROOT/scripts/run_exact_tabicl.py"
     --archive-root "$ROOT" --source-manifest "$FORMAL_SOURCE_MANIFEST"
     --expected-manifest-sha256 "$FORMAL_SOURCE_SHA256"

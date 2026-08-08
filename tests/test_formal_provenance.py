@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import subprocess
@@ -10,6 +11,11 @@ import torch
 
 from tabicl.train._provenance import (
     OPERATIONAL_CONFIG_FIELDS,
+    _FORMAL_RUNTIME_DISTRIBUTIONS,
+    _FORMAL_RUNTIME_MODULES,
+    _distribution_fingerprint,
+    _distribution_record_integrity,
+    _module_origin_fingerprint,
     architecture_manifest,
     build_git_source_manifest,
     build_checkpoint_provenance,
@@ -18,7 +24,6 @@ from tabicl.train._provenance import (
     load_source_manifest,
     make_manifest,
     partition_run_config,
-    runtime_environment_manifest,
     validate_cohort_provenance,
     validate_manifest,
     validate_provenance_bundle,
@@ -33,6 +38,190 @@ def _git(*args: str, cwd) -> str:
         stdout=subprocess.PIPE,
         text=True,
     ).stdout.strip()
+
+
+def _fake_distribution(metadata, version):
+    content = {"METADATA": "metadata", "RECORD": "record", "WHEEL": "wheel"}
+    return SimpleNamespace(
+        metadata=metadata,
+        version=version,
+        read_text=lambda name: content.get(name),
+    )
+
+
+def test_distribution_fingerprint_is_canonical_and_path_free():
+    fingerprint = _distribution_fingerprint(
+        _fake_distribution({"Name": "Example_Pkg"}, "1.0+cuda")
+    )
+
+    assert fingerprint["name"] == "example-pkg"
+    assert fingerprint["version"] == "1.0+cuda"
+    assert set(fingerprint) == {
+        "name",
+        "version",
+        "metadata_sha256",
+        "record_sha256",
+        "wheel_sha256",
+    }
+    assert "/" not in str(fingerprint) and "\\" not in str(fingerprint)
+
+
+@pytest.mark.parametrize(
+    "metadata,version",
+    [({}, "1.0"), ({"Name": "bad/name"}, "1.0"), ({"Name": "valid"}, "../1")],
+)
+def test_distribution_fingerprint_rejects_malformed_metadata(metadata, version):
+    with pytest.raises(ValueError, match="installed distribution"):
+        _distribution_fingerprint(_fake_distribution(metadata, version))
+
+
+def test_module_origin_is_inside_selected_distribution_and_matches_record(tmp_path):
+    origin = tmp_path / "example" / "__init__.py"
+    origin.parent.mkdir()
+    origin.write_bytes(b"value = 1\n")
+    digest = hashlib.sha256(origin.read_bytes()).digest()
+
+    class RecordPath(str):
+        hash = SimpleNamespace(
+            mode="sha256",
+            value=base64.urlsafe_b64encode(digest).decode().rstrip("="),
+        )
+
+    distribution = SimpleNamespace(
+        locate_file=lambda _path: tmp_path,
+        files=[RecordPath("example/__init__.py")],
+    )
+    module = SimpleNamespace(__file__=str(origin))
+
+    assert _module_origin_fingerprint(
+        distribution, module, distribution_name="example"
+    ) == {
+        "module_origin_relative_path": "example/__init__.py",
+        "module_origin_sha256": digest.hex(),
+    }
+
+    origin.write_bytes(b"value = 2\n")
+    with pytest.raises(ValueError, match="differs from RECORD"):
+        _module_origin_fingerprint(
+            distribution, module, distribution_name="example"
+        )
+
+
+def _record_path(path: str, raw: bytes, *, size: int | None = None):
+    digest = hashlib.sha256(raw).digest()
+
+    class RecordPath(str):
+        hash = SimpleNamespace(
+            mode="sha256",
+            value=base64.urlsafe_b64encode(digest).decode().rstrip("="),
+        )
+
+    value = RecordPath(path)
+    value.size = len(raw) if size is None else size
+    return value
+
+
+def test_distribution_record_integrity_hashes_all_files_inside_installation(tmp_path):
+    installation = tmp_path / "venv"
+    site_packages = installation / "lib/python/site-packages"
+    package = site_packages / "example/__init__.py"
+    command = installation / "bin/example"
+    package.parent.mkdir(parents=True)
+    command.parent.mkdir(parents=True)
+    package.write_bytes(b"PACKAGE\n")
+    command.write_bytes(b"COMMAND\n")
+    files = [
+        _record_path("example/__init__.py", b"PACKAGE\n"),
+        _record_path("../../../bin/example", b"COMMAND\n"),
+    ]
+    distribution = SimpleNamespace(
+        locate_file=lambda _path: site_packages,
+        files=files,
+    )
+
+    proof, verified = _distribution_record_integrity(
+        distribution,
+        distribution_name="example",
+        installation_roots=(installation,),
+    )
+
+    assert proof == {
+        "record_verified_file_count": 2,
+        "record_verified_total_bytes": 16,
+        "record_verified_files_sha256": canonical_sha256(verified),
+        "record_pyc_mismatch_count": 0,
+    }
+    assert [entry["path"] for entry in verified] == [
+        "bin/example",
+        "lib/python/site-packages/example/__init__.py",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure", ["symlink", "parent_symlink", "missing", "mismatch", "escape"]
+)
+def test_distribution_record_integrity_fails_closed(tmp_path, failure):
+    installation = tmp_path / "venv"
+    site_packages = installation / "lib/python/site-packages"
+    site_packages.mkdir(parents=True)
+    expected = b"EXPECTED\n"
+    record_name = "example/value.bin"
+    if failure == "escape":
+        record_name = "../../../../outside.bin"
+    else:
+        target = site_packages / record_name
+        if failure == "parent_symlink":
+            real_parent = tmp_path / "real-parent"
+            real_parent.mkdir()
+            (site_packages / "example").symlink_to(
+                real_parent, target_is_directory=True
+            )
+        else:
+            target.parent.mkdir(parents=True)
+        if failure == "symlink":
+            real = tmp_path / "real.bin"
+            real.write_bytes(expected)
+            target.symlink_to(real)
+        elif failure == "mismatch":
+            target.write_bytes(b"MISMATCH\n")
+        elif failure == "parent_symlink":
+            target.write_bytes(expected)
+        elif failure != "missing":
+            target.write_bytes(expected)
+    distribution = SimpleNamespace(
+        locate_file=lambda _path: site_packages,
+        files=[_record_path(record_name, expected)],
+    )
+
+    with pytest.raises(ValueError, match="RECORD"):
+        _distribution_record_integrity(
+            distribution,
+            distribution_name="example",
+            installation_roots=(installation,),
+        )
+
+
+def test_distribution_record_integrity_binds_pyc_runtime_mismatch(tmp_path):
+    installation = tmp_path / "venv"
+    site_packages = installation / "lib/python/site-packages"
+    target = site_packages / "example/__pycache__/value.pyc"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"RUNTIME-PYC\n")
+    distribution = SimpleNamespace(
+        locate_file=lambda _path: site_packages,
+        files=[_record_path("example/__pycache__/value.pyc", b"WHEEL-PYC\n")],
+    )
+
+    proof, verified = _distribution_record_integrity(
+        distribution,
+        distribution_name="example",
+        installation_roots=(installation,),
+    )
+
+    assert proof["record_pyc_mismatch_count"] == 1
+    assert verified[0]["matches_record"] is False
+    assert verified[0]["declared_sha256"] != verified[0]["actual_sha256"]
+    assert proof["record_verified_files_sha256"] == canonical_sha256(verified)
 
 
 def test_git_source_manifest_rejects_tracked_gitlinks(tmp_path):
@@ -178,6 +367,47 @@ def _identity_treatment(mode: str) -> dict[str, object]:
     return make_identity_treatment(mode=mode, seed=17, world_size=1)
 
 
+def _environment_payload(*, visible_cuda_device_count=1):
+    return {
+        "python_version": "3.13.5",
+        "python_implementation": "CPython",
+        "python_executable_sha256": "e" * 64,
+        "python_cache_tag": "cpython-313",
+        "python_soabi": "cpython-313-x86_64-linux-gnu",
+        "platform_system": "Linux",
+        "platform_release": "test",
+        "platform_machine": "x86_64",
+        "torch_version": "2.7.1",
+        "numpy_version": "2.0.0",
+        "cuda_runtime_version": "12.8",
+        "cudnn_version": 9000,
+        "environment_fingerprint_schema_version": 2,
+        "installed_distributions_sha256": "d" * 64,
+        "formal_runtime_distributions": [
+            {
+                "name": name,
+                "version": "1.0",
+                "metadata_sha256": "a" * 64,
+                "record_sha256": "b" * 64,
+                "wheel_sha256": "c" * 64,
+                "module": _FORMAL_RUNTIME_MODULES[name],
+                "module_version": "1.0",
+                "module_origin_relative_path": f"{name}/__init__.py",
+                "module_origin_sha256": "f" * 64,
+                "record_verified_file_count": 1,
+                "record_verified_total_bytes": 1,
+                "record_verified_files_sha256": "9" * 64,
+                "record_pyc_mismatch_count": 0,
+            }
+            for name in _FORMAL_RUNTIME_DISTRIBUTIONS
+        ],
+        "unavailable_formal_runtime_distributions": [],
+        "flash_attn3_available": True,
+        "nccl_version": [2, 27, 5],
+        "visible_cuda_device_count": visible_cuda_device_count,
+    }
+
+
 def _optimizer_protocol() -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -255,7 +485,7 @@ def _bundle(mode: str, *, output_id: str | None = None, run_config=None):
     run_config = run_config or _run_config(mode, output_id)
     return build_checkpoint_provenance(
         source_manifest=_source_manifest(),
-        environment={"python": "3.13.5", "torch": "2.7.1", "cuda": None},
+        environment=_environment_payload(),
         model_config=_model_config(mode),
         state_dict=_state_dict(),
         prior_stream=_prior_stream(),
@@ -464,7 +694,7 @@ def _formal_trainer(tmp_path, *, source_sha=None, max_checkpoint_bytes=1 << 20):
             "tabicl.train._provenance", fromlist=["canonical_json_bytes"]
         ).canonical_json_bytes(source)
     )
-    environment = runtime_environment_manifest()
+    environment = make_manifest("environment", _environment_payload())
     config = build_parser().parse_args(
         [
             "--device",
@@ -554,7 +784,18 @@ def _formal_trainer(tmp_path, *, source_sha=None, max_checkpoint_bytes=1 << 20):
         trainer.optimizer, lambda _step: 1.0
     )
     trainer.scaler = torch.GradScaler("cuda", enabled=False)
+    trainer._test_environment_manifest = environment
     return trainer
+
+
+def _stub_trainer_environment(monkeypatch, trainer):
+    import tabicl.train._run as run_module
+
+    monkeypatch.setattr(
+        run_module,
+        "runtime_environment_manifest",
+        lambda *, require_formal_runtime: trainer._test_environment_manifest,
+    )
 
 
 def test_formal_parser_defaults_off_and_exposes_explicit_trust_inputs():
@@ -577,8 +818,9 @@ def test_formal_parser_defaults_off_and_exposes_explicit_trust_inputs():
         assert hasattr(config, name)
 
 
-def test_trainer_formal_checkpoint_persists_validated_provenance(tmp_path):
+def test_trainer_formal_checkpoint_persists_validated_provenance(tmp_path, monkeypatch):
     trainer = _formal_trainer(tmp_path)
+    _stub_trainer_environment(monkeypatch, trainer)
     trainer.configure_formal_provenance()
     trainer.save_checkpoint("step-1.ckpt")
 
@@ -607,6 +849,7 @@ def test_formal_trainer_passes_overlay_checkpoint_ceiling_to_atomic_save(
     import tabicl.train._run as run_module
 
     trainer = _formal_trainer(tmp_path, max_checkpoint_bytes=123_456)
+    _stub_trainer_environment(monkeypatch, trainer)
     trainer.configure_formal_provenance()
     observed = {}
 

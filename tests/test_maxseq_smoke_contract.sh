@@ -27,11 +27,32 @@ contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'hermetic_git() {'
 contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'GIT_ALLOW_PROTOCOL=https'
 contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'hermetic_git -C "$CHECKOUT_PARENT" clone --quiet --no-hardlinks --no-checkout --'
 contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'remote get-url origin'
-contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '"$NVIDIA_SMI" --id="$GPU_TOKEN"'
-contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'trap '\''status=$?; trap - EXIT INT TERM; cleanup; exit "$status"'\'' EXIT'
-contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'verify_filesystem_isolation.py'
-contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" 'exec "$FORMAL_SUBMISSION_EXACT_ROOT/scripts/run_slurm_h100_identity_case.sh" 1'
-contains "$ROOT/scripts/slurm_h100_identity_nccl_smoke.sh" 'exec "$FORMAL_SUBMISSION_EXACT_ROOT/scripts/run_slurm_h100_identity_case.sh" 2'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '--query-token "$GPU_TOKEN"'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '--query-fields uuid,name,driver_version'
+contains "$ROOT/scripts/exec_digest_bound_nvidia_smi.py" 'QUERY_TIMEOUT_SECONDS = 15'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'trap '\''status=$?; trap - EXIT HUP INT TERM; cleanup; exit "$status"'\'' EXIT'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" "trap 'exit 129' HUP"
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'FORMAL_H100_VERIFY_FILESYSTEM_FD'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'FORMAL_H100_VERIFY_ENVIRONMENT_FD'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '--expected-sha256 "$FORMAL_EXPECTED_ENVIRONMENT_SHA256"'
+contains "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" 'exec "$PYTHON" -I -B - 1'
+contains "$ROOT/scripts/slurm_h100_identity_nccl_smoke.sh" 'exec "$PYTHON" -I -B - 2'
+for SCRIPT in "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" "$ROOT/scripts/slurm_h100_identity_nccl_smoke.sh"; do
+  contains "$SCRIPT" '"FORMAL_TRUSTED_RUNNER_FD": ("run_slurm_h100_identity_case.sh", True)'
+  contains "$SCRIPT" 'runner_fd = trusted_fds["FORMAL_TRUSTED_RUNNER_FD"]'
+  contains "$SCRIPT" '"FORMAL_H100_NVIDIA_LAUNCHER_FD": ("exec_digest_bound_nvidia_smi.py", False)'
+  contains "$SCRIPT" '"FORMAL_H100_VERIFY_GIT_FD": ("verify_git_repository.py", False)'
+  contains "$SCRIPT" '"FORMAL_H100_VERIFY_FILESYSTEM_FD": ("verify_filesystem_isolation.py", False)'
+  contains "$SCRIPT" '"FORMAL_H100_VERIFY_ENVIRONMENT_FD": ("verify_formal_environment.py", False)'
+  contains "$SCRIPT" 'trusted H100 helper differs from committed source'
+done
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '"/proc/self/fd/$FORMAL_H100_NVIDIA_LAUNCHER_FD"'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '"/proc/self/fd/$FORMAL_H100_VERIFY_GIT_FD"'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '"/proc/self/fd/$FORMAL_H100_VERIFY_FILESYSTEM_FD"'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '"/proc/self/fd/$FORMAL_H100_VERIFY_ENVIRONMENT_FD"'
+if grep -F '"$GIT" -C' "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" "$ROOT/scripts/slurm_h100_identity_nccl_smoke.sh" >/dev/null; then
+  fail "static Slurm wrapper executes mutable GIT before shared digest binding"
+fi
 if grep -F 'dirname "${BASH_SOURCE[0]}"' "$ROOT/scripts/slurm_h100_identity_maxseq_smoke.sh" >/dev/null; then
   fail "one-GPU spool wrapper resolves an untrusted sibling directory"
 fi
@@ -41,6 +62,9 @@ fi
 contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" 'FORMAL_VISIBLE_GPU_UUIDS'
 contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" 'FORMAL_EXPECTED_ENVIRONMENT_SHA256'
 contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" '--nproc_per_node=2'
+contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" 'main NVIDIA-SMI is not its reacquired verified descriptor'
+contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" 'DIGEST_BOUND_COMPUTE=('
+contains "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" '"${DIGEST_BOUND_COMPUTE[@]}"'
 if grep -F 'MAXSEQ_REPEAT_STEPS' "$ROOT/scripts/run_h100_identity_maxseq_smoke.sh" >/dev/null; then
   fail "hostile repeat-step override is exposed"
 fi

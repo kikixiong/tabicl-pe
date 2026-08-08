@@ -29,6 +29,18 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _JOB_ID = re.compile(r"^[1-9][0-9]{0,19}$")
 _SBATCH_RESULT = re.compile(r"^([1-9][0-9]{0,19})(?:;[A-Za-z0-9._-]+)?$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
+_ENVIRONMENT_COMPLETION_MAX_BYTES = 1 << 20
+_ENVIRONMENT_MANIFEST_MAX_BYTES = 1 << 20
+_ENVIRONMENT_INVENTORY_MAX_BYTES = 128 << 20
+SCHEDULER_COMMAND_TIMEOUT_SECONDS = 30
+LOCAL_GIT_CONFIG_OVERRIDES = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.filemode=true",
+)
 _ONE_GPU_WRAPPER = "scripts/slurm_h100_identity_maxseq_smoke.sh"
 _TWO_GPU_WRAPPER = "scripts/slurm_h100_identity_nccl_smoke.sh"
 _SCHEDULER = {
@@ -282,6 +294,22 @@ def _load_strict_json(path: Path, *, max_bytes: int = 8 << 20) -> Mapping[str, A
     return value
 
 
+def _strict_json_bytes(raw: bytes, *, where: str, max_bytes: int) -> Mapping[str, Any]:
+    if len(raw) > max_bytes:
+        _fail(f"{where} exceeds its byte ceiling")
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_pairs,
+            parse_constant=lambda token: _fail(f"invalid JSON constant: {token}"),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid {where} JSON") from error
+    if not isinstance(value, Mapping) or raw != _canonical(value) + b"\n":
+        _fail(f"{where} must be canonical newline-terminated JSON")
+    return value
+
+
 def _absolute(path: Any, where: str) -> Path:
     if not isinstance(path, str) or not path:
         _fail(f"{where} must be a non-empty absolute path")
@@ -328,36 +356,112 @@ def _require_executable(path: Any, where: str) -> Path:
     return value
 
 
-def _attest_regular_executable(path: Any, expected_sha256: Any, where: str) -> Path:
-    value = _absolute(path, where)
+def _open_digest_bound_file(
+    path: Any,
+    expected_sha256: Any,
+    where: str,
+    *,
+    require_executable: bool,
+) -> tuple[str, int]:
+    """Open/hash one file and retain that exact inode for later consumption."""
+
+    value = _absolute(
+        os.fspath(path) if isinstance(path, os.PathLike) else path, where
+    )
     expected = _digest(expected_sha256, f"{where} digest")
     parent_fd = _open_directory_nofollow(value.parent, where=f"{where} parent")
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         fd = os.open(value.name, flags, dir_fd=parent_fd)
     except OSError as error:
+        raise ValueError(f"{where} is not a no-follow regular file") from error
+    finally:
         os.close(parent_fd)
-        raise ValueError(f"{where} is not a no-follow regular executable") from error
-    os.close(parent_fd)
     try:
         before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o111 == 0:
-            _fail(f"{where} is not a regular executable")
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (require_executable and before.st_mode & 0o111 == 0)
+            or before.st_size > 128 * 1024 * 1024
+        ):
+            _fail(
+                f"{where} is not a bounded regular"
+                + (" executable" if require_executable else " file")
+            )
         digest = hashlib.sha256()
-        while True:
-            chunk = os.read(fd, 1 << 20)
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1 << 20, remaining))
             if not chunk:
-                break
+                _fail(f"{where} was truncated while being attested")
             digest.update(chunk)
+            remaining -= len(chunk)
         after = os.fstat(fd)
-        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
         if any(getattr(before, field) != getattr(after, field) for field in fields):
             _fail(f"{where} changed while being attested")
         if digest.hexdigest() != expected:
             _fail(f"{where} digest mismatch")
-    finally:
+        os.lseek(fd, 0, os.SEEK_SET)
+        return f"/proc/self/fd/{fd}", fd
+    except BaseException:
         os.close(fd)
-    return value
+        raise
+
+
+def _open_digest_bound_executable(
+    path: Any, expected_sha256: Any, where: str
+) -> tuple[str, int]:
+    return _open_digest_bound_file(
+        path,
+        expected_sha256,
+        where,
+        require_executable=True,
+    )
+
+
+def _open_digest_bound_regular_file(
+    path: Any, expected_sha256: Any, where: str
+) -> tuple[str, int]:
+    return _open_digest_bound_file(
+        path,
+        expected_sha256,
+        where,
+        require_executable=False,
+    )
+
+
+def _open_scheduler_commands(
+    specifications: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, str], tuple[int, ...]]:
+    commands: dict[str, str] = {}
+    descriptors: list[int] = []
+    try:
+        for name in sorted(specifications):
+            command, descriptor = _open_digest_bound_executable(
+                specifications[name]["path"],
+                specifications[name]["sha256"],
+                f"scheduler {name}",
+            )
+            commands[name] = command
+            descriptors.append(descriptor)
+    except BaseException:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
+    return commands, tuple(descriptors)
 
 
 def _load_module(name: str, path: Path):
@@ -414,6 +518,7 @@ def _run(
     env: Mapping[str, str] | None = None,
     where: str,
     check: bool = True,
+    pass_fds: Sequence[int] = (),
 ) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         list(argv),
@@ -423,37 +528,212 @@ def _run(
         stderr=subprocess.PIPE,
         text=True,
         check=False,
+        timeout=SCHEDULER_COMMAND_TIMEOUT_SECONDS,
+        pass_fds=tuple(pass_fds),
     )
     if check and completed.returncode != 0:
         raise RuntimeError(f"{where} failed with status {completed.returncode}: {completed.stderr.strip()}")
     return completed
 
 
-def _git(git: Path, root: Path, *args: str) -> str:
+def _verify_environment_transaction(
+    *,
+    exact_root: Path,
+    python: Path,
+    source_commit_sha: str,
+    source_tree_sha: str,
+    git_sha256: str,
+    environments: Mapping[str, str],
+    specification: Mapping[str, Any],
+    verifier_sha256: str,
+) -> dict[str, Any]:
+    completion_path = _absolute(
+        specification["completion_path"], "environment completion marker"
+    )
+    verifier_command, verifier_fd = _open_digest_bound_regular_file(
+        exact_root / "scripts/verify_formal_environment_transaction.py",
+        verifier_sha256,
+        "formal environment transaction verifier",
+    )
+    try:
+        completed = _run(
+            [
+                os.fspath(python),
+                "-I",
+                "-B",
+                verifier_command,
+                "--completion",
+                os.fspath(completion_path),
+                "--expected-completion-sha256",
+                specification["completion_sha256"],
+                "--expected-transaction-sha256",
+                specification["transaction_sha256"],
+                "--expected-one-gpu-environment-sha256",
+                environments["1"],
+                "--expected-two-gpu-environment-sha256",
+                environments["2"],
+                "--expected-inventory-sha256",
+                specification["inventory_sha256"],
+                "--expected-source-commit-sha",
+                source_commit_sha,
+                "--expected-source-tree-sha",
+                source_tree_sha,
+                "--expected-git-sha256",
+                git_sha256,
+                "--completion-max-bytes",
+                str(specification["completion_max_bytes"]),
+                "--manifest-max-bytes",
+                str(specification["manifest_max_bytes"]),
+                "--inventory-max-bytes",
+                str(specification["inventory_max_bytes"]),
+            ],
+            env={
+                "PATH": "/usr/bin:/bin",
+                "LC_ALL": "C",
+                "LANG": "C",
+                "PYTHONPATH": os.fspath(exact_root / "src"),
+                "PYTHONNOUSERSITE": "1",
+            },
+            where="formal environment transaction verification",
+            pass_fds=(verifier_fd,),
+        )
+    finally:
+        os.close(verifier_fd)
+    if completed.stderr:
+        _fail("formal environment transaction verifier emitted stderr")
+    summary = _strict_json_bytes(
+        completed.stdout.encode("utf-8"),
+        where="formal environment transaction verifier output",
+        max_bytes=1 << 20,
+    )
+    _exact_keys(
+        summary,
+        {
+            "schema_version",
+            "kind",
+            "completion_raw_sha256",
+            "transaction_sha256",
+            "source_commit_sha",
+            "source_tree_sha",
+            "git_sha256",
+            "one_gpu_environment_sha256",
+            "two_gpu_environment_sha256",
+            "inventory_sha256",
+            "installed_distributions_sha256",
+            "capture_visible_cuda_device_count",
+            "output_raw_sha256_by_role",
+        },
+        "formal environment transaction verification summary",
+    )
+    output_digests = summary["output_raw_sha256_by_role"]
+    _exact_keys(
+        output_digests,
+        {"one_gpu", "two_gpu", "inventory"},
+        "formal environment transaction raw-output map",
+    )
+    for role, digest in output_digests.items():
+        _digest(digest, f"formal environment {role} raw output")
+    capture_count = summary["capture_visible_cuda_device_count"]
+    if (
+        isinstance(capture_count, bool)
+        or not isinstance(capture_count, int)
+        or capture_count < 0
+    ):
+        _fail("formal environment capture GPU count is invalid")
+    expected = {
+        "schema_version": 1,
+        "kind": "formal_environment_transaction_verification",
+        "completion_raw_sha256": specification["completion_sha256"],
+        "transaction_sha256": specification["transaction_sha256"],
+        "source_commit_sha": source_commit_sha,
+        "source_tree_sha": source_tree_sha,
+        "git_sha256": git_sha256,
+        "one_gpu_environment_sha256": environments["1"],
+        "two_gpu_environment_sha256": environments["2"],
+        "inventory_sha256": specification["inventory_sha256"],
+    }
+    if any(summary[key] != value for key, value in expected.items()):
+        _fail("formal environment transaction verifier returned a binding mismatch")
+    _digest(
+        summary["installed_distributions_sha256"],
+        "formal environment installed-distribution inventory",
+    )
+    return {
+        **dict(summary),
+        "output_raw_sha256_by_role": dict(output_digests),
+    }
+
+
+def _git(git_command: str, git_fd: int, root: Path, *args: str) -> str:
     return _run(
-        [os.fspath(git), "-C", os.fspath(root), *args],
-        env={"PATH": os.fspath(git.parent), "LC_ALL": "C", "LANG": "C"},
+        [git_command, *LOCAL_GIT_CONFIG_OVERRIDES, "-C", os.fspath(root), *args],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "LC_ALL": "C",
+            "LANG": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_CEILING_DIRECTORIES": "/",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_PROTOCOL_FROM_USER": "0",
+            "GIT_ALLOW_PROTOCOL": "https",
+        },
         where=f"git {' '.join(args)}",
+        pass_fds=(git_fd,),
     ).stdout.strip()
 
 
 def _attest_exact_checkout(
-    *, root: Path, git: Path, commit_sha: str, tree_sha: str, source: Mapping[str, Any]
+    *,
+    root: Path,
+    git_command: str,
+    git_fd: int,
+    commit_sha: str,
+    tree_sha: str,
+    source: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     _require_directory(root, where="exact candidate root")
     if Path(__file__).resolve(strict=True) != (root / "scripts/submit_h100_identity_validation.py").resolve(strict=True):
         _fail("submission controller is not running from exact candidate root")
-    if _git(git, root, "rev-parse", "HEAD") != commit_sha:
+    if _git(git_command, git_fd, root, "rev-parse", "HEAD") != commit_sha:
         _fail("exact checkout commit mismatch")
-    if _git(git, root, "rev-parse", "HEAD^{tree}") != tree_sha:
+    if _git(git_command, git_fd, root, "rev-parse", "HEAD^{tree}") != tree_sha:
         _fail("exact checkout tree mismatch")
-    if _git(git, root, "status", "--porcelain=v1", "--untracked-files=all"):
+    if _git(
+        git_command,
+        git_fd,
+        root,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    ):
         _fail("exact checkout is dirty")
     symbolic = _run(
-        [os.fspath(git), "-C", os.fspath(root), "symbolic-ref", "-q", "HEAD"],
-        env={"PATH": os.fspath(git.parent), "LC_ALL": "C", "LANG": "C"},
+        [
+            git_command,
+            *LOCAL_GIT_CONFIG_OVERRIDES,
+            "-C",
+            os.fspath(root),
+            "symbolic-ref",
+            "-q",
+            "HEAD",
+        ],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "LC_ALL": "C",
+            "LANG": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_CEILING_DIRECTORIES": "/",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_PROTOCOL_FROM_USER": "0",
+            "GIT_ALLOW_PROTOCOL": "https",
+        },
         where="detached checkout check",
         check=False,
+        pass_fds=(git_fd,),
     )
     if symbolic.returncode == 0:
         _fail("exact checkout must be detached")
@@ -464,19 +744,27 @@ def _attest_exact_checkout(
     manifest = verifier.load_and_validate_source_manifest(
         Path(source["manifest_path"]), source["manifest_sha256"], commit_sha, tree_sha
     )
-    verifier.verify_archive(root, manifest)
-    tracked = {entry["path"] for entry in manifest["payload"]["entries"]}
     required = {
         "scripts/submit_h100_identity_validation.py",
         "scripts/submit_h100_identity_validation.sh",
         "scripts/run_h100_identity_validation.py",
         "scripts/run_h100_identity_maxseq_smoke.sh",
         "scripts/run_slurm_h100_identity_case.sh",
+        "scripts/formal_run_with_gpu_monitor.sh",
+        "scripts/run_with_durable_log.sh",
+        "scripts/exec_digest_bound_git.py",
+        "scripts/exec_digest_bound_nvidia_smi.py",
+        "scripts/verify_formal_environment.py",
+        "scripts/verify_formal_environment_transaction.py",
         _ONE_GPU_WRAPPER,
         _TWO_GPU_WRAPPER,
     }
-    if not required <= tracked:
-        _fail(f"source manifest omits H100 gate controller files: {sorted(required - tracked)}")
+    verifier.require_manifest_coverage(
+        manifest,
+        required_paths=required,
+        required_code_roots=("scripts", "src/tabicl"),
+    )
+    verifier.verify_archive(root, manifest)
     return manifest
 
 
@@ -512,7 +800,66 @@ def _write_all(fd: int, raw: bytes) -> None:
         offset += written
 
 
-def _publish_no_replace(path: Path, value: Mapping[str, Any], *, max_bytes: int) -> Path:
+class _PublicationUncertain(RuntimeError):
+    def __init__(self, path: Path):
+        super().__init__(f"publication visibility could not be revoked: {path.name}")
+        self.path = path
+
+
+class _PublicationInterrupted(BaseException):
+    """A process interrupt observed after publication became durable."""
+
+    def __init__(self, path: Path, interruption: BaseException):
+        super().__init__(f"publication committed while interrupted: {path.name}")
+        self.path = path
+        self.interruption = interruption
+
+
+def _publication_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_published_bytes(parent_fd: int, name: str, *, max_bytes: int) -> bytes:
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > max_bytes:
+            raise ValueError("published artifact is not a bounded regular file")
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(fd, min(1 << 20, remaining))
+            if not chunk:
+                raise ValueError("published artifact was truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if _publication_signature(os.fstat(fd)) != _publication_signature(opened):
+            raise ValueError("published artifact changed during verification")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _publish_no_replace(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    max_bytes: int,
+    fault: str | None = None,
+) -> Path:
     raw = _canonical(value) + b"\n"
     if len(raw) > max_bytes:
         _fail(f"publication exceeds ceiling: {path.name}")
@@ -520,6 +867,9 @@ def _publish_no_replace(path: Path, value: Mapping[str, Any], *, max_bytes: int)
     temporary = f".{path.name}.{secrets.token_hex(16)}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     fd = -1
+    linked = False
+    durably_committed = False
+    durably_revoked = False
     try:
         fd = os.open(temporary, flags, 0o400, dir_fd=parent_fd)
         _write_all(fd, raw)
@@ -527,18 +877,112 @@ def _publish_no_replace(path: Path, value: Mapping[str, Any], *, max_bytes: int)
         os.close(fd)
         fd = -1
         os.link(temporary, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+        linked = True
+        if fault == "after_link":
+            raise OSError("injected publication failure after link")
         os.fsync(parent_fd)
+        if fault == "after_link_fsync":
+            raise OSError("injected publication failure after link fsync")
         os.unlink(temporary, dir_fd=parent_fd)
+        if fault == "after_temp_unlink":
+            raise OSError("injected publication failure after temporary unlink")
         os.fsync(parent_fd)
+        durably_committed = True
         return path
+    except BaseException as error:
+        if not linked:
+            # Python may deliver a process signal after link(2) committed but
+            # before the following assignment ran.  Recover that exact window
+            # only when the final and private temporary names are hard links
+            # to the same regular inode; an unrelated pre-existing final must
+            # remain a no-replace collision.
+            try:
+                temporary_info = os.stat(
+                    temporary, dir_fd=parent_fd, follow_symlinks=False
+                )
+                published_info = os.stat(
+                    path.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except OSError:
+                pass
+            else:
+                linked = (
+                    stat.S_ISREG(temporary_info.st_mode)
+                    and stat.S_ISREG(published_info.st_mode)
+                    and temporary_info.st_dev == published_info.st_dev
+                    and temporary_info.st_ino == published_info.st_ino
+                )
+        if linked:
+            completion_error: BaseException | None = None
+            try:
+                if _read_published_bytes(
+                    parent_fd, path.name, max_bytes=max_bytes
+                ) != raw:
+                    raise ValueError("published artifact differs from intended bytes")
+                # A second directory sync closes a one-shot post-link failure.
+                os.fsync(parent_fd)
+                try:
+                    os.unlink(temporary, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                os.fsync(parent_fd)
+                durably_committed = True
+            except BaseException as caught:
+                completion_error = caught
+            if completion_error is None:
+                if not isinstance(error, Exception):
+                    raise _PublicationInterrupted(path, error) from error
+                return path
+            else:
+                removed = False
+                try:
+                    os.unlink(path.name, dir_fd=parent_fd)
+                    removed = True
+                except FileNotFoundError:
+                    removed = True
+                except OSError:
+                    pass
+                if removed:
+                    try:
+                        os.fsync(parent_fd)
+                    except BaseException as revoke_error:
+                        raise _PublicationUncertain(path) from revoke_error
+                    durably_committed = False
+                    durably_revoked = True
+                else:
+                    raise _PublicationUncertain(path) from completion_error
+        raise error
     finally:
+        active_error = sys.exc_info()[1]
+        cleanup_error: BaseException | None = None
         if fd >= 0:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except BaseException as error:
+                cleanup_error = error
         try:
             os.unlink(temporary, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
-        os.close(parent_fd)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        try:
+            os.close(parent_fd)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if cleanup_error is not None:
+            if durably_committed:
+                if not isinstance(cleanup_error, Exception):
+                    raise _PublicationInterrupted(path, cleanup_error) from cleanup_error
+                # The final name and removal of the private temporary name
+                # were already directory-synced.  A redundant cleanup/close
+                # error cannot turn that durable commit into a rollback.
+            elif active_error is None:
+                if linked and not durably_revoked:
+                    raise _PublicationUncertain(path) from cleanup_error
+                raise cleanup_error
 
 
 class _Journal:
@@ -581,7 +1025,13 @@ class _Journal:
         self.head = record["sha256"]
 
     def snapshot(self) -> tuple[str, int]:
-        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(
+            self.path,
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
         try:
             digest = hashlib.sha256()
             while True:
@@ -615,6 +1065,7 @@ def _scheduler_state_token(raw: str) -> str | None:
 def _scheduler_state(
     commands: Mapping[str, str],
     scheduler_env: Mapping[str, str],
+    scheduler_fds: Sequence[int],
     *,
     job_id: str,
     cluster: str | None,
@@ -630,6 +1081,7 @@ def _scheduler_state(
         env=scheduler_env,
         where=f"squeue reconciliation {job_id}",
         check=False,
+        pass_fds=scheduler_fds,
     )
     queue_rows: list[tuple[str, str]] = []
     if query.returncode == 0:
@@ -658,6 +1110,7 @@ def _scheduler_state(
         env=scheduler_env,
         where=f"sacct reconciliation {job_id}",
         check=False,
+        pass_fds=scheduler_fds,
     )
     accounting_rows: list[str] = []
     if accounting.returncode == 0:
@@ -681,6 +1134,7 @@ def _scheduler_state(
 def _scheduler_state_bounded_retry(
     commands: Mapping[str, str],
     scheduler_env: Mapping[str, str],
+    scheduler_fds: Sequence[int],
     *,
     job_id: str,
     cluster: str | None,
@@ -694,7 +1148,11 @@ def _scheduler_state_bounded_retry(
     for _attempt in range(attempts):
         try:
             last = _scheduler_state(
-                commands, scheduler_env, job_id=job_id, cluster=cluster
+                commands,
+                scheduler_env,
+                scheduler_fds,
+                job_id=job_id,
+                cluster=cluster,
             )
             if acceptable(*last):
                 return last
@@ -734,6 +1192,7 @@ def _transaction_job_name(transaction_id: str, position: int) -> str:
 def _discover_transaction_jobs(
     commands: Mapping[str, str],
     scheduler_env: Mapping[str, str],
+    scheduler_fds: Sequence[int],
     *,
     job_name: str,
 ) -> list[dict[str, str | None]]:
@@ -749,6 +1208,7 @@ def _discover_transaction_jobs(
         env=scheduler_env,
         where=f"squeue response-loss discovery {job_name}",
         check=False,
+        pass_fds=scheduler_fds,
     )
     found: dict[str, dict[str, str | None]] = {}
     if query.returncode == 0:
@@ -785,6 +1245,7 @@ def _discover_transaction_jobs(
         env=scheduler_env,
         where=f"sacct response-loss discovery {job_name}",
         check=False,
+        pass_fds=scheduler_fds,
     )
     if accounting.returncode == 0:
         for row in accounting.stdout.splitlines():
@@ -852,6 +1313,7 @@ def _parse_sbatch(raw: str) -> tuple[str, str | None]:
 def _rollback(
     commands: Mapping[str, str],
     scheduler_env: Mapping[str, str],
+    scheduler_fds: Sequence[int],
     accepted: Sequence[Mapping[str, Any]],
     journal: _Journal,
 ) -> tuple[list[str], list[str]]:
@@ -867,6 +1329,7 @@ def _rollback(
                 env=scheduler_env,
                 where=f"rollback cancellation {job_id}",
                 check=False,
+                pass_fds=scheduler_fds,
             )
         except BaseException as cancel_error:
             remaining.append(job_id)
@@ -888,6 +1351,7 @@ def _rollback(
             state, reason, source = _scheduler_state_bounded_retry(
                 commands,
                 scheduler_env,
+                scheduler_fds,
                 job_id=job_id,
                 cluster=cluster,
                 acceptable=_terminal_state_is_acceptable,
@@ -936,6 +1400,7 @@ def _validate_overlay(value: Mapping[str, Any], *, exact_root: Path) -> dict[str
             "artifact_root",
             "source",
             "environment_sha256_by_world_size",
+            "environment_transaction",
             "runtime",
             "limits",
             "scheduler_commands",
@@ -991,13 +1456,23 @@ def _validate_overlay(value: Mapping[str, Any], *, exact_root: Path) -> dict[str
     runtime = value["runtime"]
     _exact_keys(
         runtime,
-        {"python", "git", "git_sha256", "nvidia_smi", "case_work_root"},
+        {
+            "python", "git", "git_sha256", "nvidia_smi",
+            "nvidia_smi_sha256", "case_work_root",
+        },
         "overlay runtime",
     )
     python = _require_executable(runtime["python"], "runtime Python")
-    git = _require_executable(runtime["git"], "runtime Git")
+    git = _absolute(runtime["git"], "runtime Git")
     git_sha256 = _digest(runtime["git_sha256"], "runtime Git")
-    nvidia_smi = _require_executable(runtime["nvidia_smi"], "runtime nvidia-smi")
+    nvidia_smi = _absolute(runtime["nvidia_smi"], "runtime nvidia-smi")
+    nvidia_smi_sha256 = _digest(
+        runtime["nvidia_smi_sha256"], "runtime nvidia-smi"
+    )
+    _nvidia_command, nvidia_fd = _open_digest_bound_executable(
+        nvidia_smi, nvidia_smi_sha256, "runtime nvidia-smi"
+    )
+    os.close(nvidia_fd)
     case_work_root = _require_directory(
         _absolute(runtime["case_work_root"], "case work root"), where="case work root"
     )
@@ -1011,18 +1486,92 @@ def _validate_overlay(value: Mapping[str, Any], *, exact_root: Path) -> dict[str
     ):
         _fail("case work root must not overlap exact source or artifact namespace")
 
+    environment_transaction = value["environment_transaction"]
+    _exact_keys(
+        environment_transaction,
+        {
+            "completion_path",
+            "completion_sha256",
+            "transaction_sha256",
+            "inventory_sha256",
+            "completion_max_bytes",
+            "manifest_max_bytes",
+            "inventory_max_bytes",
+        },
+        "formal environment transaction",
+    )
+    completion_path = _absolute(
+        environment_transaction["completion_path"],
+        "formal environment completion marker",
+    )
+    completion_parent = _require_directory(
+        completion_path.parent, where="formal environment transaction directory"
+    )
+    for protected_root, label in (
+        (exact_root, "exact source"),
+        (artifact_root, "artifact namespace"),
+        (case_work_root, "case work root"),
+    ):
+        if (
+            completion_parent == protected_root
+            or protected_root in completion_parent.parents
+            or completion_parent in protected_root.parents
+        ):
+            _fail(
+                "formal environment transaction directory must not overlap "
+                f"{label}"
+            )
+    fixed_environment_transaction = {
+        "completion_path": os.fspath(completion_path),
+        "completion_sha256": _digest(
+            environment_transaction["completion_sha256"],
+            "formal environment completion marker",
+        ),
+        "transaction_sha256": _digest(
+            environment_transaction["transaction_sha256"],
+            "formal environment transaction",
+        ),
+        "inventory_sha256": _digest(
+            environment_transaction["inventory_sha256"],
+            "formal environment inventory",
+        ),
+        "completion_max_bytes": _positive(
+            environment_transaction["completion_max_bytes"],
+            "formal environment completion ceiling",
+        ),
+        "manifest_max_bytes": _positive(
+            environment_transaction["manifest_max_bytes"],
+            "formal environment manifest ceiling",
+        ),
+        "inventory_max_bytes": _positive(
+            environment_transaction["inventory_max_bytes"],
+            "formal environment inventory ceiling",
+        ),
+    }
+    expected_environment_ceilings = {
+        "completion_max_bytes": _ENVIRONMENT_COMPLETION_MAX_BYTES,
+        "manifest_max_bytes": _ENVIRONMENT_MANIFEST_MAX_BYTES,
+        "inventory_max_bytes": _ENVIRONMENT_INVENTORY_MAX_BYTES,
+    }
+    if any(
+        fixed_environment_transaction[key] != expected
+        for key, expected in expected_environment_ceilings.items()
+    ):
+        _fail("formal environment transaction ceilings are not canonical")
+
     scheduler_commands = value["scheduler_commands"]
     command_names = {"sbatch", "scontrol", "scancel", "squeue", "sacct"}
     _exact_keys(scheduler_commands, command_names, "scheduler command map")
-    fixed_commands: dict[str, str] = {}
+    fixed_commands: dict[str, dict[str, str]] = {}
     scheduler_digests: dict[str, str] = {}
     for name in sorted(command_names):
         entry = scheduler_commands[name]
         _exact_keys(entry, {"path", "sha256"}, f"scheduler command {name}")
-        fixed_commands[name] = os.fspath(
-            _attest_regular_executable(entry["path"], entry["sha256"], f"scheduler {name}")
-        )
-        scheduler_digests[name] = entry["sha256"]
+        fixed_commands[name] = {
+            "path": os.fspath(_absolute(entry["path"], f"scheduler {name}")),
+            "sha256": _digest(entry["sha256"], f"scheduler {name}"),
+        }
+        scheduler_digests[name] = fixed_commands[name]["sha256"]
 
     limits = value["limits"]
     _exact_keys(
@@ -1039,20 +1588,46 @@ def _validate_overlay(value: Mapping[str, Any], *, exact_root: Path) -> dict[str
     )
     limits = {key: _positive(item, key) for key, item in limits.items()}
 
-    manifest = _attest_exact_checkout(
-        root=exact_root,
-        git=git,
-        commit_sha=commit_sha,
-        tree_sha=tree_sha,
-        source=source,
+    git_command, git_fd = _open_digest_bound_executable(
+        git, git_sha256, "runtime Git"
     )
+    try:
+        manifest = _attest_exact_checkout(
+            root=exact_root,
+            git_command=git_command,
+            git_fd=git_fd,
+            commit_sha=commit_sha,
+            tree_sha=tree_sha,
+            source=source,
+        )
+    finally:
+        os.close(git_fd)
     if manifest["sha256"] != source_sha:
         _fail("validated source manifest digest mismatch")
+    manifest_entries = {
+        entry["path"]: entry for entry in manifest["payload"]["entries"]
+    }
+    environment_verifier_sha256 = _digest(
+        manifest_entries["scripts/verify_formal_environment_transaction.py"][
+            "sha256"
+        ],
+        "formal environment transaction verifier source",
+    )
     repository_binding = _query_repository_binding(
         exact_root=exact_root,
         git=git,
         git_sha256=git_sha256,
         commit_sha=commit_sha,
+    )
+    environment_transaction_summary = _verify_environment_transaction(
+        exact_root=exact_root,
+        python=python,
+        source_commit_sha=commit_sha,
+        source_tree_sha=tree_sha,
+        git_sha256=git_sha256,
+        environments=environments,
+        specification=fixed_environment_transaction,
+        verifier_sha256=environment_verifier_sha256,
     )
     filesystem_isolation = _require_work_artifact_filesystem_isolation(
         exact_root=exact_root,
@@ -1119,6 +1694,7 @@ def _validate_overlay(value: Mapping[str, Any], *, exact_root: Path) -> dict[str
             "PYTHON": os.fspath(python),
             "GIT": os.fspath(git),
             "NVIDIA_SMI": os.fspath(nvidia_smi),
+            "FORMAL_NVIDIA_SMI_SHA256": nvidia_smi_sha256,
             "PYTHONPATH": os.fspath(exact_root / "src"),
             "PYTHONNOUSERSITE": "1",
             "PATH": "/usr/bin:/bin",
@@ -1137,6 +1713,25 @@ def _validate_overlay(value: Mapping[str, Any], *, exact_root: Path) -> dict[str
             }
         )
 
+    wrapper_commands: dict[str, str] = {}
+    wrapper_fds: list[int] = []
+    try:
+        for world_size, wrapper in (
+            ("1", _ONE_GPU_WRAPPER),
+            ("2", _TWO_GPU_WRAPPER),
+        ):
+            command, descriptor = _open_digest_bound_executable(
+                exact_root / wrapper,
+                manifest_entries[wrapper]["sha256"],
+                f"{world_size}-GPU Slurm spool wrapper",
+            )
+            wrapper_commands[world_size] = command
+            wrapper_fds.append(descriptor)
+    except BaseException:
+        for descriptor in wrapper_fds:
+            os.close(descriptor)
+        raise
+
     return {
         "validation_id": validation_id,
         "artifact_root": artifact_root,
@@ -1147,12 +1742,16 @@ def _validate_overlay(value: Mapping[str, Any], *, exact_root: Path) -> dict[str
             "manifest_sha256": source_sha,
         },
         "environment_sha256_by_world_size": environments,
+        "environment_transaction": environment_transaction_summary,
+        "nvidia_smi_sha256": nvidia_smi_sha256,
         "limits": limits,
         "scheduler_commands": fixed_commands,
         "scheduler_command_sha256": scheduler_digests,
         "repository_binding": repository_binding,
         "filesystem_isolation": filesystem_isolation,
         "jobs": jobs,
+        "wrapper_commands_by_world_size": wrapper_commands,
+        "wrapper_fds": tuple(wrapper_fds),
     }
 
 
@@ -1175,7 +1774,7 @@ def _sbatch_argv(plan: Mapping[str, Any], job: Mapping[str, Any]) -> list[str]:
         "--open-mode=truncate",
         f"--job-name={_transaction_job_name(plan['transaction_id'], job['position'])}",
         _export_argument(job["exports"]),
-        os.fspath(Path(plan["exact_root"]) / resources["wrapper"]),
+        plan["wrapper_commands_by_world_size"][str(job["world_size"])],
     ]
 
 
@@ -1188,6 +1787,8 @@ def _transaction_payload(plan: Mapping[str, Any], submitted: Sequence[Mapping[st
         "source_manifest_sha256": plan["source"]["manifest_sha256"],
         "repository_binding": dict(plan["repository_binding"]),
         "environment_sha256_by_world_size": dict(plan["environment_sha256_by_world_size"]),
+        "environment_transaction": dict(plan["environment_transaction"]),
+        "nvidia_smi_sha256": plan["nvidia_smi_sha256"],
         "checkpoint_ceiling_bytes": plan["limits"]["checkpoint_ceiling_bytes"],
         "limits": dict(plan["limits"]),
         "capacity": dict(plan["capacity"]),
@@ -1209,19 +1810,16 @@ def _transaction_payload(plan: Mapping[str, Any], submitted: Sequence[Mapping[st
     }
 
 
-def submit(
-    overlay: Path,
+def _submit_transaction(
+    plan: dict[str, Any],
     *,
-    exact_root: Path,
+    commands: Mapping[str, str],
+    scheduler_fds: Sequence[int],
+    wrapper_fds: Sequence[int],
     process_scoped_signals: bool = False,
 ) -> Mapping[str, Any]:
-    if not sys.flags.isolated or not sys.dont_write_bytecode:
-        _fail("H100 gate submitter requires Python -I -B")
-    if os.environ.get("PYTHONNOUSERSITE") != "1" or os.environ.get("PYTHONPATH") != os.fspath(exact_root / "src"):
-        _fail("H100 gate submitter requires a closed exact-source import environment")
-    plan = _validate_overlay(_load_strict_json(overlay), exact_root=exact_root)
-    commands = plan["scheduler_commands"]
     scheduler_env = _scheduler_environment()
+    sbatch_fds = (*scheduler_fds, *wrapper_fds)
     plan["transaction_id"] = hashlib.sha256(
         secrets.token_bytes(32)
         + plan["validation_id"].encode("ascii")
@@ -1256,13 +1854,15 @@ def submit(
     final_receipt: Mapping[str, Any] | None = None
     held_plan_published = False
     receipt_published = False
+    held_plan_visibility = "absent"
+    receipt_visibility = "absent"
     previous_handlers: dict[int, Any] = {}
 
     def interrupted(signum, _frame):
         raise KeyboardInterrupt(f"scheduler transaction interrupted by signal {signum}")
 
     if process_scoped_signals:
-        for signum in (signal.SIGINT, signal.SIGTERM):
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.getsignal(signum)
             signal.signal(signum, interrupted)
     try:
@@ -1277,6 +1877,7 @@ def submit(
                 env=scheduler_env,
                 where=f"held H100 validation submission {position}/12",
                 check=False,
+                pass_fds=sbatch_fds,
             )
             if completed.returncode != 0:
                 untrusted_result_position = position
@@ -1353,12 +1954,22 @@ def submit(
         held_plan = _make_envelope(
             "h100_gate_held_plan", _transaction_payload(plan, submitted)
         )
-        _publish_no_replace(
-            plan["artifact_root"] / "held-plan.json",
-            held_plan,
-            max_bytes=plan["limits"]["receipt_ceiling_bytes"],
-        )
-        held_plan_published = True
+        previous_mask = None
+        if process_scoped_signals:
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, tuple(previous_handlers)
+            )
+        try:
+            _publish_no_replace(
+                plan["artifact_root"] / "held-plan.json",
+                held_plan,
+                max_bytes=plan["limits"]["receipt_ceiling_bytes"],
+            )
+            held_plan_published = True
+            held_plan_visibility = "durable"
+        finally:
+            if previous_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         journal.append("held_plan_published", {"sha256": held_plan["sha256"]})
 
         phase = "release_failed"
@@ -1370,10 +1981,12 @@ def submit(
                 [commands["scontrol"], *_cluster_argv(cluster), "release", job_id],
                 env=scheduler_env,
                 where=f"release held H100 gate job {job_id}",
+                pass_fds=scheduler_fds,
             )
             state, reason, source = _scheduler_state_bounded_retry(
                 commands,
                 scheduler_env,
+                scheduler_fds,
                 job_id=job_id,
                 cluster=cluster,
                 acceptable=_released_state_is_acceptable,
@@ -1410,8 +2023,32 @@ def submit(
             max_bytes=plan["limits"]["receipt_ceiling_bytes"],
         )
         receipt_published = True
+        receipt_visibility = "durable"
         return final_receipt
     except BaseException as error:
+        if isinstance(error, _PublicationInterrupted):
+            interruption = error.interruption
+            if error.path.name == "held-plan.json":
+                held_plan_published = True
+                held_plan_visibility = "durable"
+                _safe_journal(
+                    journal,
+                    "held_plan_publication_interrupted",
+                    {"sha256": held_plan["sha256"] if held_plan else None},
+                )
+                error = interruption
+            elif error.path.name == "submission-receipt.json":
+                receipt_published = True
+                receipt_visibility = "durable"
+                if process_scoped_signals:
+                    for signum, handler in previous_handlers.items():
+                        signal.signal(signum, handler)
+                raise interruption
+        elif isinstance(error, _PublicationUncertain):
+            if error.path.name == "held-plan.json":
+                held_plan_visibility = "uncertain"
+            elif error.path.name == "submission-receipt.json":
+                receipt_visibility = "uncertain"
         if inflight_position is not None:
             if untrusted_result_position is None:
                 untrusted_result_position = inflight_position
@@ -1419,6 +2056,14 @@ def submit(
         if process_scoped_signals:
             for signum in previous_handlers:
                 signal.signal(signum, signal.SIG_IGN)
+        if (
+            isinstance(error, _PublicationUncertain)
+            and error.path.name == "submission-receipt.json"
+        ):
+            raise RuntimeError(
+                "released H100 gate receipt visibility is uncertain; jobs were "
+                "left released to avoid contradicting a visible receipt"
+            ) from error
         if untrusted_result_position is not None:
             response_loss_job_name = _transaction_job_name(
                 plan["transaction_id"], untrusted_result_position
@@ -1427,6 +2072,7 @@ def submit(
                 response_loss_discovery = _discover_transaction_jobs(
                     commands,
                     scheduler_env,
+                    scheduler_fds,
                     job_name=response_loss_job_name,
                 )
             except Exception:
@@ -1464,7 +2110,11 @@ def submit(
             )
         try:
             cancelled, remaining = _rollback(
-                commands, scheduler_env, submitted, journal
+                commands,
+                scheduler_env,
+                scheduler_fds,
+                submitted,
+                journal,
             )
         except BaseException as rollback_error:
             cancelled = []
@@ -1509,6 +2159,8 @@ def submit(
                 "response_loss_discovery": response_loss_discovery,
                 "held_plan_published": held_plan_published,
                 "submission_receipt_published": receipt_published,
+                "held_plan_visibility": held_plan_visibility,
+                "submission_receipt_visibility": receipt_visibility,
                 "transaction_journal_sha256": journal_sha256,
                 "transaction_journal_events": journal_events,
             },
@@ -1535,6 +2187,46 @@ def submit(
         raise RuntimeError(
             "H100 gate transaction failed; rollback reconciled and recovery was published"
         ) from error
+
+
+def submit(
+    overlay: Path,
+    *,
+    exact_root: Path,
+    process_scoped_signals: bool = False,
+) -> Mapping[str, Any]:
+    if not sys.flags.isolated or not sys.dont_write_bytecode:
+        _fail("H100 gate submitter requires Python -I -B")
+    if (
+        os.environ.get("PYTHONNOUSERSITE") != "1"
+        or os.environ.get("PYTHONPATH") != os.fspath(exact_root / "src")
+    ):
+        _fail("H100 gate submitter requires a closed exact-source import environment")
+    plan = _validate_overlay(_load_strict_json(overlay), exact_root=exact_root)
+    wrapper_fds = plan["wrapper_fds"]
+    try:
+        commands, scheduler_fds = _open_scheduler_commands(
+            plan["scheduler_commands"]
+        )
+    except BaseException:
+        for wrapper_fd in wrapper_fds:
+            os.close(wrapper_fd)
+        raise
+    try:
+        return _submit_transaction(
+            plan,
+            commands=commands,
+            scheduler_fds=scheduler_fds,
+            wrapper_fds=wrapper_fds,
+            process_scoped_signals=process_scoped_signals,
+        )
+    finally:
+        for scheduler_fd in scheduler_fds:
+            os.close(scheduler_fd)
+        for wrapper_fd in wrapper_fds:
+            os.close(wrapper_fd)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--overlay", required=True, type=Path)

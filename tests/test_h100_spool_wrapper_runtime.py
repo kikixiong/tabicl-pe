@@ -47,13 +47,32 @@ def spool_runtime(tmp_path):
         pytest.skip("test host has no writable second filesystem")
 
     for name in (
+        "exec_digest_bound_git.py",
+        "exec_digest_bound_nvidia_smi.py",
         "slurm_h100_identity_maxseq_smoke.sh",
+        "slurm_h100_identity_nccl_smoke.sh",
         "run_slurm_h100_identity_case.sh",
         "verify_filesystem_isolation.py",
+        "verify_formal_environment.py",
         "verify_git_repository.py",
     ):
         shutil.copy2(ROOT / "scripts" / name, scripts / name)
-        (scripts / name).chmod((scripts / name).stat().st_mode | stat.S_IXUSR)
+        if name.endswith(".sh"):
+            (scripts / name).chmod((scripts / name).stat().st_mode | stat.S_IXUSR)
+
+    environment_verifier = scripts / "verify_formal_environment.py"
+    environment_verifier.write_text(
+        "import argparse, os, sys\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--exact-root', required=True)\n"
+        "p.add_argument('--expected-sha256', required=True)\n"
+        "p.add_argument('--expected-gpus', required=True, type=int)\n"
+        "a=p.parse_args()\n"
+        "assert sys.flags.isolated and sys.dont_write_bytecode\n"
+        "assert os.environ.get('PYTHONNOUSERSITE') == '1'\n"
+        "assert a.expected_gpus == 1 and len(a.expected_sha256) == 64\n"
+    )
+    environment_verifier.chmod(0o755)
 
     workload = scripts / "run_h100_identity_maxseq_smoke.sh"
     workload.write_text(
@@ -105,12 +124,15 @@ esac
     assert {path.name for path in spool.iterdir()} == {"slurm_script"}
 
     nvidia_log = external / "nvidia-argv.log"
+    nvidia_exit = external / "nvidia-exit-code"
+    nvidia_exit.write_text("0\n")
     nvidia_smi = external / "nvidia-smi"
     nvidia_smi.write_text(
-        """#!/bin/bash
+        f"""#!/bin/bash
 set -euo pipefail
-printf '%s\\n' "$*" >> "$TEST_NVIDIA_LOG"
+printf '%s\\n' "$*" >> {str(nvidia_log)!r}
 printf '%s\\n' 'GPU-fixture, NVIDIA H100 80GB HBM3, 570.00'
+exit "$(< {str(nvidia_exit)!r})"
 """
     )
     nvidia_smi.chmod(0o755)
@@ -190,6 +212,9 @@ printf '%s\\n' 'GPU-fixture, NVIDIA H100 80GB HBM3, 570.00'
             "PYTHON": str(Path(sys.executable).resolve()),
             "GIT": str(fake_git),
             "NVIDIA_SMI": str(nvidia_smi),
+            "FORMAL_NVIDIA_SMI_SHA256": hashlib.sha256(
+                nvidia_smi.read_bytes()
+            ).hexdigest(),
             "RUN_POLICY": "fresh",
             "FORMAL_SUBMISSION_EXACT_ROOT": str(exact),
             "SLURM_JOB_ID": "901",
@@ -208,16 +233,331 @@ printf '%s\\n' 'GPU-fixture, NVIDIA H100 80GB HBM3, 570.00'
             "TEST_MODE": mode,
             "TEST_MARKER": str(marker),
             "TEST_EXPECTED_GPU_TOKEN": token,
-            "TEST_NVIDIA_LOG": str(nvidia_log),
         }
 
     yield {
         "wrapper": spool_wrapper,
+        "exact": exact,
+        "fake_git": fake_git,
         "case_work": case_work,
         "nvidia_log": nvidia_log,
+        "nvidia_exit": nvidia_exit,
         "environment": environment,
     }
     shutil.rmtree(case_work, ignore_errors=True)
+
+
+def test_valid_gpu_row_followed_by_nonzero_nvidia_status_is_rejected(
+    spool_runtime, tmp_path
+):
+    marker = tmp_path / "workload-marker"
+    environment = spool_runtime["environment"](
+        token="0", mode="success", marker=marker
+    )
+    spool_runtime["nvidia_exit"].write_text("23\n")
+    completed = subprocess.run(
+        ["/bin/bash", str(spool_runtime["wrapper"])],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 1
+    assert "CUDA-visible nvidia-smi query failed" in completed.stderr
+    assert not marker.exists()
+    assert list(spool_runtime["case_work"].iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("token", "expected_gpus", "case_id"),
+    (
+        ("0,", "1", "stage1_rope_one_step"),
+        ("0,1,", "2", "nccl_2gpu"),
+    ),
+)
+def test_trailing_comma_gpu_list_is_rejected_before_query_checkout_or_workload(
+    spool_runtime, tmp_path, token, expected_gpus, case_id
+):
+    if expected_gpus == "1":
+        trusted_wrapper = spool_runtime["wrapper"]
+    else:
+        trusted_wrapper = tmp_path / "trusted-nccl-spool-wrapper"
+        shutil.copy2(
+            spool_runtime["exact"]
+            / "scripts/slurm_h100_identity_nccl_smoke.sh",
+            trusted_wrapper,
+        )
+    marker = tmp_path / "workload-marker"
+    environment = spool_runtime["environment"](
+        token=token, mode="success", marker=marker
+    )
+    environment.update(
+        {
+            "FORMAL_EXPECTED_GPUS": expected_gpus,
+            "FORMAL_REQUESTED_GPUS": expected_gpus,
+            "VALIDATION_CASE_ID": case_id,
+        }
+    )
+    completed = subprocess.run(
+        ["/bin/bash", str(trusted_wrapper)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 1
+    assert "CUDA_VISIBLE_DEVICES is not a canonical" in completed.stderr
+    assert not marker.exists()
+    assert not spool_runtime["nvidia_log"].exists()
+    assert list(spool_runtime["case_work"].iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("wrapper_name", "expected_gpus", "case_id"),
+    (
+        ("slurm_h100_identity_maxseq_smoke.sh", "1", "stage1_rope_one_step"),
+        ("slurm_h100_identity_nccl_smoke.sh", "2", "nccl_2gpu"),
+    ),
+)
+def test_static_wrapper_never_executes_replaced_git_before_digest_rejection(
+    spool_runtime, tmp_path, wrapper_name, expected_gpus, case_id
+):
+    marker = tmp_path / "malicious-git-executed"
+    fake_git = spool_runtime["fake_git"]
+    fake_git.rename(fake_git.with_name("git.verified-inode"))
+    fake_git.write_text(
+        "#!/bin/bash\n"
+        f"printf executed > {str(marker)!r}\n"
+        "exit 97\n"
+    )
+    fake_git.chmod(0o755)
+    environment = spool_runtime["environment"](
+        token="0", mode="success", marker=tmp_path / "workload-marker"
+    )
+    environment.update(
+        {
+            "FORMAL_EXPECTED_GPUS": expected_gpus,
+            "FORMAL_REQUESTED_GPUS": expected_gpus,
+            "VALIDATION_CASE_ID": case_id,
+        }
+    )
+    completed = subprocess.run(
+        [
+            "/bin/bash",
+            str(spool_runtime["exact"] / "scripts" / wrapper_name),
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 2
+    assert "trusted bootstrap Git digest mismatch" in completed.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("wrapper_name", "expected_gpus", "case_id"),
+    (
+        ("slurm_h100_identity_maxseq_smoke.sh", "1", "stage1_rope_one_step"),
+        ("slurm_h100_identity_nccl_smoke.sh", "2", "nccl_2gpu"),
+    ),
+)
+def test_trusted_static_wrapper_never_executes_modified_shared_runner(
+    spool_runtime, tmp_path, wrapper_name, expected_gpus, case_id
+):
+    if expected_gpus == "1":
+        trusted_wrapper = spool_runtime["wrapper"]
+    else:
+        trusted_wrapper = tmp_path / "trusted-nccl-spool-wrapper"
+        shutil.copy2(
+            spool_runtime["exact"] / "scripts" / wrapper_name,
+            trusted_wrapper,
+        )
+    marker = tmp_path / "modified-shared-runner-executed"
+    shared_runner = (
+        spool_runtime["exact"] / "scripts/run_slurm_h100_identity_case.sh"
+    )
+    shared_runner.write_text(
+        "#!/bin/bash\n"
+        f"printf executed > {str(marker)!r}\n"
+        "exit 97\n"
+    )
+    shared_runner.chmod(0o755)
+    environment = spool_runtime["environment"](
+        token="0", mode="success", marker=tmp_path / "workload-marker"
+    )
+    environment.update(
+        {
+            "FORMAL_EXPECTED_GPUS": expected_gpus,
+            "FORMAL_REQUESTED_GPUS": expected_gpus,
+            "VALIDATION_CASE_ID": case_id,
+        }
+    )
+    completed = subprocess.run(
+        ["/bin/bash", str(trusted_wrapper)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert "trusted bootstrap exact root is dirty" in completed.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("wrapper_name", "expected_gpus", "case_id"),
+    (
+        ("slurm_h100_identity_maxseq_smoke.sh", "1", "stage1_rope_one_step"),
+        ("slurm_h100_identity_nccl_smoke.sh", "2", "nccl_2gpu"),
+    ),
+)
+def test_trusted_static_wrapper_rejects_fifo_shared_runner_without_blocking(
+    spool_runtime, tmp_path, wrapper_name, expected_gpus, case_id
+):
+    if expected_gpus == "1":
+        trusted_wrapper = spool_runtime["wrapper"]
+    else:
+        trusted_wrapper = tmp_path / "trusted-nccl-spool-wrapper"
+        shutil.copy2(
+            spool_runtime["exact"] / "scripts" / wrapper_name,
+            trusted_wrapper,
+        )
+    shared_runner = (
+        spool_runtime["exact"] / "scripts/run_slurm_h100_identity_case.sh"
+    )
+    shared_runner.unlink()
+    os.mkfifo(shared_runner, stat.S_IRUSR | stat.S_IWUSR)
+    environment = spool_runtime["environment"](
+        token="0", mode="success", marker=tmp_path / "workload-marker"
+    )
+    environment.update(
+        {
+            "FORMAL_EXPECTED_GPUS": expected_gpus,
+            "FORMAL_REQUESTED_GPUS": expected_gpus,
+            "VALIDATION_CASE_ID": case_id,
+        }
+    )
+    completed = subprocess.run(
+        ["/bin/bash", str(trusted_wrapper)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert completed.returncode == 2
+    assert "trusted bootstrap file is not a stable bounded executable" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "helper_name",
+    (
+        "exec_digest_bound_nvidia_smi.py",
+        "verify_git_repository.py",
+        "verify_filesystem_isolation.py",
+        "verify_formal_environment.py",
+    ),
+)
+def test_modified_assume_unchanged_helper_is_blob_rejected_before_execution(
+    spool_runtime, tmp_path, helper_name
+):
+    exact = spool_runtime["exact"]
+    relative = f"scripts/{helper_name}"
+    _run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(exact),
+            "update-index",
+            "--assume-unchanged",
+            relative,
+        ]
+    )
+    marker = tmp_path / "modified-helper-executed"
+    helper = exact / relative
+    helper.write_text(
+        "#!/bin/bash\n"
+        f"printf executed > {str(marker)!r}\n"
+        "exit 97\n"
+    )
+    helper.chmod(0o755)
+    completed = subprocess.run(
+        ["/bin/bash", str(spool_runtime["wrapper"])],
+        env=spool_runtime["environment"](
+            token="0", mode="success", marker=tmp_path / "workload-marker"
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert completed.returncode == 2
+    assert "trusted H100 helper differs from committed source" in completed.stderr
+    assert not marker.exists()
+
+
+def test_local_fsmonitor_config_cannot_execute_during_static_or_runner_git_checks(
+    spool_runtime, tmp_path
+):
+    exact = spool_runtime["exact"]
+    marker = tmp_path / "fsmonitor-executed"
+    hook = tmp_path / "fsmonitor-hook"
+    hook.write_text(
+        "#!/bin/bash\n"
+        f"printf executed > {str(marker)!r}\n"
+        "printf '0\\n'\n"
+    )
+    hook.chmod(0o755)
+    _run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(exact),
+            "config",
+            "core.fsmonitor",
+            str(hook),
+        ]
+    )
+    workload_marker = tmp_path / "workload-marker"
+    completed = subprocess.run(
+        ["/bin/bash", str(spool_runtime["wrapper"])],
+        env=spool_runtime["environment"](
+            token="0", mode="success", marker=workload_marker
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert workload_marker.exists()
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("mutation", ("dirty", "attached"))
+def test_shared_digest_bound_body_rejects_nonexact_submission_checkout(
+    spool_runtime, tmp_path, mutation
+):
+    exact = spool_runtime["exact"]
+    if mutation == "dirty":
+        (exact / "untracked-marker").write_text("dirty\n")
+        expected_error = "trusted bootstrap exact root is dirty"
+    else:
+        _run(["/usr/bin/git", "-C", str(exact), "checkout", "-q", "master"])
+        expected_error = "trusted bootstrap exact root is not detached"
+    marker = tmp_path / "workload-marker"
+    completed = subprocess.run(
+        ["/bin/bash", str(spool_runtime["wrapper"])],
+        env=spool_runtime["environment"](token="0", mode="success", marker=marker),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 2
+    assert expected_error in completed.stderr
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("token", ["0", "GPU-assigned_1", "MIG-assigned_1"])
@@ -309,9 +649,12 @@ def test_case_artifact_root_is_created_with_atomic_fresh_only_mkdir(tmp_path):
     sentinel.write_text("preserve\n")
     environment = {
         "PATH": "/usr/bin:/bin",
-        "TABICL_EXACT_ROOT": str(ROOT),
-        "PYTHON": str(Path(sys.executable).resolve()),
-        "NVIDIA_SMI": "/usr/bin/true",
+            "TABICL_EXACT_ROOT": str(ROOT),
+            "PYTHON": str(Path(sys.executable).resolve()),
+            "NVIDIA_SMI": "/usr/bin/true",
+            "FORMAL_NVIDIA_SMI_SHA256": hashlib.sha256(
+                Path("/usr/bin/true").read_bytes()
+            ).hexdigest(),
         "FORMAL_SOURCE_MANIFEST": str(tmp_path / "source.json"),
         "FORMAL_SOURCE_SHA256": "a" * 64,
         "FORMAL_SOURCE_COMMIT_SHA": "b" * 40,
@@ -326,6 +669,15 @@ def test_case_artifact_root_is_created_with_atomic_fresh_only_mkdir(tmp_path):
     }
     completed = subprocess.run(
         [
+            str(Path(sys.executable).resolve()),
+            "-I",
+            "-B",
+            str(ROOT / "scripts/exec_digest_bound_nvidia_smi.py"),
+            "--nvidia-smi",
+            "/usr/bin/true",
+            "--expected-sha256",
+            environment["FORMAL_NVIDIA_SMI_SHA256"],
+            "--",
             "/bin/bash",
             str(ROOT / "scripts/run_h100_identity_maxseq_smoke.sh"),
             "stage1_rope_one_step",
@@ -353,6 +705,9 @@ def test_case_artifact_root_rejects_symlinked_parent_component(tmp_path):
         "TABICL_EXACT_ROOT": str(ROOT),
         "PYTHON": str(Path(sys.executable).resolve()),
         "NVIDIA_SMI": "/usr/bin/true",
+        "FORMAL_NVIDIA_SMI_SHA256": hashlib.sha256(
+            Path("/usr/bin/true").read_bytes()
+        ).hexdigest(),
         "FORMAL_SOURCE_MANIFEST": str(source_manifest),
         "FORMAL_SOURCE_SHA256": "a" * 64,
         "FORMAL_SOURCE_COMMIT_SHA": "b" * 40,
@@ -367,6 +722,15 @@ def test_case_artifact_root_rejects_symlinked_parent_component(tmp_path):
     }
     completed = subprocess.run(
         [
+            str(Path(sys.executable).resolve()),
+            "-I",
+            "-B",
+            str(ROOT / "scripts/exec_digest_bound_nvidia_smi.py"),
+            "--nvidia-smi",
+            "/usr/bin/true",
+            "--expected-sha256",
+            environment["FORMAL_NVIDIA_SMI_SHA256"],
+            "--",
             "/bin/bash",
             str(ROOT / "scripts/run_h100_identity_maxseq_smoke.sh"),
             "stage1_rope_one_step",
@@ -386,6 +750,15 @@ def test_case_artifact_root_rejects_symlinked_parent_component(tmp_path):
     )
     completed = subprocess.run(
         [
+            str(Path(sys.executable).resolve()),
+            "-I",
+            "-B",
+            str(ROOT / "scripts/exec_digest_bound_nvidia_smi.py"),
+            "--nvidia-smi",
+            "/usr/bin/true",
+            "--expected-sha256",
+            unnormalized_environment["FORMAL_NVIDIA_SMI_SHA256"],
+            "--",
             "/bin/bash",
             str(ROOT / "scripts/run_h100_identity_maxseq_smoke.sh"),
             "stage1_rope_one_step",

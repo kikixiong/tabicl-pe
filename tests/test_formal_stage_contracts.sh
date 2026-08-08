@@ -8,8 +8,11 @@ not_contains() { ! grep -F -- "$2" "$1" >/dev/null || fail "$(basename "$1") con
 
 for SCRIPT in \
   "$ROOT/scripts/check_formal_capacity.py" \
+  "$ROOT/scripts/generate_formal_environment.py" \
+  "$ROOT/scripts/verify_formal_environment_transaction.py" \
   "$ROOT/scripts/run_exact_tabicl.py" \
   "$ROOT/scripts/reject_nonfinite_log.py" \
+  "$ROOT/scripts/verify_formal_environment.py" \
   "$ROOT/scripts/prune_identity_stage_checkpoints.py" \
   "$ROOT/scripts/run_with_durable_log.sh" \
   "$ROOT/scripts/run_formal_identity_production_job.py" \
@@ -19,14 +22,28 @@ for SCRIPT in \
   "$ROOT/scripts/slurm_h100_identity_formal.sh"; do
   [[ -x "$SCRIPT" ]] || fail "$SCRIPT is not executable"
 done
+contains "$ROOT/scripts/generate_formal_environment.py" '--completion-output'
+contains "$ROOT/scripts/generate_formal_environment.py" 'formal_environment_generation_completion'
+contains "$ROOT/scripts/generate_formal_environment.py" '/proc/self/fd/'
+contains "$ROOT/scripts/verify_formal_environment_transaction.py" '--expected-completion-sha256'
+contains "$ROOT/scripts/verify_formal_environment_transaction.py" '--expected-transaction-sha256'
+contains "$ROOT/scripts/verify_formal_environment_transaction.py" 'formal_environment_inventory'
+contains "$ROOT/scripts/verify_formal_environment.py" 'imported before exact-T isolation'
+contains "$ROOT/scripts/verify_formal_environment.py" '_provenance.py'
 contains "$ROOT/scripts/slurm_h100_identity_formal.sh" ': "${GIT:?'
 contains "$ROOT/scripts/slurm_h100_identity_formal.sh" 'hermetic_git() {'
 contains "$ROOT/scripts/slurm_h100_identity_formal.sh" 'GIT_ALLOW_PROTOCOL=https'
 contains "$ROOT/scripts/slurm_h100_identity_formal.sh" 'hermetic_git -C "$CHECKOUT_PARENT" clone --quiet --no-hardlinks --no-checkout --'
 contains "$ROOT/scripts/slurm_h100_identity_formal.sh" 'remote get-url origin'
 contains "$ROOT/scripts/slurm_h100_identity_formal.sh" ': "${NVIDIA_SMI:?'
-contains "$ROOT/scripts/slurm_h100_identity_formal.sh" '"$NVIDIA_SMI" --id="$CUDA_VISIBLE_DEVICES" --query-gpu=name,uuid'
+contains "$ROOT/scripts/slurm_h100_identity_formal.sh" '--query-token "$CUDA_VISIBLE_DEVICES"'
+contains "$ROOT/scripts/slurm_h100_identity_formal.sh" '--query-fields name,uuid,driver_version'
+contains "$ROOT/scripts/exec_digest_bound_nvidia_smi.py" 'QUERY_TIMEOUT_SECONDS = 15'
+contains "$ROOT/scripts/slurm_h100_identity_formal.sh" 'FORMAL_EXPECTED_GPU_MODEL'
+contains "$ROOT/scripts/slurm_h100_identity_formal.sh" 'FORMAL_EXPECTED_DRIVER_VERSION'
 contains "$ROOT/scripts/slurm_h100_identity_formal.sh" 'verify_filesystem_isolation.py'
+contains "$ROOT/scripts/slurm_h100_identity_formal.sh" 'verify_formal_environment.py'
+contains "$ROOT/scripts/slurm_h100_identity_formal.sh" '--expected-sha256 "$FORMAL_ENVIRONMENT_SHA256"'
 contains "$ROOT/scripts/slurm_h100_identity_formal.sh" ': "${FORMAL_SUBMISSION_EXACT_ROOT:?}"'
 contains "$ROOT/scripts/slurm_h100_identity_formal.sh" 'clone --quiet --no-hardlinks --no-checkout --'
 contains "$ROOT/scripts/slurm_h100_identity_formal.sh" 'run_formal_identity_production_job.py'

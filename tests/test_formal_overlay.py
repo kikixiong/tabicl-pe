@@ -4,9 +4,12 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import signal
 import stat
+import subprocess
 import sys
 
 import pytest
@@ -29,6 +32,30 @@ def _load():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_fifo_scheduler_executable_is_rejected_without_blocking(tmp_path):
+    fifo = tmp_path / "sbatch"
+    os.mkfifo(fifo, stat.S_IRUSR | stat.S_IWUSR)
+    code = (
+        "import importlib.util, pathlib, sys\n"
+        "spec=importlib.util.spec_from_file_location('fifo_formal_overlay', sys.argv[1])\n"
+        "module=importlib.util.module_from_spec(spec)\n"
+        "sys.modules[spec.name]=module\n"
+        "spec.loader.exec_module(module)\n"
+        "module._open_digest_bound_executable(\n"
+        "    pathlib.Path(sys.argv[2]), '0' * 64, where='scheduler sbatch',\n"
+        ")\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code, str(SCRIPT), str(fifo)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert completed.returncode != 0
+    assert "bounded regular file" in completed.stderr
 
 
 def _canonical(value) -> bytes:
@@ -133,6 +160,44 @@ def _overlay(tmp_path: Path, seed_value: int = 42) -> dict:
     scheduler_executable = Path("/usr/bin/true")
     scheduler_sha256 = hashlib.sha256(scheduler_executable.read_bytes()).hexdigest()
     study_id = f"study-a-seed{seed_value}"
+    static_protocols = {
+        stage["stage"]: _manifest(
+            "formal_campaign_stage_static_protocol",
+            {
+                "training_commit_sha": "a" * 40,
+                "training_tree_sha": "b" * 40,
+                "source_manifest_sha256": digest["source"],
+                "environment_sha256": digest["environment"],
+                "stage": stage["stage"],
+                "terminal_step": stage["terminal_step"],
+                "time_limit": TIME_LIMIT_BY_STAGE[stage["stage"]],
+                "prior_sha256": stage["prior_sha256"],
+                "architecture_sha256": stage["architecture_sha256"],
+                "optimizer_sha256": stage["optimizer_sha256"],
+                "scientific_sha256": stage["scientific_sha256"],
+            },
+        )["sha256"]
+        for stage in stages
+    }
+    campaign_sha256 = "8" * 64
+    campaign_binding = {
+        "campaign_id": "study-a",
+        "campaign_manifest_sha256": campaign_sha256,
+        "training_commit_sha": "a" * 40,
+        "training_tree_sha": "b" * 40,
+        "source_manifest_sha256": digest["source"],
+        "environment_sha256": digest["environment"],
+        "h100_attestation_sha256": "7" * 64,
+        "nvidia_smi_sha256": hashlib.sha256(
+            Path("/usr/bin/true").read_bytes()
+        ).hexdigest(),
+        "checkpoint_ceiling_bytes": 2_000_000_000,
+        "static_protocol_sha256_by_stage": static_protocols,
+        "time_limit_by_stage": dict(TIME_LIMIT_BY_STAGE),
+        "predecessor_acceptance_sha256_by_seed": {
+            str(seed): "9" * 64 for seed in (42, 43, 44) if seed < seed_value
+        },
+    }
     return {
         "schema_version": 1,
         "run_policy": "fresh",
@@ -152,6 +217,13 @@ def _overlay(tmp_path: Path, seed_value: int = 42) -> dict:
             "attestation_path": str(external / "h100-smoke.json"),
             "expected_sha256": "7" * 64,
             "expected_gpu_model": "NVIDIA H100 80GB HBM3",
+            "expected_driver_version": "550.54.15",
+        },
+        "campaign": {
+            "manifest_path": str(external / "campaign.json"),
+            "expected_sha256": campaign_sha256,
+            "acceptance_registry": str(external / "acceptance-registry"),
+            "binding": campaign_binding,
         },
         "capacity": {
             "checkpoint_ceiling_bytes": 2_000_000_000,
@@ -166,6 +238,9 @@ def _overlay(tmp_path: Path, seed_value: int = 42) -> dict:
             "git": str(git),
             "git_sha256": hashlib.sha256(git.read_bytes()).hexdigest(),
             "nvidia_smi": "/usr/bin/true",
+            "nvidia_smi_sha256": hashlib.sha256(
+                Path("/usr/bin/true").read_bytes()
+            ).hexdigest(),
             "job_work_root": str(tmp_path / "job-work"),
         },
         "scheduler": {
@@ -202,6 +277,7 @@ def _maximal_terminal_fixture(module, plan):
                 "cluster": "c" * 64,
                 "job_name": f"tabicl-{'f' * 32}-{job['arm']}-s{job['stage_index']}",
                 "parent_job_id": parent_id,
+                "sbatch_argv_sha256": "f" * 64,
             }
         )
     receipt = module._submission_receipt(plan, submitted)
@@ -239,6 +315,11 @@ def test_valid_overlay_builds_exact_nine_entry_ledger_and_fixed_job_plan(tmp_pat
         job["stage"]: job["time_limit"] for job in plan["jobs"]
     } == TIME_LIMIT_BY_STAGE
     entries = plan["ledger"]["payload"]["entries"]
+    assert (
+        plan["ledger"]["payload"]["protocol_metadata_allowance_bytes"]
+        == plan["capacity"]["protocol_metadata_allowance_bytes"]
+        == 100_000_000
+    )
     assert all(
         set(entry)
         == {
@@ -363,6 +444,12 @@ def test_valid_overlay_builds_exact_nine_entry_ledger_and_fixed_job_plan(tmp_pat
             "nvidia_smi",
         ),
         (
+            lambda value: value["runtime"].update(
+                nvidia_smi_sha256="0" * 64
+            ),
+            "campaign binding differs",
+        ),
+        (
             lambda value: value["source"].update(candidate_repository="--poison"),
             "canonical public GitHub URL",
         ),
@@ -380,6 +467,19 @@ def test_valid_overlay_builds_exact_nine_entry_ledger_and_fixed_job_plan(tmp_pat
             ),
             "protocol metadata",
         ),
+        (
+            lambda value: value["capacity"].update(
+                protocol_metadata_allowance_bytes=(128 << 20) + 1
+            ),
+            "formal metadata ceiling",
+        ),
+        (
+            lambda value: value["capacity"].update(
+                manifest_ceiling_bytes=4_000_000,
+                protocol_metadata_allowance_bytes=3_000_000,
+            ),
+            "finalized manifest ceiling",
+        ),
     ],
 )
 def test_overlay_rejects_noncanonical_or_undeclared_drift(tmp_path, mutate, match):
@@ -388,6 +488,85 @@ def test_overlay_rejects_noncanonical_or_undeclared_drift(tmp_path, mutate, matc
     mutate(overlay)
     with pytest.raises(ValueError, match=match):
         module.validate_overlay(overlay, exact_root=tmp_path / "exact")
+
+
+def test_production_source_manifest_required_set_covers_shell_launch_chain():
+    module = _load()
+
+    assert {
+        "scripts/submit_h100_identity_formal.sh",
+        "scripts/slurm_h100_identity_formal.sh",
+        "scripts/formal_train_v2_clf_identity_stage1.sh",
+        "scripts/formal_train_v2_clf_identity_stage2.sh",
+        "scripts/formal_train_v2_clf_identity_stage3.sh",
+        "scripts/run_with_durable_log.sh",
+    } <= set(module.PRODUCTION_REQUIRED_SOURCE_PATHS)
+    assert set(module.PRODUCTION_REQUIRED_CODE_ROOTS) == {"scripts", "src/tabicl"}
+
+
+@pytest.mark.parametrize(
+    ("evidence_key", "container_key", "match"),
+    [
+        ("h100_submission_receipt_path", "artifact_root", "artifact_root"),
+        ("environment_completion_path", "job_work_root", "job_work_root"),
+    ],
+)
+def test_campaign_raw_evidence_must_be_outside_production_namespaces(
+    tmp_path, monkeypatch, evidence_key, container_key, match
+):
+    module = _load()
+    exact_root = tmp_path / "exact"
+    artifact_root = tmp_path / "artifacts" / "study"
+    job_work_root = tmp_path / "work"
+    external = tmp_path / "external"
+    for directory in (exact_root, artifact_root, job_work_root, external):
+        directory.mkdir(parents=True, exist_ok=True)
+    evidence = {
+        "source_manifest_path": str(external / "source.json"),
+        "h100_attestation_path": str(external / "h100.json"),
+        "h100_submission_receipt_path": str(external / "receipt.json"),
+        "environment_completion_path": str(external / "environment.json"),
+    }
+    containers = {
+        "artifact_root": artifact_root,
+        "job_work_root": job_work_root,
+    }
+    evidence[evidence_key] = str(containers[container_key] / "raw-evidence.json")
+
+    class Registry:
+        CAMPAIGN_MANIFEST_CEILING_BYTES = 1 << 20
+
+        @staticmethod
+        def read_canonical_manifest(*_args, **_kwargs):
+            return {"trusted": True}
+
+        @staticmethod
+        def validate_campaign_manifest(_manifest):
+            return {"validation_evidence": evidence}
+
+    monkeypatch.setattr(module, "_load_campaign_registry_helper", lambda _root: Registry)
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "campaign CLI ran before raw-evidence topology rejection"
+        ),
+    )
+    plan = {
+        "exact_root": str(exact_root),
+        "artifact_root": str(artifact_root),
+        "runtime": {"python": sys.executable, "job_work_root": str(job_work_root)},
+        "campaign": {
+            "manifest_path": str(external / "campaign.json"),
+            "expected_sha256": "a" * 64,
+            "acceptance_registry": str(external / "acceptances"),
+            "binding": {},
+        },
+        "seed": 42,
+    }
+
+    with pytest.raises(ValueError, match=match):
+        module._validate_campaign_authorization(plan)
 
 
 @pytest.mark.parametrize("seed_value", [42, 43, 44])
@@ -654,12 +833,17 @@ def test_protocol_metadata_budget_reserves_nine_completions_terminal_logs_and_fu
                 "cluster": "cluster-max",
                 "job_name": f"tabicl-{'f' * 32}-{job['arm']}-s{job['stage_index']}",
                 "parent_job_id": parent_id,
+                "sbatch_argv_sha256": "f" * 64,
             }
         )
     receipt = module._submission_receipt(plan, submitted)
     commit = module._submission_commit(
         plan, receipt=receipt, submitted=submitted
     )
+    allowance = plan["capacity"]["protocol_metadata_allowance_bytes"]
+    assert plan["ledger"]["payload"]["protocol_metadata_allowance_bytes"] == allowance
+    assert receipt["payload"]["protocol_metadata_allowance_bytes"] == allowance
+    assert commit["payload"]["protocol_metadata_allowance_bytes"] == allowance
     recovery = max(
         (
             module._rollback_record(
@@ -705,6 +889,15 @@ def test_terminal_attestation_preflight_synthesizes_full_maximum_and_exact_bound
     payload = attestation["payload"]
 
     assert payload["path_format"] == "artifact_root_relative_posix_v1"
+    assert (
+        payload["protocol_metadata_allowance_bytes"]
+        == plan["capacity"]["protocol_metadata_allowance_bytes"]
+    )
+    assert all(
+        job["completion"]["protocol_metadata_allowance_bytes"]
+        == plan["capacity"]["protocol_metadata_allowance_bytes"]
+        for job in payload["jobs"]
+    )
     assert len(payload["jobs"]) == 9
     assert len(payload["terminal_queries"][0]["job_ids"]) == 9
     assert all(
@@ -762,10 +955,16 @@ def test_nofollow_directory_open_rejects_a_symlinked_parent(tmp_path):
 def test_scheduler_commands_are_absolute_digest_bound_regular_executables(tmp_path):
     module = _load()
     plan = module.validate_overlay(_overlay(tmp_path), exact_root=tmp_path / "exact")
-    commands, scheduler_env = module._scheduler_commands(plan)
-    assert set(commands) == {"sbatch", "scontrol", "scancel", "squeue", "sacct"}
-    assert set(commands.values()) == {"/usr/bin/true"}
-    assert scheduler_env["PATH"] == "/usr/bin:/bin"
+    commands, descriptors, scheduler_env = module._scheduler_commands(plan)
+    try:
+        assert set(commands) == {"sbatch", "scontrol", "scancel", "squeue", "sacct"}
+        assert set(commands.values()) == {
+            f"/proc/self/fd/{descriptor}" for descriptor in descriptors
+        }
+        assert scheduler_env["PATH"] == "/usr/bin:/bin"
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
 
     tampered = copy.deepcopy(plan)
     tampered["scheduler"]["commands"]["sbatch"]["sha256"] = "0" * 64
@@ -781,6 +980,33 @@ def test_scheduler_commands_are_absolute_digest_bound_regular_executables(tmp_pa
     }
     with pytest.raises(ValueError, match="no-follow executable"):
         module._scheduler_commands(symlinked)
+
+
+def test_scheduler_executes_the_hashed_inode_after_path_replacement(tmp_path):
+    module = _load()
+    trusted = tmp_path / "scheduler"
+    replacement = tmp_path / "replacement"
+    shutil.copy2("/usr/bin/true", trusted)
+    shutil.copy2("/usr/bin/false", replacement)
+    trusted.chmod(0o755)
+    replacement.chmod(0o755)
+    plan = module.validate_overlay(_overlay(tmp_path / "plan"), exact_root=tmp_path / "exact")
+    trusted_sha256 = hashlib.sha256(trusted.read_bytes()).hexdigest()
+    for specification in plan["scheduler"]["commands"].values():
+        specification.update(path=str(trusted), sha256=trusted_sha256)
+    commands, descriptors, scheduler_env = module._scheduler_commands(plan)
+    try:
+        replacement.replace(trusted)
+        completed = subprocess.run(
+            [commands["sbatch"]],
+            env=scheduler_env,
+            pass_fds=descriptors,
+            check=False,
+        )
+        assert completed.returncode == 0
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
 
 
 def test_job_work_root_must_be_disjoint_from_exact_and_artifact_roots(tmp_path):

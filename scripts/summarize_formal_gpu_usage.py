@@ -16,6 +16,9 @@ import time
 from typing import Callable
 
 
+QUERY_TIMEOUT_SECONDS = 15
+
+
 def _monitor_module():
     path = Path(__file__).with_name("monitor_formal_identity.py")
     spec = importlib.util.spec_from_file_location("_formal_monitor_contract", path)
@@ -119,6 +122,7 @@ def record_gpu_window(
     if max_bytes < 1 or interval_seconds != 1.0 or expected_gpu_count not in {1, 2}:
         raise ValueError("formal GPU recorder requires a positive ceiling and 1s cadence")
     executable = os.environ.get("NVIDIA_SMI")
+    raw_fd = os.environ.get("FORMAL_NVIDIA_SMI_FD")
     if (
         not executable
         or not os.path.isabs(executable)
@@ -126,6 +130,11 @@ def record_gpu_window(
         or not os.access(executable, os.X_OK)
     ):
         raise ValueError("NVIDIA_SMI must be an absolute executable")
+    nvidia_fd = None
+    if raw_fd is not None:
+        if not raw_fd.isdecimal() or executable != f"/proc/self/fd/{raw_fd}":
+            raise ValueError("NVIDIA_SMI descriptor binding is invalid")
+        nvidia_fd = int(raw_fd)
     raw_tokens = os.environ.get("FORMAL_VISIBLE_GPU_TOKENS", "")
     tokens = tuple(raw_tokens.split(",")) if raw_tokens else ()
     token_pattern = re.compile(r"^(?:[0-9]+|GPU-[A-Za-z0-9._-]+|MIG-[A-Za-z0-9._-]+)$")
@@ -139,17 +148,26 @@ def record_gpu_window(
     def scoped_query(fields: str) -> subprocess.CompletedProcess[str]:
         rows: list[str] = []
         for token in tokens:
-            result = query_fn(
-                [
+            arguments = [
                     executable,
                     f"--id={token}",
                     f"--query-gpu={fields}",
                     "--format=csv,noheader,nounits",
-                ],
+                ]
+            query_kwargs = dict(
                 check=False,
                 capture_output=True,
                 text=True,
+                timeout=QUERY_TIMEOUT_SECONDS,
             )
+            if nvidia_fd is not None:
+                query_kwargs["pass_fds"] = (nvidia_fd,)
+            try:
+                result = query_fn(arguments, **query_kwargs)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    "CUDA-visible nvidia-smi query timed out"
+                ) from error
             lines = [line for line in result.stdout.splitlines() if line.strip()]
             if result.returncode != 0 or len(lines) != 1:
                 raise RuntimeError("CUDA-visible nvidia-smi query failed")
