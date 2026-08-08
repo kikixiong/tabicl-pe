@@ -997,7 +997,7 @@ def _capture_scontrol_allocation(
             "alloc_nodes": int(_tres_value(fields["AllocTRES"], "node")),
             "alloc_gpus": int(_tres_value(fields["AllocTRES"], "gres/gpu")),
             "per_node_gpus": int(
-                _tres_value(fields["TresPerNode"], "gres/gpu", separator=":")
+                _tres_value(fields["TresPerNode"], "gres:gpu", separator=":")
             ),
         }
     except ValueError as error:
@@ -1459,7 +1459,7 @@ def validate_runtime_evidence(
             "alloc_nodes": int(_tres_value(alloc_tres, "node")),
             "alloc_gpus": int(_tres_value(alloc_tres, "gres/gpu")),
             "per_node_gpus": int(
-                _tres_value(per_node_tres, "gres/gpu", separator=":")
+                _tres_value(per_node_tres, "gres:gpu", separator=":")
             ),
         }
     except (RuntimeError, ValueError) as error:

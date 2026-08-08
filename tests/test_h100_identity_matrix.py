@@ -300,7 +300,7 @@ def _case_evidence(
         f"gres/gpu={requested_resource['gpus']}"
     )
     alloc_tres = req_tres
-    tres_per_node = f"gres/gpu:{requested_resource['gpus']}"
+    tres_per_node = f"gres:gpu:{requested_resource['gpus']}"
     scontrol_argv = [
         "scontrol",
         "--clusters=cluster-a",
@@ -726,7 +726,7 @@ def test_formal_runtime_distribution_contract_is_literal(matrix):
         ("slurm_cpus_per_task", 31),
         ("slurm_memory_per_node_mb", 130048),
         ("slurm_alloc_tres", "cpu=32,mem=128G,node=1,gres/gpu=0"),
-        ("slurm_tres_per_node", "gres/gpu:0"),
+        ("slurm_tres_per_node", "gres:gpu:0"),
         ("scontrol_query_returncode", 1),
         ("scontrol_query_argv_sha256", "f" * 64),
         ("scontrol_query_stderr_sha256", "f" * 64),
@@ -765,7 +765,7 @@ def _scontrol_allocation_line(resource, *, job_id="7001"):
         f"TimeLimit={resource['time_limit']} NumNodes={resource['nodes']} "
         f"NumCPUs={resource['cpus_per_task']} CPUs/Task={resource['cpus_per_task']} "
         f"MinMemoryNode=128G ReqTRES={tres} AllocTRES={tres} "
-        f"TresPerNode=gres/gpu:{resource['gpus']}\n"
+        f"TresPerNode=gres:gpu:{resource['gpus']}\n"
     )
 
 
@@ -924,6 +924,7 @@ def test_runtime_scheduler_capture_rejects_repository_ref_export_drift(
         ("NumCPUs=32", "NumCPUs=31"),
         ("MinMemoryNode=128G", "MinMemoryNode=127G"),
         ("AllocTRES=cpu=32,mem=128G,node=1,gres/gpu=1", "AllocTRES=cpu=32,mem=128G,node=1,gres/gpu=0"),
+        ("TresPerNode=gres:gpu:1", "TresPerNode=gres:gpu:0"),
     ],
 )
 def test_runtime_scheduler_capture_rejects_actual_allocation_drift(
