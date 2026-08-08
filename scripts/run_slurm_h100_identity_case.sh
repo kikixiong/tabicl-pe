@@ -239,6 +239,17 @@ trap 'status=$?; trap - EXIT HUP INT TERM; cleanup; exit "$status"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+RUNTIME_HOME="$CHECKOUT_PARENT/home"
+mkdir -m 700 -- "$RUNTIME_HOME"
+[[ -d "$RUNTIME_HOME" && ! -L "$RUNTIME_HOME" ]] || {
+  echo "node-local H100 runtime HOME is not a physical directory" >&2
+  exit 2
+}
+export HOME="$RUNTIME_HOME" USER=tabicl LOGNAME=tabicl
+export XDG_CACHE_HOME="$RUNTIME_HOME/.cache"
+export XDG_CONFIG_HOME="$RUNTIME_HOME/.config"
+export XDG_DATA_HOME="$RUNTIME_HOME/.local/share"
+readonly RUNTIME_HOME
 hermetic_git -C "$CHECKOUT_PARENT" clone --quiet --no-hardlinks --no-checkout -- \
   "$CANDIDATE_REPOSITORY" candidate
 [[ "$(hermetic_git -C "$CHECKOUT" remote get-url origin)" == "$CANDIDATE_REPOSITORY" ]]

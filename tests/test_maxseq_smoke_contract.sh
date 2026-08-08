@@ -32,6 +32,9 @@ contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '--query-fields uuid,na
 contains "$ROOT/scripts/exec_digest_bound_nvidia_smi.py" 'QUERY_TIMEOUT_SECONDS = 15'
 contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'trap '\''status=$?; trap - EXIT HUP INT TERM; cleanup; exit "$status"'\'' EXIT'
 contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" "trap 'exit 129' HUP"
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'RUNTIME_HOME="$CHECKOUT_PARENT/home"'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'export HOME="$RUNTIME_HOME" USER=tabicl LOGNAME=tabicl'
+contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'export XDG_CACHE_HOME="$RUNTIME_HOME/.cache"'
 contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'FORMAL_H100_VERIFY_FILESYSTEM_FD'
 contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" 'FORMAL_H100_VERIFY_ENVIRONMENT_FD'
 contains "$ROOT/scripts/run_slurm_h100_identity_case.sh" '--expected-sha256 "$FORMAL_EXPECTED_ENVIRONMENT_SHA256"'

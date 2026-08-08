@@ -339,6 +339,17 @@ CHECKOUT_PARENT="$(mktemp -d "$FORMAL_JOB_WORK_ROOT/${MODE}-stage${STAGE}.XXXXXX
 CHECKOUT="$CHECKOUT_PARENT/candidate"
 cleanup() { rm -rf "$CHECKOUT_PARENT"; }
 trap cleanup EXIT HUP INT TERM
+RUNTIME_HOME="$CHECKOUT_PARENT/home"
+mkdir -m 700 -- "$RUNTIME_HOME"
+[[ -d "$RUNTIME_HOME" && ! -L "$RUNTIME_HOME" ]] || {
+  echo "node-local production runtime HOME is not a physical directory" >&2
+  exit 2
+}
+export HOME="$RUNTIME_HOME" USER=tabicl LOGNAME=tabicl
+export XDG_CACHE_HOME="$RUNTIME_HOME/.cache"
+export XDG_CONFIG_HOME="$RUNTIME_HOME/.config"
+export XDG_DATA_HOME="$RUNTIME_HOME/.local/share"
+readonly RUNTIME_HOME
 hermetic_git -C "$CHECKOUT_PARENT" clone --quiet --no-hardlinks --no-checkout -- \
   "$CANDIDATE_REPOSITORY" candidate
 [[ "$(hermetic_git -C "$CHECKOUT" remote get-url origin)" == "$CANDIDATE_REPOSITORY" ]]

@@ -81,6 +81,22 @@ set -euo pipefail
 [[ "${BASH_SOURCE[0]}" == "$TABICL_EXACT_ROOT/scripts/run_h100_identity_maxseq_smoke.sh" ]]
 [[ "$FORMAL_VISIBLE_GPU_TOKENS" == "$TEST_EXPECTED_GPU_TOKEN" ]]
 [[ "$FORMAL_VISIBLE_GPU_UUIDS" == "GPU-fixture" ]]
+"$PYTHON" -I -B - <<'PY'
+import getpass
+import os
+from pathlib import Path
+import stat
+
+home = Path(os.environ["HOME"])
+expected = Path(os.environ["TABICL_EXACT_ROOT"]).parent / "home"
+assert home == expected
+assert home.is_dir() and not home.is_symlink()
+assert stat.S_IMODE(home.stat().st_mode) == 0o700
+assert os.environ["USER"] == os.environ["LOGNAME"] == getpass.getuser() == "tabicl"
+assert os.environ["XDG_CACHE_HOME"] == str(home / ".cache")
+assert os.environ["XDG_CONFIG_HOME"] == str(home / ".config")
+assert os.environ["XDG_DATA_HOME"] == str(home / ".local/share")
+PY
 printf 'ready\\n' > "$TEST_MARKER"
 case "$TEST_MODE" in
   success) exit 0 ;;
@@ -233,6 +249,12 @@ exit "$(< {str(nvidia_exit)!r})"
             "TEST_MODE": mode,
             "TEST_MARKER": str(marker),
             "TEST_EXPECTED_GPU_TOKEN": token,
+            "HOME": "/poison/inherited-home",
+            "USER": "poison-user",
+            "LOGNAME": "poison-logname",
+            "XDG_CACHE_HOME": "/poison/cache",
+            "XDG_CONFIG_HOME": "/poison/config",
+            "XDG_DATA_HOME": "/poison/data",
         }
 
     yield {

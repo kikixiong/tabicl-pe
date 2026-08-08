@@ -147,6 +147,12 @@ parent. This no-follow descriptor check happens before namespace creation,
 repeats against the created artifact root during the held capacity recheck,
 and runs again on the compute node before `mktemp` or `git clone`. Device drift
 at either controller check rolls the held transaction back.
+Each compute wrapper also replaces inherited account and desktop paths with a
+private mode-0700 `HOME` beneath that node-local temporary root, together with
+matching XDG cache/config/data roots and fixed non-personal `USER`/`LOGNAME`
+values. This is required on compute images where the Slurm UID has no passwd
+entry and prevents libraries from falling back to shared or user-specific
+locations. The complete runtime home is removed with the temporary checkout.
 
 The parent inode/metadata must be unchanged across the snapshot and available
 bytes must be greater than or equal to the requirement. Every term, the
@@ -375,6 +381,8 @@ before namespace creation and rechecks both device identity and capacity while
 all nine allocations remain held. The exact-root bootstrap binding is exported
 to every job, whose compute wrapper invokes the same exact-T no-follow helper
 before creating a temporary checkout.
+Production uses the same private node-local runtime-home contract as the H100
+matrix; it never relies on a passwd entry or an inherited `HOME`/XDG path.
 
 Submission is one transaction: submit all nine jobs held, atomically publish
 the protocol ledger and held-job receipt, then release them. Stage 2 and Stage

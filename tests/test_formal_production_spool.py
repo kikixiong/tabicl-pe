@@ -32,7 +32,18 @@ def _fixture(tmp_path: Path, exit_code: int):
     runner = scripts / "run_formal_identity_production_job.py"
     runner.write_text(
         "from pathlib import Path\n"
+        "import getpass\n"
         "import os\n"
+        "import stat\n"
+        "root = Path(__file__).parents[1]\n"
+        "home = Path(os.environ['HOME'])\n"
+        "assert home == root.parent / 'home'\n"
+        "assert home.is_dir() and not home.is_symlink()\n"
+        "assert stat.S_IMODE(home.stat().st_mode) == 0o700\n"
+        "assert os.environ['USER'] == os.environ['LOGNAME'] == getpass.getuser() == 'tabicl'\n"
+        "assert os.environ['XDG_CACHE_HOME'] == str(home / '.cache')\n"
+        "assert os.environ['XDG_CONFIG_HOME'] == str(home / '.config')\n"
+        "assert os.environ['XDG_DATA_HOME'] == str(home / '.local/share')\n"
         "Path(os.environ['RUNTIME_MARKER']).write_text(str(Path(__file__).parents[1]))\n"
         "raise SystemExit(int(os.environ['RUNTIME_EXIT']))\n"
     )
@@ -177,6 +188,12 @@ def _fixture(tmp_path: Path, exit_code: int):
         "RUNTIME_MARKER": str(marker),
         "RUNTIME_EXIT": str(exit_code),
         "NVIDIA_ARGS": str(nvidia_args),
+        "HOME": "/poison/inherited-home",
+        "USER": "poison-user",
+        "LOGNAME": "poison-logname",
+        "XDG_CACHE_HOME": "/poison/cache",
+        "XDG_CONFIG_HOME": "/poison/config",
+        "XDG_DATA_HOME": "/poison/data",
     }
     return spool, work_root, marker, nvidia_args, environment
 
