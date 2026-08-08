@@ -8,15 +8,18 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path
 import re
+import selectors
 import subprocess
 import sys
 import time
-from typing import Callable
-
+from collections.abc import Callable
+from pathlib import Path
+from typing import Protocol
 
 QUERY_TIMEOUT_SECONDS = 15
+QUERY_MAX_BYTES = 512
+STREAM_POLL_SECONDS = 0.05
 
 
 def _monitor_module():
@@ -103,6 +106,182 @@ def _write_record(
     jsonl_handle.flush()
 
 
+class _GpuSampleStream(Protocol):
+    def read_sample(self, timeout_seconds: float) -> tuple[str, ...] | None: ...
+
+    def close(self) -> None: ...
+
+
+class _PersistentNvidiaSmiSampler:
+    """Read allocation-scoped samples from long-lived nvidia-smi loops."""
+
+    def __init__(
+        self,
+        *,
+        executable: str,
+        tokens: tuple[str, ...],
+        nvidia_fd: int | None,
+        interval_seconds: float,
+        popen_fn: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        wall_monotonic_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if interval_seconds != 1.0 or not tokens:
+            raise ValueError("persistent nvidia-smi requires exact 1s cadence")
+        self._selector = selectors.DefaultSelector()
+        self._processes: list[subprocess.Popen[bytes]] = []
+        self._stdout_buffers = [bytearray() for _token in tokens]
+        self._pending_rows: list[bytes | None] = [None for _token in tokens]
+        self._wall_monotonic_fn = wall_monotonic_fn
+        self._last_complete = wall_monotonic_fn()
+        self._closed = False
+        try:
+            for index, token in enumerate(tokens):
+                arguments = [
+                    executable,
+                    f"--id={token}",
+                    "--query-gpu=uuid,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                    "--loop-ms=1000",
+                ]
+                query_kwargs = {
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.PIPE,
+                    "text": False,
+                    "bufsize": 0,
+                }
+                if nvidia_fd is not None:
+                    query_kwargs["pass_fds"] = (nvidia_fd,)
+                process = popen_fn(arguments, **query_kwargs)
+                self._processes.append(process)
+                if process.stdout is None or process.stderr is None:
+                    raise RuntimeError("persistent nvidia-smi pipes are unavailable")
+                for channel, stream in (
+                    ("stdout", process.stdout),
+                    ("stderr", process.stderr),
+                ):
+                    os.set_blocking(stream.fileno(), False)
+                    self._selector.register(
+                        stream, selectors.EVENT_READ, (index, channel)
+                    )
+        except BaseException:
+            try:
+                self.close()
+            except OSError:
+                pass
+            raise
+
+    def _check_processes(self) -> None:
+        if any(process.poll() is not None for process in self._processes):
+            raise RuntimeError("persistent nvidia-smi exited before monitor shutdown")
+
+    def _check_stalled(self) -> None:
+        if self._wall_monotonic_fn() - self._last_complete >= QUERY_TIMEOUT_SECONDS:
+            raise RuntimeError("persistent nvidia-smi sample timed out")
+
+    def _consume(self, timeout_seconds: float) -> bool:
+        events = self._selector.select(timeout_seconds)
+        if not events:
+            self._check_processes()
+            self._check_stalled()
+            return False
+        for key, _mask in events:
+            index, channel = key.data
+            try:
+                chunk = os.read(key.fd, QUERY_MAX_BYTES + 1)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                raise RuntimeError("persistent nvidia-smi stream closed unexpectedly")
+            if channel == "stderr":
+                raise RuntimeError("persistent nvidia-smi wrote to stderr")
+            buffer = self._stdout_buffers[index]
+            buffer.extend(chunk)
+            if len(buffer) > QUERY_MAX_BYTES:
+                raise RuntimeError("persistent nvidia-smi row exceeds its byte ceiling")
+            newline = buffer.find(b"\n")
+            if newline < 0:
+                continue
+            if self._pending_rows[index] is not None:
+                raise RuntimeError("persistent nvidia-smi emitted duplicate GPU rows")
+            self._pending_rows[index] = bytes(buffer[:newline])
+            del buffer[: newline + 1]
+            if b"\n" in buffer:
+                raise RuntimeError("persistent nvidia-smi emitted extra GPU rows")
+        self._check_processes()
+        return all(row is not None for row in self._pending_rows)
+
+    def read_sample(self, timeout_seconds: float) -> tuple[str, ...] | None:
+        if self._closed or timeout_seconds < 0 or not math.isfinite(timeout_seconds):
+            raise RuntimeError("persistent nvidia-smi read is invalid")
+        deadline = self._wall_monotonic_fn() + timeout_seconds
+        while True:
+            if all(row is not None for row in self._pending_rows):
+                raw_rows = tuple(row for row in self._pending_rows if row is not None)
+                self._pending_rows = [None for _row in self._pending_rows]
+                try:
+                    rows = tuple(row.decode("ascii") for row in raw_rows)
+                except UnicodeDecodeError as error:
+                    raise RuntimeError(
+                        "persistent nvidia-smi row is not ASCII"
+                    ) from error
+                self._last_complete = self._wall_monotonic_fn()
+                return rows
+            remaining = max(0.0, deadline - self._wall_monotonic_fn())
+            complete = self._consume(remaining)
+            if complete:
+                continue
+            if self._wall_monotonic_fn() >= deadline:
+                return None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for process in self._processes:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+        for process in self._processes:
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+        self._selector.close()
+        for process in self._processes:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+
+def _parse_sample_rows(
+    rows: tuple[str, ...], expected_gpu_uuids: tuple[str, ...]
+) -> tuple[tuple[str, float], ...]:
+    if len(rows) != len(expected_gpu_uuids):
+        raise RuntimeError("nvidia-smi sample GPU count changed")
+    parsed: list[tuple[str, float]] = []
+    for row, expected_uuid in zip(rows, expected_gpu_uuids):
+        if not row or row != row.strip():
+            raise ValueError("invalid nvidia-smi sample")
+        fields = [item.strip() for item in row.split(",")]
+        if len(fields) != 2 or not fields[0]:
+            raise ValueError("invalid nvidia-smi sample")
+        try:
+            utilization = float(fields[1])
+        except ValueError as error:
+            raise ValueError("invalid nvidia-smi sample") from error
+        if not math.isfinite(utilization) or not 0.0 <= utilization <= 100.0:
+            raise ValueError("invalid nvidia-smi sample")
+        if fields[0] != expected_uuid:
+            raise RuntimeError("visible GPU UUID set changed inside active window")
+        parsed.append((fields[0], utilization))
+    return tuple(parsed)
+
+
 def record_gpu_window(
     csv_path: Path,
     jsonl_path: Path,
@@ -115,8 +294,7 @@ def record_gpu_window(
     expected_gpu_count: int,
     interval_seconds: float = 1.0,
     monotonic_fn: Callable[[], float] = time.monotonic,
-    sleep_fn: Callable[[float], None] = time.sleep,
-    query_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    sampler_factory: Callable[..., _GpuSampleStream] = _PersistentNvidiaSmiSampler,
 ) -> None:
     """Record every sample, and only samples, in the harness-signaled window."""
     if max_bytes < 1 or interval_seconds != 1.0 or expected_gpu_count not in {1, 2}:
@@ -144,35 +322,15 @@ def record_gpu_window(
         or any(token_pattern.fullmatch(token) is None for token in tokens)
     ):
         raise ValueError("formal GPU recorder requires exact CUDA-visible GPU tokens")
-
-    def scoped_query(fields: str) -> subprocess.CompletedProcess[str]:
-        rows: list[str] = []
-        for token in tokens:
-            arguments = [
-                    executable,
-                    f"--id={token}",
-                    f"--query-gpu={fields}",
-                    "--format=csv,noheader,nounits",
-                ]
-            query_kwargs = dict(
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=QUERY_TIMEOUT_SECONDS,
-            )
-            if nvidia_fd is not None:
-                query_kwargs["pass_fds"] = (nvidia_fd,)
-            try:
-                result = query_fn(arguments, **query_kwargs)
-            except subprocess.TimeoutExpired as error:
-                raise RuntimeError(
-                    "CUDA-visible nvidia-smi query timed out"
-                ) from error
-            lines = [line for line in result.stdout.splitlines() if line.strip()]
-            if result.returncode != 0 or len(lines) != 1:
-                raise RuntimeError("CUDA-visible nvidia-smi query failed")
-            rows.append(lines[0])
-        return subprocess.CompletedProcess([], 0, "\n".join(rows) + "\n", "")
+    raw_uuids = os.environ.get("FORMAL_VISIBLE_GPU_UUIDS", "")
+    expected_gpu_uuids = tuple(raw_uuids.split(",")) if raw_uuids else ()
+    uuid_pattern = re.compile(r"^(?:GPU|MIG)-[A-Za-z0-9._:/-]+$")
+    if (
+        len(expected_gpu_uuids) != expected_gpu_count
+        or len(set(expected_gpu_uuids)) != expected_gpu_count
+        or any(uuid_pattern.fullmatch(value) is None for value in expected_gpu_uuids)
+    ):
+        raise ValueError("formal GPU recorder requires exact visible GPU UUIDs")
     if any(
         path.exists() or path.is_symlink()
         for path in (
@@ -186,85 +344,91 @@ def record_gpu_window(
         raise ValueError("formal GPU recorder outputs must be fresh")
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("x", encoding="utf-8") as csv_handle, jsonl_path.open(
-        "x", encoding="utf-8"
-    ) as jsonl_handle:
-        initial = scoped_query("uuid")
-        expected_gpu_uuids = tuple(
-            line.strip() for line in initial.stdout.splitlines() if line.strip()
-        )
-        if (
-            initial.returncode != 0
-            or len(expected_gpu_uuids) != expected_gpu_count
-            or len(set(expected_gpu_uuids)) != expected_gpu_count
-        ):
-            raise RuntimeError("visible GPU UUID set/count does not match case contract")
-        ready_path.touch(exist_ok=False)
-        while not active_start_path.exists():
-            if stop_path.exists():
-                for handle in (csv_handle, jsonl_handle):
-                    os.fsync(handle.fileno())
-                return
-            sleep_fn(0.05)
-        start = _read_signal_timestamp(active_start_path)
-        _write_record(
-            csv_handle,
-            jsonl_handle,
-            {
-                "kind": "training_start",
-                "monotonic_seconds": start,
-                "expected_gpu_uuids": list(expected_gpu_uuids),
-                "expected_gpu_count": expected_gpu_count,
-            },
-            max_bytes=max_bytes,
-        )
-        while not active_end_path.exists():
-            if stop_path.exists():
-                raise RuntimeError("compute ended before active training window closed")
-            loop_start = monotonic_fn()
-            result = scoped_query("uuid,utilization.gpu")
-            if result.returncode != 0:
-                raise RuntimeError("nvidia-smi sample failed")
-            timestamp = monotonic_fn()
-            observed_gpu_uuids: list[str] = []
-            for raw in result.stdout.splitlines():
-                fields = [item.strip() for item in raw.split(",")]
-                if len(fields) != 2 or not fields[0]:
-                    raise ValueError("invalid nvidia-smi sample")
-                utilization = float(fields[1])
-                observed_gpu_uuids.append(fields[0])
-                _write_record(
-                    csv_handle,
-                    jsonl_handle,
-                    {
-                        "kind": "sample",
-                        "monotonic_seconds": timestamp,
-                        "gpu_uuid": fields[0],
-                        "utilization_percent": utilization,
-                    },
-                    max_bytes=max_bytes,
-                )
-            if tuple(observed_gpu_uuids) != expected_gpu_uuids:
-                raise RuntimeError("visible GPU UUID set changed inside active window")
-            delay = interval_seconds - (monotonic_fn() - loop_start)
-            if delay > 0:
-                sleep_fn(delay)
-        end = _read_signal_timestamp(active_end_path)
-        if end <= start:
-            raise ValueError("active training signal timestamps are invalid")
-        _write_record(
-            csv_handle,
-            jsonl_handle,
-            {
-                "kind": "training_end",
-                "monotonic_seconds": end,
-                "expected_gpu_uuids": list(expected_gpu_uuids),
-                "expected_gpu_count": expected_gpu_count,
-            },
-            max_bytes=max_bytes,
-        )
-        for handle in (csv_handle, jsonl_handle):
-            os.fsync(handle.fileno())
+    sampler: _GpuSampleStream | None = None
+    try:
+        with csv_path.open("x", encoding="utf-8") as csv_handle, jsonl_path.open(
+            "x", encoding="utf-8"
+        ) as jsonl_handle:
+            sampler = sampler_factory(
+                executable=executable,
+                tokens=tokens,
+                nvidia_fd=nvidia_fd,
+                interval_seconds=interval_seconds,
+            )
+            initial_rows = sampler.read_sample(QUERY_TIMEOUT_SECONDS)
+            if initial_rows is None:
+                raise RuntimeError("persistent nvidia-smi sample timed out")
+            _parse_sample_rows(initial_rows, expected_gpu_uuids)
+            ready_path.touch(exist_ok=False)
+            while not active_start_path.exists():
+                if stop_path.exists():
+                    for handle in (csv_handle, jsonl_handle):
+                        os.fsync(handle.fileno())
+                    return
+                discarded = sampler.read_sample(STREAM_POLL_SECONDS)
+                if discarded is not None:
+                    _parse_sample_rows(discarded, expected_gpu_uuids)
+            start = _read_signal_timestamp(active_start_path)
+            while True:
+                discarded = sampler.read_sample(0.0)
+                if discarded is None:
+                    break
+                _parse_sample_rows(discarded, expected_gpu_uuids)
+            _write_record(
+                csv_handle,
+                jsonl_handle,
+                {
+                    "kind": "training_start",
+                    "monotonic_seconds": start,
+                    "expected_gpu_uuids": list(expected_gpu_uuids),
+                    "expected_gpu_count": expected_gpu_count,
+                },
+                max_bytes=max_bytes,
+            )
+            while not active_end_path.exists():
+                if stop_path.exists():
+                    raise RuntimeError("compute ended before active training window closed")
+                rows = sampler.read_sample(STREAM_POLL_SECONDS)
+                if rows is None:
+                    continue
+                timestamp = monotonic_fn()
+                if active_end_path.exists():
+                    observed_end = _read_signal_timestamp(active_end_path)
+                    if timestamp > observed_end:
+                        break
+                for gpu_uuid, utilization in _parse_sample_rows(
+                    rows, expected_gpu_uuids
+                ):
+                    _write_record(
+                        csv_handle,
+                        jsonl_handle,
+                        {
+                            "kind": "sample",
+                            "monotonic_seconds": timestamp,
+                            "gpu_uuid": gpu_uuid,
+                            "utilization_percent": utilization,
+                        },
+                        max_bytes=max_bytes,
+                    )
+            end = _read_signal_timestamp(active_end_path)
+            if end <= start:
+                raise ValueError("active training signal timestamps are invalid")
+            _write_record(
+                csv_handle,
+                jsonl_handle,
+                {
+                    "kind": "training_end",
+                    "monotonic_seconds": end,
+                    "expected_gpu_uuids": list(expected_gpu_uuids),
+                    "expected_gpu_count": expected_gpu_count,
+                },
+                max_bytes=max_bytes,
+            )
+            for handle in (csv_handle, jsonl_handle):
+                os.fsync(handle.fileno())
+    finally:
+        if sampler is not None:
+            sampler.close()
 
 
 def _read_signal_timestamp(path: Path) -> float:

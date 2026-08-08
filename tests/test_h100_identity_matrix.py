@@ -7,14 +7,13 @@ import inspect
 import io
 import json
 import os
-from pathlib import Path
 import stat
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 
 ROOT = Path(__file__).parents[1]
 MATRIX_SCRIPT = ROOT / "scripts" / "run_h100_identity_validation.py"
@@ -68,7 +67,16 @@ def test_fifo_artifact_and_sacct_inputs_are_rejected_without_blocking(
         "    getattr(module, sys.argv[3])(path, max_bytes=1024)\n"
     )
     completed = subprocess.run(
-        [sys.executable, "-I", "-B", "-c", code, str(MATRIX_SCRIPT), str(fifo), function_name],
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            code,
+            str(MATRIX_SCRIPT),
+            str(fifo),
+            function_name,
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -130,12 +138,12 @@ def test_matrix_freezes_lengths_recompute_utilization_and_world_size(matrix):
             assert case.assertion == "nccl_all_reduce_exact"
         else:
             assert case.world_size == 1
-    assert next(c for c in cases if c.case_id == "temporary_cuda_rng_resume").assertion == (
-        "temporary_cuda_rng_isolation_and_resume_exact"
-    )
-    assert next(c for c in cases if c.case_id == "prior_dataloader_resume").assertion == (
-        "full_prior_dataloader_uninterrupted_equals_resume"
-    )
+    assert next(
+        c for c in cases if c.case_id == "temporary_cuda_rng_resume"
+    ).assertion == ("temporary_cuda_rng_isolation_and_resume_exact")
+    assert next(
+        c for c in cases if c.case_id == "prior_dataloader_resume"
+    ).assertion == ("full_prior_dataloader_uninterrupted_equals_resume")
 
 
 def test_all_training_shapes_disable_random_or_log_length_replay(matrix):
@@ -219,11 +227,12 @@ def _case_evidence(
     tree="2" * 40,
     source_manifest="4" * 64,
 ):
-    artifact_identity = hashlib.sha256(("identity:" + case.case_id).encode()).hexdigest()
+    artifact_identity = hashlib.sha256(
+        ("identity:" + case.case_id).encode()
+    ).hexdigest()
+
     def canonical(value):
-        return json.dumps(
-            value, sort_keys=True, separators=(",", ":")
-        ).encode()
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
     def envelope(kind, payload):
         body = {"schema_version": 1, "kind": kind, "payload": payload}
@@ -528,7 +537,9 @@ def _attestation(matrix):
                 "exit_code": "0:0",
                 "derived_exit_code": "0:0",
                 "query_returncode": 0,
-                "query_argv_sha256": hashlib.sha256(matrix._canonical(argv)).hexdigest(),
+                "query_argv_sha256": hashlib.sha256(
+                    matrix._canonical(argv)
+                ).hexdigest(),
                 "query_stdout_sha256": hashlib.sha256(
                     f"{job_id}|cluster-a|COMPLETED|0:0|0:0\n".encode()
                 ).hexdigest(),
@@ -543,7 +554,9 @@ def _attestation(matrix):
     payload = {
         "commit_sha": commit,
         "tree_sha": tree,
-        "environment_sha256": cases[0]["runtime_evidence"]["payload"]["environment"]["sha256"],
+        "environment_sha256": cases[0]["runtime_evidence"]["payload"]["environment"][
+            "sha256"
+        ],
         "source_manifest_sha256": "4" * 64,
         "repository_binding": _repository_binding(matrix, commit=commit),
         "nvidia_smi_sha256": "9" * 64,
@@ -601,11 +614,12 @@ def test_runtime_evidence_is_bound_to_receipt_job_cluster_and_resource(matrix):
 @pytest.mark.parametrize(
     "mutation,error",
     [
-        (lambda payload: payload.update(formal_runtime_distributions=[]), "inventory is incomplete"),
         (
-            lambda payload: payload.update(
-                environment_fingerprint_schema_version=True
-            ),
+            lambda payload: payload.update(formal_runtime_distributions=[]),
+            "inventory is incomplete",
+        ),
+        (
+            lambda payload: payload.update(environment_fingerprint_schema_version=True),
             "schema is unsupported",
         ),
         (
@@ -644,7 +658,10 @@ def test_runtime_evidence_is_bound_to_receipt_job_cluster_and_resource(matrix):
             ),
             "pyc mismatch count is malformed",
         ),
-        (lambda payload: payload.update(flash_attn3_available=False), "backend is unavailable"),
+        (
+            lambda payload: payload.update(flash_attn3_available=False),
+            "backend is unavailable",
+        ),
         (lambda payload: payload.update(nccl_version=[]), "NCCL version is malformed"),
     ],
 )
@@ -661,9 +678,7 @@ def test_runtime_evidence_rejects_malformed_distribution_inventory(
     environment["sha256"] = hashlib.sha256(
         matrix._canonical(environment_body)
     ).hexdigest()
-    runtime_body = {
-        key: runtime[key] for key in ("schema_version", "kind", "payload")
-    }
+    runtime_body = {key: runtime[key] for key in ("schema_version", "kind", "payload")}
     runtime["sha256"] = hashlib.sha256(matrix._canonical(runtime_body)).hexdigest()
 
     with pytest.raises(ValueError, match=error):
@@ -741,9 +756,7 @@ def test_runtime_evidence_rejects_noncanonical_actual_resource_proof(
     scheduler[field] = value
     scheduler_body = {key: item for key, item in scheduler.items() if key != "sha256"}
     scheduler["sha256"] = hashlib.sha256(matrix._canonical(scheduler_body)).hexdigest()
-    runtime_body = {
-        key: runtime[key] for key in ("schema_version", "kind", "payload")
-    }
+    runtime_body = {key: runtime[key] for key in ("schema_version", "kind", "payload")}
     runtime["sha256"] = hashlib.sha256(matrix._canonical(runtime_body)).hexdigest()
     with pytest.raises(ValueError, match="scheduler/resource binding"):
         matrix.validate_runtime_evidence(
@@ -757,8 +770,7 @@ def test_runtime_evidence_rejects_noncanonical_actual_resource_proof(
 
 def _scontrol_allocation_line(resource, *, job_id="7001"):
     tres = (
-        f"cpu={resource['cpus_per_task']},mem=128G,node=1,"
-        f"gres/gpu={resource['gpus']}"
+        f"cpu={resource['cpus_per_task']},mem=128G,node=1,gres/gpu={resource['gpus']}"
     )
     return (
         f"JobId={job_id} Partition={resource['partition']} QOS={resource['qos']} "
@@ -801,7 +813,9 @@ def _install_runtime_scheduler_fixture(
                 "requested_resource_sha256": matrix.gate_requested_resource_sha256(
                     expected_case
                 ),
-                "job_id": "7001" if expected_case.case_id == case.case_id else str(7100 + index),
+                "job_id": "7001"
+                if expected_case.case_id == case.case_id
+                else str(7100 + index),
                 "cluster": "cluster-a",
             }
         )
@@ -854,9 +868,7 @@ def _install_runtime_scheduler_fixture(
         "FORMAL_REPOSITORY_IDENTITY_SHA256": _repository_binding(matrix)[
             "repository_identity_sha256"
         ],
-        "FORMAL_REPOSITORY_QUERY_SHA256": _repository_binding(matrix)[
-            "query_sha256"
-        ],
+        "FORMAL_REPOSITORY_QUERY_SHA256": _repository_binding(matrix)["query_sha256"],
         "SCONTROL": str(scontrol),
     }
     for name, value in environment.items():
@@ -899,9 +911,10 @@ def test_runtime_scheduler_capture_binds_actual_scontrol_allocation_and_digests(
         "-o",
         "7001",
     ]
-    assert binding["scontrol_query_argv_sha256"] == hashlib.sha256(
-        matrix._canonical(expected_argv)
-    ).hexdigest()
+    assert (
+        binding["scontrol_query_argv_sha256"]
+        == hashlib.sha256(matrix._canonical(expected_argv)).hexdigest()
+    )
 
 
 def test_runtime_scheduler_capture_rejects_repository_ref_export_drift(
@@ -923,7 +936,10 @@ def test_runtime_scheduler_capture_rejects_repository_ref_export_drift(
         ("Partition=h100", "Partition=cpu"),
         ("NumCPUs=32", "NumCPUs=31"),
         ("MinMemoryNode=128G", "MinMemoryNode=127G"),
-        ("AllocTRES=cpu=32,mem=128G,node=1,gres/gpu=1", "AllocTRES=cpu=32,mem=128G,node=1,gres/gpu=0"),
+        (
+            "AllocTRES=cpu=32,mem=128G,node=1,gres/gpu=1",
+            "AllocTRES=cpu=32,mem=128G,node=1,gres/gpu=0",
+        ),
         ("TresPerNode=gres:gpu:1", "TresPerNode=gres:gpu:0"),
     ],
 )
@@ -931,8 +947,8 @@ def test_runtime_scheduler_capture_rejects_actual_allocation_drift(
     tmp_path, matrix, monkeypatch, old, new
 ):
     case = matrix.build_matrix()[0]
-    _resource, state, _command_digest, _held_digest = _install_runtime_scheduler_fixture(
-        tmp_path, matrix, monkeypatch, case
+    _resource, state, _command_digest, _held_digest = (
+        _install_runtime_scheduler_fixture(tmp_path, matrix, monkeypatch, case)
     )
     state.write_text(state.read_text().replace(old, new))
     with pytest.raises(RuntimeError, match="actual scontrol allocation"):
@@ -943,8 +959,8 @@ def test_runtime_scheduler_capture_rejects_exported_allocation_drift(
     tmp_path, matrix, monkeypatch
 ):
     case = matrix.build_matrix()[0]
-    resource, _state, _command_digest, _held_digest = _install_runtime_scheduler_fixture(
-        tmp_path, matrix, monkeypatch, case
+    resource, _state, _command_digest, _held_digest = (
+        _install_runtime_scheduler_fixture(tmp_path, matrix, monkeypatch, case)
     )
 
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", str(resource["cpus_per_task"] - 1))
@@ -1009,9 +1025,13 @@ def _write_assembler_cases(root: Path, matrix) -> None:
                 **body,
                 "sha256": hashlib.sha256(matrix._canonical(body)).hexdigest(),
             }
-        _write_canonical(case_root / "source-attestation.json", item["source_attestation"])
+        _write_canonical(
+            case_root / "source-attestation.json", item["source_attestation"]
+        )
         _write_canonical(case_root / "runtime-evidence.json", item["runtime_evidence"])
-        _write_canonical(case_root / "action-completion.json", item["action_completion"])
+        _write_canonical(
+            case_root / "action-completion.json", item["action_completion"]
+        )
         _write_canonical(compute_root / "case-result.json", item["case_result"])
         (case_root / "compute.log").write_bytes(b"completed\n")
         if case.utilization_required:
@@ -1308,7 +1328,10 @@ def test_assembler_rejects_fatal_scheduler_spool_signatures(tmp_path, matrix):
             f"{job}|cluster-a|COMPLETED|0:0|0:0",
             f"{job}|cluster-a|COMPLETED|0:0|0:0",
         ],
-        lambda job: ["Welcome back, forged banner", f"{job}|cluster-a|COMPLETED|0:0|0:0"],
+        lambda job: [
+            "Welcome back, forged banner",
+            f"{job}|cluster-a|COMPLETED|0:0|0:0",
+        ],
         lambda job: [f"{job}.batch|cluster-a|COMPLETED|0:0|0:0"],
         lambda job: [f"{job}|cluster-b|COMPLETED|0:0|0:0"],
     ),
@@ -1325,9 +1348,7 @@ def test_assembler_rejects_fatal_scheduler_spool_signatures(tmp_path, matrix):
         "wrong-cluster",
     ),
 )
-def test_terminal_finalizer_rejects_noncanonical_sacct_rows(
-    tmp_path, matrix, rows
-):
+def test_terminal_finalizer_rejects_noncanonical_sacct_rows(tmp_path, matrix, rows):
     cases = tmp_path / "cases"
     cases.mkdir()
     _write_assembler_cases(cases, matrix)
@@ -1538,8 +1559,7 @@ def test_gpu_summary_reuses_monitor_active_window_contract(tmp_path):
     # The low sample before initialization is excluded, but the low sample
     # inside the explicit active window is retained in the unfiltered mean.
     rows.extend(
-        f"sample,{100 + index},GPU-a,{0 if index == 0 else 100}"
-        for index in range(10)
+        f"sample,{100 + index},GPU-a,{0 if index == 0 else 100}" for index in range(10)
     )
     rows.append("training_end,110")
     rows.append("sample,111,GPU-a,0")
@@ -1603,16 +1623,12 @@ def test_gpu_recorder_binds_expected_uuid_set_and_checks_bytes_before_write():
     csv_record, jsonl_record = summary._encoded_record(marker)
     exact = len(csv_record.encode()) + len(jsonl_record.encode())
     csv_handle, jsonl_handle = io.StringIO(), io.StringIO()
-    summary._write_record(
-        csv_handle, jsonl_handle, marker, max_bytes=exact
-    )
+    summary._write_record(csv_handle, jsonl_handle, marker, max_bytes=exact)
     assert "expected_gpu_uuids" in jsonl_handle.getvalue()
 
     csv_short, jsonl_short = io.StringIO(), io.StringIO()
     with pytest.raises(ValueError, match="ceiling"):
-        summary._write_record(
-            csv_short, jsonl_short, marker, max_bytes=exact - 1
-        )
+        summary._write_record(csv_short, jsonl_short, marker, max_bytes=exact - 1)
     assert csv_short.getvalue() == jsonl_short.getvalue() == ""
 
 
@@ -1626,30 +1642,48 @@ def test_gpu_recorder_waits_for_harness_active_signal_and_keeps_every_sample(
     current = 10.0
     sample_calls = 0
 
-    class Result:
-        returncode = 0
-        stderr = ""
+    class Sampler:
+        def __init__(self):
+            self.read_calls = 0
+            self.closed = False
 
-        def __init__(self, stdout):
-            self.stdout = stdout
+        def read_sample(self, timeout_seconds):
+            nonlocal current, sample_calls
+            self.read_calls += 1
+            if self.read_calls == 1:
+                assert timeout_seconds == summary.QUERY_TIMEOUT_SECONDS
+                assert not ready.exists()
+                assert not start.exists()
+                return ("GPU-0, 80",)
+            if not start.exists():
+                assert ready.exists()
+                start.write_text("10\n")
+                return ("GPU-0, 80",)
+            if timeout_seconds == 0.0:
+                return None
+            sample_calls += 1
+            current += 1.0
+            if sample_calls == 11:
+                end.write_text("20.5\n")
+            return ("GPU-0, 80",)
 
-    def query(argv, **_kwargs):
-        nonlocal current, sample_calls
-        assert "--id=0" in argv
-        if "--query-gpu=uuid" in argv:
-            return Result("GPU-0\n")
-        sample_calls += 1
-        current += 1.0
-        if sample_calls == 10:
-            end.write_text("21\n")
-        return Result("GPU-0, 80\n")
+        def close(self):
+            self.closed = True
 
-    def sleep(_seconds):
-        assert sample_calls == 0
-        start.write_text("10\n")
+    sampler = Sampler()
+
+    def sampler_factory(**kwargs):
+        assert kwargs == {
+            "executable": sys.executable,
+            "tokens": ("0",),
+            "nvidia_fd": None,
+            "interval_seconds": 1.0,
+        }
+        return sampler
 
     monkeypatch.setenv("NVIDIA_SMI", sys.executable)
     monkeypatch.setenv("FORMAL_VISIBLE_GPU_TOKENS", "0")
+    monkeypatch.setenv("FORMAL_VISIBLE_GPU_UUIDS", "GPU-0")
     summary.record_gpu_window(
         csv_path,
         jsonl_path,
@@ -1660,8 +1694,7 @@ def test_gpu_recorder_waits_for_harness_active_signal_and_keeps_every_sample(
         max_bytes=1 << 20,
         expected_gpu_count=1,
         monotonic_fn=lambda: current,
-        sleep_fn=sleep,
-        query_fn=query,
+        sampler_factory=sampler_factory,
     )
     records, invalid = summary._monitor_module().parse_gpu_records(
         jsonl_path.read_text()
@@ -1670,16 +1703,344 @@ def test_gpu_recorder_waits_for_harness_active_signal_and_keeps_every_sample(
     assert [record.kind for record in records].count("sample") == 10
     assert records[0].kind == "training_start"
     assert records[-1].kind == "training_end"
+    assert sample_calls == 11
+    assert sampler.closed is True
+    assert summary.summarize(
+        csv_path,
+        utilization_required=True,
+        expected_gpu_uuids=("GPU-0",),
+        expected_gpu_count=1,
+    ) == {
+        "schema_version": 1,
+        "utilization_required": True,
+        "utilization_claimed": True,
+        "sample_counts": {"GPU-0": 10},
+        "means": {"GPU-0": 80.0},
+    }
+
+
+def test_gpu_recorder_persistent_sampler_executes_verified_fd_once_per_token(
+    tmp_path,
+):
+    summary = _load("formal_gpu_summary_persistent_process", SUMMARY_SCRIPT)
+    executable = tmp_path / "nvidia-smi"
+    invocation_dir = tmp_path / "invocations"
+    invocation_dir.mkdir()
+    executable.write_text(
+        f"""#!{sys.executable}
+import json
+from pathlib import Path
+import sys
+import time
+
+token = next(arg.split("=", 1)[1] for arg in sys.argv if arg.startswith("--id="))
+Path({str(invocation_dir)!r}, token + ".json").write_text(json.dumps(sys.argv[1:]))
+while True:
+    print(f"GPU-{{token}}, 80", flush=True)
+    time.sleep(1)
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    descriptor = os.open(executable, os.O_RDONLY)
+    popen_calls = []
+
+    def recording_popen(argv, **kwargs):
+        popen_calls.append((argv, kwargs))
+        return subprocess.Popen(argv, **kwargs)
+
+    sampler = summary._PersistentNvidiaSmiSampler(
+        executable=f"/proc/self/fd/{descriptor}",
+        tokens=("0", "1"),
+        nvidia_fd=descriptor,
+        interval_seconds=1.0,
+        popen_fn=recording_popen,
+    )
+    processes = tuple(sampler._processes)
+    try:
+        assert sampler.read_sample(2.0) == ("GPU-0, 80", "GPU-1, 80")
+    finally:
+        sampler.close()
+        os.close(descriptor)
+    assert len(popen_calls) == 2
+    assert all(call[1]["pass_fds"] == (descriptor,) for call in popen_calls)
+    assert all(process.poll() is not None for process in processes)
+    for token in ("0", "1"):
+        assert json.loads((invocation_dir / f"{token}.json").read_text()) == [
+            f"--id={token}",
+            "--query-gpu=uuid,utilization.gpu",
+            "--format=csv,noheader,nounits",
+            "--loop-ms=1000",
+        ]
+
+
+def _persistent_test_executable(tmp_path, name, body):
+    executable = tmp_path / name
+    executable.write_text(
+        f"#!{sys.executable}\nimport sys\nimport time\n{body}\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def test_gpu_recorder_uuid_drift_fails_before_ready(tmp_path, monkeypatch):
+    summary = _load("formal_gpu_summary_uuid_drift", SUMMARY_SCRIPT)
+    monkeypatch.setenv("NVIDIA_SMI", sys.executable)
+    monkeypatch.setenv("FORMAL_VISIBLE_GPU_TOKENS", "0")
+    monkeypatch.setenv("FORMAL_VISIBLE_GPU_UUIDS", "GPU-0")
+
+    class DriftSampler:
+        closed = False
+
+        def read_sample(self, timeout_seconds):
+            assert timeout_seconds == summary.QUERY_TIMEOUT_SECONDS
+            return ("GPU-other, 80",)
+
+        def close(self):
+            self.closed = True
+
+    sampler = DriftSampler()
+    ready = tmp_path / "ready"
+    with pytest.raises(RuntimeError, match="UUID set changed"):
+        summary.record_gpu_window(
+            tmp_path / "gpu.csv",
+            tmp_path / "gpu.jsonl",
+            ready_path=ready,
+            stop_path=tmp_path / "stop",
+            active_start_path=tmp_path / "start",
+            active_end_path=tmp_path / "end",
+            max_bytes=1 << 20,
+            expected_gpu_count=1,
+            sampler_factory=lambda **_kwargs: sampler,
+        )
+    assert not ready.exists()
+    assert sampler.closed is True
+
+
+def test_gpu_recorder_uuid_drift_inside_active_window_fails_closed(
+    tmp_path, monkeypatch
+):
+    summary = _load("formal_gpu_summary_active_uuid_drift", SUMMARY_SCRIPT)
+    monkeypatch.setenv("NVIDIA_SMI", sys.executable)
+    monkeypatch.setenv("FORMAL_VISIBLE_GPU_TOKENS", "0")
+    monkeypatch.setenv("FORMAL_VISIBLE_GPU_UUIDS", "GPU-0")
+    start = tmp_path / "start"
+
+    class DriftSampler:
+        closed = False
+        calls = 0
+
+        def read_sample(self, timeout_seconds):
+            self.calls += 1
+            if self.calls == 1:
+                assert timeout_seconds == summary.QUERY_TIMEOUT_SECONDS
+                return ("GPU-0, 80",)
+            if self.calls == 2:
+                assert timeout_seconds == summary.STREAM_POLL_SECONDS
+                start.write_text("10\n")
+                return ("GPU-0, 80",)
+            if self.calls == 3:
+                assert timeout_seconds == 0.0
+                return None
+            return ("GPU-other, 80",)
+
+        def close(self):
+            self.closed = True
+
+    sampler = DriftSampler()
+    with pytest.raises(RuntimeError, match="UUID set changed"):
+        summary.record_gpu_window(
+            tmp_path / "gpu.csv",
+            tmp_path / "gpu.jsonl",
+            ready_path=tmp_path / "ready",
+            stop_path=tmp_path / "stop",
+            active_start_path=start,
+            active_end_path=tmp_path / "end",
+            max_bytes=1 << 20,
+            expected_gpu_count=1,
+            sampler_factory=lambda **_kwargs: sampler,
+        )
+    assert sampler.closed is True
+
+
+def test_persistent_gpu_sampler_accepts_a_partial_row(tmp_path):
+    summary = _load("formal_gpu_summary_partial_row", SUMMARY_SCRIPT)
+    executable = _persistent_test_executable(
+        tmp_path,
+        "nvidia-partial",
+        'sys.stdout.write("GPU-0, "); sys.stdout.flush(); time.sleep(0.05); '
+        'sys.stdout.write("80\\n"); sys.stdout.flush(); time.sleep(30)',
+    )
+    descriptor = os.open(executable, os.O_RDONLY)
+    sampler = summary._PersistentNvidiaSmiSampler(
+        executable=f"/proc/self/fd/{descriptor}",
+        tokens=("0",),
+        nvidia_fd=descriptor,
+        interval_seconds=1.0,
+    )
+    try:
+        assert sampler.read_sample(2.0) == ("GPU-0, 80",)
+    finally:
+        sampler.close()
+        os.close(descriptor)
+
+
+def test_persistent_gpu_sampler_rejects_backlogged_duplicate_rows(tmp_path):
+    summary = _load("formal_gpu_summary_duplicate_rows", SUMMARY_SCRIPT)
+    executable = _persistent_test_executable(
+        tmp_path,
+        "nvidia-duplicate",
+        'sys.stdout.write("GPU-0, 80\\nGPU-0, 81\\n"); '
+        "sys.stdout.flush(); time.sleep(30)",
+    )
+    descriptor = os.open(executable, os.O_RDONLY)
+    sampler = summary._PersistentNvidiaSmiSampler(
+        executable=f"/proc/self/fd/{descriptor}",
+        tokens=("0",),
+        nvidia_fd=descriptor,
+        interval_seconds=1.0,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="extra GPU rows"):
+            sampler.read_sample(2.0)
+    finally:
+        sampler.close()
+        os.close(descriptor)
+
+
+def test_persistent_gpu_sampler_executes_open_inode_after_path_swap(tmp_path):
+    summary = _load("formal_gpu_summary_path_swap", SUMMARY_SCRIPT)
+    executable = _persistent_test_executable(
+        tmp_path,
+        "nvidia-smi",
+        'print("GPU-original, 80", flush=True); time.sleep(30)',
+    )
+    replacement = _persistent_test_executable(
+        tmp_path,
+        "nvidia-smi-replacement",
+        'print("GPU-replaced, 0", flush=True); time.sleep(30)',
+    )
+    descriptor = os.open(executable, os.O_RDONLY)
+    os.replace(replacement, executable)
+    sampler = summary._PersistentNvidiaSmiSampler(
+        executable=f"/proc/self/fd/{descriptor}",
+        tokens=("0",),
+        nvidia_fd=descriptor,
+        interval_seconds=1.0,
+    )
+    try:
+        assert sampler.read_sample(2.0) == ("GPU-original, 80",)
+    finally:
+        sampler.close()
+        os.close(descriptor)
+
+
+def test_persistent_gpu_sampler_kills_process_that_ignores_terminate(tmp_path):
+    summary = _load("formal_gpu_summary_kill_cleanup", SUMMARY_SCRIPT)
+    executable = _persistent_test_executable(
+        tmp_path,
+        "nvidia-ignore-term",
+        "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        'print("GPU-0, 80", flush=True); time.sleep(30)',
+    )
+    descriptor = os.open(executable, os.O_RDONLY)
+    sampler = summary._PersistentNvidiaSmiSampler(
+        executable=f"/proc/self/fd/{descriptor}",
+        tokens=("0",),
+        nvidia_fd=descriptor,
+        interval_seconds=1.0,
+    )
+    process = sampler._processes[0]
+    try:
+        assert sampler.read_sample(2.0) == ("GPU-0, 80",)
+        sampler.close()
+    finally:
+        sampler.close()
+        os.close(descriptor)
+    assert process.returncode is not None
+
+
+@pytest.mark.parametrize(
+    ("name", "body", "message"),
+    [
+        ("nvidia-eof", "raise SystemExit(0)", "closed|exited"),
+        ("nvidia-nonzero", "raise SystemExit(7)", "closed|exited"),
+        (
+            "nvidia-stderr",
+            'sys.stderr.write("x" * 513); sys.stderr.flush(); time.sleep(30)',
+            "stderr|closed|exited",
+        ),
+        (
+            "nvidia-oversize",
+            'sys.stdout.write("x" * 513); sys.stdout.flush(); time.sleep(30)',
+            "byte ceiling",
+        ),
+    ],
+)
+def test_persistent_gpu_sampler_stream_failures_are_closed_and_reaped(
+    tmp_path, name, body, message
+):
+    summary = _load(f"formal_gpu_summary_{name}", SUMMARY_SCRIPT)
+    executable = _persistent_test_executable(tmp_path, name, body)
+    descriptor = os.open(executable, os.O_RDONLY)
+    sampler = summary._PersistentNvidiaSmiSampler(
+        executable=f"/proc/self/fd/{descriptor}",
+        tokens=("0",),
+        nvidia_fd=descriptor,
+        interval_seconds=1.0,
+    )
+    processes = tuple(sampler._processes)
+    try:
+        with pytest.raises(RuntimeError, match=message):
+            sampler.read_sample(2.0)
+    finally:
+        sampler.close()
+        os.close(descriptor)
+    assert all(process.poll() is not None for process in processes)
+
+
+def test_persistent_gpu_sampler_timeout_is_closed_and_reaped(tmp_path):
+    summary = _load("formal_gpu_summary_stream_timeout", SUMMARY_SCRIPT)
+    executable = _persistent_test_executable(
+        tmp_path, "nvidia-timeout", "time.sleep(30)"
+    )
+    descriptor = os.open(executable, os.O_RDONLY)
+    now = 0.0
+    sampler = summary._PersistentNvidiaSmiSampler(
+        executable=f"/proc/self/fd/{descriptor}",
+        tokens=("0",),
+        nvidia_fd=descriptor,
+        interval_seconds=1.0,
+        wall_monotonic_fn=lambda: now,
+    )
+    processes = tuple(sampler._processes)
+    now = summary.QUERY_TIMEOUT_SECONDS
+    try:
+        with pytest.raises(RuntimeError, match="timed out"):
+            sampler.read_sample(0.0)
+    finally:
+        sampler.close()
+        os.close(descriptor)
+    assert all(process.poll() is not None for process in processes)
 
 
 def test_gpu_recorder_query_timeout_fails_closed(tmp_path, monkeypatch):
     summary = _load("formal_gpu_summary_query_timeout", SUMMARY_SCRIPT)
     monkeypatch.setenv("NVIDIA_SMI", sys.executable)
     monkeypatch.setenv("FORMAL_VISIBLE_GPU_TOKENS", "0")
+    monkeypatch.setenv("FORMAL_VISIBLE_GPU_UUIDS", "GPU-0")
 
-    def query(argv, **kwargs):
-        assert kwargs["timeout"] == summary.QUERY_TIMEOUT_SECONDS
-        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+    class TimeoutSampler:
+        closed = False
+
+        def read_sample(self, timeout_seconds):
+            assert timeout_seconds == summary.QUERY_TIMEOUT_SECONDS
+
+        def close(self):
+            self.closed = True
+
+    sampler = TimeoutSampler()
 
     with pytest.raises(RuntimeError, match="timed out"):
         summary.record_gpu_window(
@@ -1691,8 +2052,9 @@ def test_gpu_recorder_query_timeout_fails_closed(tmp_path, monkeypatch):
             active_end_path=tmp_path / "end",
             max_bytes=1 << 20,
             expected_gpu_count=1,
-            query_fn=query,
+            sampler_factory=lambda **_kwargs: sampler,
         )
+    assert sampler.closed is True
 
 
 def test_strict_attestation_loader_rejects_symlink_duplicate_and_oversize(
@@ -1712,9 +2074,7 @@ def test_strict_attestation_loader_rejects_symlink_duplicate_and_oversize(
     parent_alias = tmp_path / "parent-alias"
     parent_alias.symlink_to(real_parent, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink|invalid component"):
-        matrix._read_regular_bytes(
-            parent_alias / "nested.json", max_bytes=1 << 20
-        )
+        matrix._read_regular_bytes(parent_alias / "nested.json", max_bytes=1 << 20)
     with pytest.raises(ValueError, match="duplicate JSON key"):
         matrix._strict_json(b'{"a":1,"a":2}\n', where="duplicate")
     with pytest.raises(ValueError, match="exceeds ceiling"):
@@ -1748,7 +2108,9 @@ def test_runtime_gpu_query_rejects_path_lookup(monkeypatch, matrix):
 
 def test_nccl_completion_publish_is_after_all_rank_final_barrier():
     source = (ROOT / "scripts" / "run_exact_tabicl.py").read_text()
-    final_attestation = source.index("verifier.attest_loaded_tabicl(root, expected_src)\n    if args.action")
+    final_attestation = source.index(
+        "verifier.attest_loaded_tabicl(root, expected_src)\n    if args.action"
+    )
     barrier = source.index("dist.barrier()", final_attestation)
     completion = source.index("completion = harness.make_action_completion", barrier)
     assert final_attestation < barrier < completion
@@ -1816,9 +2178,7 @@ def test_exact_publisher_requires_precreated_physical_parent(tmp_path):
     destination_alias = physical_parent / "source.json"
     destination_alias.symlink_to(outside)
     with pytest.raises(FileExistsError):
-        exact._publish_no_replace(
-            destination_alias, b"replacement\n", max_bytes=100
-        )
+        exact._publish_no_replace(destination_alias, b"replacement\n", max_bytes=100)
     assert destination_alias.is_symlink()
     assert outside.read_bytes() == b"outside\n"
 
