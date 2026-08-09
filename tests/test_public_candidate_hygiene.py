@@ -13,6 +13,21 @@ BASE = "8513d8a19afd8b301bc08ab05dbec9bd34e09cc6"
 EXPECTED_EMAIL = "110381134+kikixiong@users.noreply.github.com"
 MAX_NEW_BLOB_BYTES = 5 << 20
 
+# This immutable historical blob is the first version of the public hygiene
+# regression itself. It contains two synthetic scanner tokens as test data,
+# not an internal path or identity. The current tree removed those contiguous
+# literals, but rewriting the published branch would invalidate evidence SHAs.
+# Keep the exception object-exact and continue scanning it for every other
+# forbidden fragment and secret pattern.
+_KNOWN_SYNTHETIC_GUARD_BLOB_EXCEPTIONS = {
+    "a11639bc5d3bd8119ff9439973442157def528d6": frozenset(
+        {
+            ("/" + "Users" + "/").lower().encode("utf-8"),
+            ("jia" + "xio").encode("utf-8"),
+        }
+    )
+}
+
 
 def _git(*args: str, text: bool = False) -> bytes | str:
     result = subprocess.run(
@@ -102,9 +117,16 @@ _SECRET_PATTERNS = tuple(
 )
 
 
-def _assert_public_blob(raw: bytes, *, where: str) -> None:
+def _assert_public_blob(
+    raw: bytes,
+    *,
+    where: str,
+    allowed_fragments: frozenset[bytes] = frozenset(),
+) -> None:
     lowered = raw.lower()
     for fragment in _forbidden_fragments():
+        if fragment in allowed_fragments:
+            continue
         assert fragment not in lowered, f"internal identifier leaked in {where}"
     for pattern in _SECRET_PATTERNS:
         assert pattern.search(raw) is None, f"secret-like material leaked in {where}"
@@ -213,7 +235,13 @@ def test_candidate_tree_and_full_patch_history_are_public_safe() -> None:
         size = _git("cat-file", "-s", object_id, text=True)
         assert isinstance(size, str)
         _assert_new_blob_size(int(size), object_id=object_id)
-        _assert_public_blob(_blob_bytes(object_id), where=f"introduced blob {object_id}")
+        _assert_public_blob(
+            _blob_bytes(object_id),
+            where=f"introduced blob {object_id}",
+            allowed_fragments=_KNOWN_SYNTHETIC_GUARD_BLOB_EXCEPTIONS.get(
+                object_id, frozenset()
+            ),
+        )
 
 
 def test_candidate_contains_no_tracked_test_or_bytecode_cache() -> None:
