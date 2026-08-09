@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "protocol_id": "tabicl-step250k-whole-row-representation-v2",
+  "frozen_at": "2026-08-09T19:53:00+01:00",
+  "study_scope": "exploratory_pilot",
+  "analysis_parent_sha": "b2db3517e3dbc9d224daa1651a5ee4e56d430e14",
+  "model_source_sha": "2d44e7540ffd4ec6216aa0058970b1de1034aa1d",
+  "supersession_note": "Before any collection transaction published output, a schema audit replaced an uncommitted draft that requested a potentially unavailable fixed validation-row count and used an unnecessarily aggressive dense bottleneck.",
+  "dataset_manifest": {
+    "file": "../manifests/talent-classification-split-v1.json",
+    "sha256": "1d82bf8dd40528bb9937a20204f9b23d6c48696a5c1b245304387d3b47e1ea38",
+    "training_assignment": "discovery",
+    "training_dataset_count": 109,
+    "validation_assignment": "validation",
+    "validation_dataset_count": 8
+  },
+  "conditions": [
+    "rope",
+    "none"
+  ],
+  "reference_condition": "rope",
+  "checkpoint_step": 250000,
+  "checkpoint_sha256_by_condition": {
+    "rope": "8dd12abadc32ae57b30a2249696efb8e9081a3ea0db2cdd9807ffb150ffb15b3",
+    "none": "5251d99bc34109d5c9923d93d48c647f70d0c82bbd51557939d586c82779fac4"
+  },
+  "collection_config_sha256_by_role": {
+    "training_rope": "ff63cdf093c3e59f32412f933933ffd7e39c62df1fada164a47a990d998f6298",
+    "training_none": "811a79b95c1425b55fd5c24ed3283837f33f60ed537d6a405297e6a7d44e18e9",
+    "validation_rope": "e746829e9b4a0a3211b3b31851deb3496c9a0865c5487afa1b1464cc0da53763",
+    "validation_none": "1c25631e4a07d45efb7af6ba99e9de0954a2e2e01eeb7c2b20269e0c10c21475"
+  },
+  "activation": {
+    "site": "row_interactor",
+    "vector_axis_name": "row_representation",
+    "input_dim": 512,
+    "structure": "four flattened 128-dimensional CLS slots"
+  },
+  "sampling": {
+    "config": {},
+    "meaning": "For each split, use the same number of vectors from every dataset, equal to the smallest available dataset count; use identical sampled coordinates in both conditions.",
+    "seed": 42,
+    "resolved_row_counts": "recorded by train-repr after strict parent verification"
+  },
+  "models": {
+    "pca": {
+      "model": {
+        "type": "pca",
+        "latent_dim": 512,
+        "solver": "full_svd"
+      },
+      "training": {
+        "epochs": 1,
+        "batch_size": 2048,
+        "seed": 42,
+        "device": "cpu"
+      }
+    },
+    "dense": {
+      "model": {
+        "type": "dense",
+        "latent_dim": 384,
+        "activation": "relu"
+      },
+      "training": {
+        "epochs": 100,
+        "batch_size": 2048,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "seed": 42,
+        "device": "cuda"
+      }
+    },
+    "topk": {
+      "model": {
+        "type": "topk",
+        "expansion_factor": 8,
+        "top_k": 64
+      },
+      "training": {
+        "epochs": 100,
+        "batch_size": 2048,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "seed": 42,
+        "device": "cuda"
+      }
+    }
+  },
+  "qualification": {
+    "metric_split": "validation",
+    "minimum_pooled_explained_variance": 0.95,
+    "minimum_each_condition_explained_variance": 0.95,
+    "maximum_no_op_reconstruction_mse": 0.01,
+    "maximum_no_op_probability_delta": 0.02,
+    "maximum_no_op_absolute_accuracy_delta": 0.005
+  },
+  "decision_rule": {
+    "causal_eligibility": "all representation and no-op gates must pass",
+    "validation_tuning": "forbidden",
+    "failed_nonlinear_model": "report as failed and do not retune on the fixed validation roster",
+    "pca_only_outcome": "continue with full-rank PCA as a causal coordinate baseline",
+    "temporary_condition": "excluded until a lineage-matched same-step checkpoint exists",
+    "formal_claim": "forbidden for this legacy checkpoint pair"
+  }
+}

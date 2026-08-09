@@ -24,19 +24,24 @@ included in the first representation comparison without a reliable matched
 checkpoint.
 
 The step-250000 pair belongs to the legacy pilot lineage and is discovery-only.
-Matched step-250000 localization has now been executed from pushed analysis
-commit `4b797135b655ee181647c84fed3df946f942f248`. The result localizes the strongest
-small loss effect to RowInteraction block 1 and uses block 0 as the site
-comparison; it does not establish a mechanism or an enhancement. Strict paired
-activation collection for both sites and both arms has also completed on eight
-discovery datasets. The first independent eight-dataset fidelity collection is
-quarantined: it exposed a mixed-case site-roster ordering bug and a
-process-hash-dependent normalization-view order, so strict representation
-alignment rejects it. Re-collect that roster only after the canonical ordering
-fix and hash-seed-frozen wrapper are pushed. A released TabPFN v2.6 checkpoint
-is not currently available locally, so its real-model experiments cannot begin
-until official license/access requirements are satisfied and the checkpoint is
-content-bound.
+Matched localization first identified a small block-1 loss signal with block 0
+as the site control. Corrected discovery and fidelity collections then supported
+shared PCA, dense-autoencoder and Top-K sparse-autoencoder fits at both sites.
+Only PCA passed the frozen 95% pooled and per-condition fidelity gate. Across
+32 discovery-only live interventions, the shift-ranked PCA components were not
+consistently more damaging than matched random components, and condition
+specificity was unstable. Preserve this as a credible exploratory negative
+result; do not promote it to a held-out mechanism or enhancement claim.
+
+New whole-row execution uses pushed commit
+`b2db3517e3dbc9d224daa1651a5ee4e56d430e14`. It captures the complete
+512-dimensional `row_interactor` output after internal batching has been
+reassembled, which is the supported independently sourced donor boundary.
+Before any whole-row collection transaction published output, the exact model
+and sampling choices were frozen in
+`analysis/pe_mechanism/protocols/whole-row-representation-v2.json`. A released
+TabPFN v2.6 checkpoint is still unavailable, so real-model TabPFN experiments
+remain gated on official license/access and content verification.
 
 The analysis package is a descendant workstream. It must never be imported by
 or copied into a running exploratory training job. Every evidence run uses a
@@ -104,30 +109,27 @@ study caps private activations at 30 GiB and stops new generation below a
 
 ## Ordered continuation
 
-1. Commit and push the canonical mixed-case site-roster fix and the
-   `PYTHONHASHSEED=0` scheduled collector, then re-collect the independent
-   fidelity roster under that exact commit. Require the strict parser and every
-   cross-condition normalization view, shuffle, call index and sampled
-   coordinate to match before continuing. Never manually reorder an existing
-   index.
-2. Train shared PCA, dense-autoencoder, and top-k sparse-autoencoder
-   representations on the completed aligned Stable RoPE/No-PE block-1
-   activations, with block 0 as the matched site control. Use the corrected
-   validation-assigned activations only for the frozen reconstruction-fidelity
-   gate; do not select features or methods from them. The pilot pair must never
-   be used for validation or held-out mechanism claims.
-3. Run live method-level interventions on the TALENT discovery roster and
-   propose
-   candidate latent features. The implemented validation workflow may freeze
-   at most two candidates using candidate-level six-component tests and
-   Benjamini-Yekutieli correction only after matched formal checkpoints exist;
-   do not promote the exploratory pilot into that workflow.
-4. Reject any representation whose condition coordinates, official inference
-   contract, checkpoint lineage, or reconstruction-fidelity gate fails.
-5. With matched formal checkpoints, run model interventions on every frozen validation dataset, including
-   dose-matched controls and the independently bound paired reverse patch. Do
-   not use the word rescue unless all source-native/source-no-op and dose gates
-   pass.
+1. Complete and independently verify the two 109-dataset whole-row discovery
+   collections and the two fixed eight-dataset fidelity collections under exact
+   commit `b2db351...`. Require matching rosters, raw-call schedules,
+   normalization views, feature/class shuffles, coordinates, axes and alignment
+   hashes. Never manually reorder an index.
+2. Train exactly the three models frozen in
+   `whole-row-representation-v2.json`. Use deterministic equal-per-dataset
+   sampling. Reject a model if pooled or either-condition validation explained
+   variance is below 95%; do not tune on the eight fidelity datasets.
+3. For every qualifying model, run live no-op reconstruction first. Then split
+   discovery datasets deterministically into ranking and causal-test subsets,
+   choose target and matched random features without using the causal-test
+   outcomes, and run target deletion plus RoPE-to-No-PE and No-PE-to-RoPE
+   independently sourced patches. Keep the pilot scope discovery-only.
+4. Do not resume broad block-0/1 collection over large tables until capture
+   metadata explicitly represents repeated internal chunk invocations. The
+   completed small-roster block-level PCA negative remains valid.
+5. With matched formal checkpoints, run model interventions on every frozen
+   validation dataset, including dose-matched controls and the independently
+   bound paired reverse patch. Do not use the word rescue unless all
+   source-native/source-no-op and dose gates pass.
 6. Acquire and content-bind the released TabPFN v2.6 checkpoint, then run the
    registered `W p + b`, `W p`-only, `b`-only, and neither decomposition.
 7. Hash and externally pre-register the selected intervention, baseline,

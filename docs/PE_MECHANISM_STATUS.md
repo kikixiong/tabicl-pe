@@ -41,14 +41,13 @@ Implemented and regression tested:
   and evaluates `W p + b`, `W p`, `b`, and neither on the same fitted model,
   with exact full/native and hook-restoration gates.
 
-The first immutable mechanism execution commit is
-`4b797135b655ee181647c84fed3df946f942f248`, pushed on
-`codex/pe-mechanism-sae-v2`. Before that push, the complete v2 worktree
-regression was 1080 passed (2 skipped) for the root package and 323 passed for
-the mechanism package; Ruff also passed over the complete mechanism source and
-test trees. These are implementation checks, not scientific results. New
-TabPFN runner work in the mutable descendant tree must receive a new commit and
-repeat the relevant gates before it can provide execution provenance.
+The current immutable mechanism execution commit is
+`b2db3517e3dbc9d224daa1651a5ee4e56d430e14`, pushed on
+`codex/pe-mechanism-sae-v2`. It descends from the first execution commit
+`4b797135b655ee181647c84fed3df946f942f248` and adds whole-row
+`row_representation` support without changing the frozen training candidate.
+Its complete mechanism regression was 338 passed, with Ruff and diff checks
+also passing. These are implementation checks, not scientific results.
 
 An exploratory Stable RoPE/No-PE checkpoint pair at exactly step 250000 has
 been copied and content-verified outside the repository. Both checkpoints load
@@ -91,19 +90,32 @@ datasets, two sites, and two conditions. Every shard contains 8192 sampled
 coordinates are exactly equal, and independent verification found no
 non-finite values or public-metadata path leakage.
 
-The first attempt to collect a second, disjoint eight-dataset roster for the
-representation-reconstruction fidelity gate completed numerically, but a
-strict parent parse correctly rejected it. Mixed-case dataset names exposed an
-index-ordering mismatch, and separate Python processes exposed hash-seed-driven
-reversal of the official normalization-view order. Those outputs are not
-admissible representation parents. The mutable descendant fixes canonical
-case-insensitive site ordering, supplies a scheduled collector that freezes
-`PYTHONHASHSEED=0`, and tests both invariants. The fidelity roster must be
-re-collected from the next pushed commit and pass the actual cross-condition
-schedule/alignment gate before AE/SAE training. This roster is used only for the
-pre-registered reconstruction gate, never to choose a site, feature,
-intervention, or claimed mechanism; the legacy checkpoint study remains
-`formal_eligible=false`.
+The disjoint eight-dataset representation-fidelity roster was recollected with
+canonical ordering and a frozen hash seed, and strict cross-condition schedule
+and coordinate checks passed. Shared block-0 and block-1 representation models
+were then trained on the aligned discovery activations. Full-rank PCA passed
+the pooled and per-condition 95% validation explained-variance gate at both
+sites. Dense autoencoders reached only about 0.91--0.93, and Top-K sparse
+autoencoders about 0.77--0.80, on the disjoint fidelity roster; those nonlinear
+models are therefore ineligible for live causal claims.
+
+Thirty-two discovery-only PCA model interventions subsequently passed every
+no-op and reconstruction gate. Deleting components ranked by the RoPE/No-PE
+activation shift did not consistently hurt predictions more than deleting
+matched random components, and the RoPE-minus-No-PE specificity interaction
+was also unstable. This is a credible exploratory negative result for those
+block-level PCA directions, not held-out confirmation and not evidence that
+positional encoding is irrelevant.
+
+The next execution phase uses the complete 512-dimensional output of
+`row_interactor`, the only supported boundary for independently sourced
+RoPE-to-No-PE and No-PE-to-RoPE patches. Collection covers 109 eligible
+discovery datasets and the fixed eight-dataset fidelity roster. Before any
+collection transaction published output, the representation choices were
+frozen in
+`analysis/pe_mechanism/protocols/whole-row-representation-v2.json`: full-rank
+PCA-512, dense AE-384 and an 8x Top-K SAE with `k=64`, with deterministic
+equal-per-dataset sampling and no tuning on the fidelity roster.
 
 A real released TabPFN v2.6 checkpoint is not locally available to this
 workstream. The mutable descendant tree now contains an offline official
@@ -114,19 +126,18 @@ and a clean TabPFN v7.1.1 checkout.
 
 Still required before a mechanistic claim:
 
-- shared PCA, dense-autoencoder, and top-k sparse-autoencoder training at block
-  1 plus the block-0 site control, followed by discovery-only live model
-  interventions with matched random and reconstruction controls;
-- real independently sourced paired reverse-patch runs over the frozen
-  discovery roster for the exploratory pilot. Restoring the same latent is
+- verify every 109-dataset whole-row collection artifact and exact
+  cross-condition schedule, view, shuffle and sampled-coordinate alignment;
+- train the pre-registered whole-row representations and admit only models that
+  pass pooled and per-condition fidelity plus live no-op gates;
+- run discovery-only target deletion, matched random controls and independently
+  sourced patches in both RoPE/No-PE directions. Restoring the same latent is
   only a round-trip plumbing control;
-- a new pushed immutable descendant analysis SHA for the TabPFN runner, with
-  its regression and public-hygiene checks repeated; the immutable training SHA
-  and its 12/12 H100 gate are already established;
-- actual validation selection, an externally pre-registered freeze, and the
-  complete held-out TALENT confirmation run before any feature is called
-  replicated; these confirmation stages require matched formal checkpoints and
-  cannot consume the legacy pilot as formal evidence.
+- acquire and content-bind the licensed released TabPFN v2.6 checkpoint before
+  running its registered positional-term decomposition;
+- obtain matched formal RoPE, Temporary and No-PE checkpoints before any
+  validation selection or held-out TALENT/TabArena confirmation. The legacy
+  pair cannot be promoted into that workflow.
 
 No mechanism result, sparse feature, downstream improvement, or efficiency
 gain is claimed at this stage.  Existing pilot checkpoints remain diagnostic
