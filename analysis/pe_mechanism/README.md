@@ -119,6 +119,19 @@ The run has external prerequisites that this repository cannot satisfy:
   checkout separately. A package with the same version label is not sufficient
   provenance.
 
+Once those prerequisites are satisfied, submit the real run through
+[`scripts/slurm_tabpfn_localize.sh`](scripts/slurm_tabpfn_localize.sh). The
+wrapper fixes one normal-partition accelerator, the short QOS and a three-hour
+limit; it does not request an H100. Supply absolute `PE_ANALYSIS_ROOT`,
+`PE_TABPFN_ROOT`, `PE_CONFIG`, `PE_OUTPUT_DIR`, `PE_RUNTIME_ROOT`, and
+`PE_PYTHON` paths. The working directory, scheduler logs, private config,
+output, and runtime cache must all stay outside both verified source checkouts.
+`PE_OUTPUT_DIR` must be fresh and `PE_RUNTIME_ROOT` must already exist as a
+real directory. The wrapper forces offline model access and removes
+`TABPFN_TOKEN`, `HF_TOKEN`, and `HUGGING_FACE_HUB_TOKEN` before Python starts;
+acquisition credentials therefore cannot enter the inference environment or
+its logs.
+
 For every dataset, the official estimator is fitted once on training rows with
 one ensemble member and a fixed random state. The same fitted estimator then
 produces paired `Wp+b`, `Wp`, `b`, and zero-position probabilities; the full
