@@ -59,12 +59,17 @@ _MATCHED_CONTROL_TEMPLATE = (
     "activation-frequency and log-decoder-norm nearest-neighbour pool of size "
     "{candidate_pool_size}, sampled once with seed {random_seed} without replacement"
 )
+_MATCHED_CONTROL_DOSE = (
+    "per_call_decoded_rms_clip_to_smaller_without_amplification"
+)
+_DOSE_PROTOCOL_ID = "tabicl-step250k-whole-row-causal-dose-amendment-v1"
 _TOP_LEVEL_FIELDS = {
     "provenance",
     "representation_run_dir",
     "expected_parent_manifest_sha256",
     "activation_sources_by_condition",
     "split_protocol",
+    "dose_protocol",
     "ranking",
 }
 _RANKING_FIELDS = {
@@ -284,6 +289,23 @@ def run(args: Any) -> int:
     split_protocol = _load_split_protocol(
         split_protocol_file.read_bytes(), parameters=parameters
     )
+    dose_reference = _exact_object(
+        config["dose_protocol"],
+        label="dose_protocol",
+        fields=_SPLIT_PROTOCOL_REFERENCE_FIELDS,
+    )
+    dose_protocol_file = verify_file(
+        _absolute_file(dose_reference["path"], name="dose_protocol.path"),
+        expected_sha256=_sha256(
+            dose_reference["expected_sha256"],
+            name="dose_protocol.expected_sha256",
+        ),
+    )
+    dose_protocol = _load_dose_protocol(
+        dose_protocol_file.read_bytes(),
+        split_protocol=split_protocol,
+        split_protocol_sha256=split_protocol_file.digest.sha256,
+    )
 
     parent_dir = _absolute_directory(
         config["representation_run_dir"], name="representation_run_dir"
@@ -327,11 +349,13 @@ def run(args: Any) -> int:
 
     additional_paths: dict[str, Path] = {
         "ranking.split_protocol": split_protocol_file.path,
+        "ranking.dose_protocol": dose_protocol_file.path,
         "representation.parent_manifest": parent_manifest_file.path,
         "representation.model": model_file.path,
     }
     expected_additional = {
         "ranking.split_protocol": split_protocol_file.digest.sha256,
+        "ranking.dose_protocol": dose_protocol_file.digest.sha256,
         "representation.parent_manifest": parent_manifest_file.digest.sha256,
         "representation.model": model_file.digest.sha256,
     }
@@ -424,6 +448,8 @@ def run(args: Any) -> int:
         model_sha256=model_file.digest.sha256,
         split_protocol=split_protocol,
         split_protocol_sha256=split_protocol_file.digest.sha256,
+        dose_protocol=dose_protocol,
+        dose_protocol_sha256=dose_protocol_file.digest.sha256,
         activation_sha256=activation_sha256,
         source_lineage=source_lineage,
         observed_lineage=observed_lineage,
@@ -591,6 +617,104 @@ def _load_split_protocol(raw: bytes, *, parameters: RankingParameters) -> dict[s
         "maximum_symmetric_donor_shift_rms_ratio": donor_shift_limit,
         "checkpoint_scope": "exploratory_pilot",
         "formal_claim": "forbidden",
+    }
+
+
+def _load_dose_protocol(
+    raw: bytes,
+    *,
+    split_protocol: Mapping[str, Any],
+    split_protocol_sha256: str,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("dose protocol is not valid JSON") from error
+    payload = _exact_object(
+        payload,
+        label="dose protocol",
+        fields={
+            "schema_version",
+            "protocol_id",
+            "frozen_at",
+            "parent_split_protocol_id",
+            "parent_split_protocol_sha256",
+            "scope",
+            "formal_claim",
+            "trigger",
+            "model_outcomes_observed_before_freeze",
+            "matched_control_dose",
+            "reference_activation",
+            "matching_unit",
+            "dose_metric",
+            "adjustment",
+            "amplification_allowed",
+            "zero_or_non_finite_dose_policy",
+            "maximum_post_adjustment_symmetric_rms_ratio",
+            "interpretation",
+        },
+    )
+    expected = {
+        "schema_version": 1,
+        "protocol_id": _DOSE_PROTOCOL_ID,
+        "frozen_at": "2026-08-09T22:36:19+01:00",
+        "parent_split_protocol_id": split_protocol["protocol_id"],
+        "parent_split_protocol_sha256": split_protocol_sha256,
+        "scope": "exploratory_pilot_ranking_bound_paired_row_interactor_only",
+        "formal_claim": "forbidden",
+        "trigger": (
+            "A decoded-dose balance gate failed before any target, control, "
+            "or donor intervention prediction was published."
+        ),
+        "model_outcomes_observed_before_freeze": False,
+        "matched_control_dose": _MATCHED_CONTROL_DOSE,
+        "reference_activation": "recipient_no_op_reconstruction",
+        "matching_unit": "official_raw_model_call",
+        "dose_metric": (
+            "root_mean_square_of_decoded_activation_edit_after_cast_to_live_"
+            "activation_dtype_minus_recipient_no_op_reconstruction_after_same_cast"
+        ),
+        "adjustment": (
+            "Set the common requested dose to the smaller full-edit dose, retain "
+            "the smaller latent edit and decoded activation byte-for-byte, shrink "
+            "only the larger latent edit by their ratio, decode the changed edit "
+            "again, cast both edit and no-op reconstruction to the live activation "
+            "dtype, reject any actual per-side dose increase, and gate the actual "
+            "injected values."
+        ),
+        "amplification_allowed": False,
+        "zero_or_non_finite_dose_policy": "fail_closed",
+        "maximum_post_adjustment_symmetric_rms_ratio": 1.25,
+        "interpretation": (
+            "The executed interventions are dose-matched partial edits, not "
+            "complete deletion or complete transplantation. Target ablation and "
+            "donor patch families are matched only within their own target/control "
+            "pair and are not dose-comparable to each other."
+        ),
+    }
+    mismatches = {
+        name: (payload.get(name), value)
+        for name, value in expected.items()
+        if payload.get(name) != value
+    }
+    if mismatches:
+        raise ValueError(f"dose protocol differs from the frozen contract: {mismatches}")
+    protocol_id = require_public_label(
+        payload.get("protocol_id"), name="dose protocol_id"
+    )
+    for name in (
+        "frozen_at",
+        "trigger",
+        "dose_metric",
+        "adjustment",
+        "interpretation",
+    ):
+        if not isinstance(payload[name], str) or not payload[name]:
+            raise TypeError(f"dose protocol {name} must be non-empty")
+    return {
+        "schema_version": 1,
+        "protocol_id": protocol_id,
+        **{name: value for name, value in expected.items() if name != "schema_version"},
     }
 
 
@@ -779,6 +903,8 @@ def _selection_payload(
     model_sha256: str,
     split_protocol: Mapping[str, Any],
     split_protocol_sha256: str,
+    dose_protocol: Mapping[str, Any],
+    dose_protocol_sha256: str,
     activation_sha256: Mapping[str, Mapping[str, str]],
     source_lineage: Mapping[str, Any],
     observed_lineage: Mapping[str, Any],
@@ -816,6 +942,9 @@ def _selection_payload(
         "maximum_symmetric_donor_shift_rms_ratio": split_protocol[
             "maximum_symmetric_donor_shift_rms_ratio"
         ],
+        "matched_control_dose": dose_protocol["matched_control_dose"],
+        "dose_protocol_id": dose_protocol["protocol_id"],
+        "dose_protocol_sha256": dose_protocol_sha256,
         "score_definition": _SCORE_ID,
         "decoder_norm_space": "raw_activation_after_denormalize",
         "raw_activation_rms_definition": (

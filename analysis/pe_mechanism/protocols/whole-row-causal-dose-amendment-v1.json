@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "protocol_id": "tabicl-step250k-whole-row-causal-dose-amendment-v1",
+  "frozen_at": "2026-08-09T22:36:19+01:00",
+  "parent_split_protocol_id": "tabicl-step250k-whole-row-causal-split-v1",
+  "parent_split_protocol_sha256": "e12a8cc5ee79ab318b6c57c4f67e384853cb107bdd5e9f49253666c7ec3418ef",
+  "scope": "exploratory_pilot_ranking_bound_paired_row_interactor_only",
+  "formal_claim": "forbidden",
+  "trigger": "A decoded-dose balance gate failed before any target, control, or donor intervention prediction was published.",
+  "model_outcomes_observed_before_freeze": false,
+  "matched_control_dose": "per_call_decoded_rms_clip_to_smaller_without_amplification",
+  "reference_activation": "recipient_no_op_reconstruction",
+  "matching_unit": "official_raw_model_call",
+  "dose_metric": "root_mean_square_of_decoded_activation_edit_after_cast_to_live_activation_dtype_minus_recipient_no_op_reconstruction_after_same_cast",
+  "adjustment": "Set the common requested dose to the smaller full-edit dose, retain the smaller latent edit and decoded activation byte-for-byte, shrink only the larger latent edit by their ratio, decode the changed edit again, cast both edit and no-op reconstruction to the live activation dtype, reject any actual per-side dose increase, and gate the actual injected values.",
+  "amplification_allowed": false,
+  "zero_or_non_finite_dose_policy": "fail_closed",
+  "maximum_post_adjustment_symmetric_rms_ratio": 1.25,
+  "interpretation": "The executed interventions are dose-matched partial edits, not complete deletion or complete transplantation. Target ablation and donor patch families are matched only within their own target/control pair and are not dose-comparable to each other."
+}

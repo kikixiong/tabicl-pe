@@ -16,6 +16,7 @@ import torch
 from torch import nn
 
 import pe_mechanism.official_causal as official_causal
+from pe_mechanism.adapters.base import ActivationRecord
 from pe_mechanism.adapters.tabicl import TabICLAdapter
 from pe_mechanism.causal import (
     model_decoder_feature_norms,
@@ -64,6 +65,25 @@ class ExactOvercompleteAutoencoder(nn.Module):
             self.encoder.weight.copy_(torch.tensor([[1.0], [1.0], [-0.25]]))
             sign = -1.0 if negate_decode else 1.0
             self.decoder.weight.copy_(torch.tensor([[0.5 * sign, 0.5 * sign, 0.0]]))
+
+    def encode(self, values):
+        return self.encoder(values)
+
+    def decode(self, latents):
+        return self.decoder(latents)
+
+
+class ImbalancedExactAutoencoder(nn.Module):
+    input_dim = 1
+    latent_dim = 3
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = nn.Linear(1, 3, bias=False)
+        self.decoder = nn.Linear(3, 1, bias=False)
+        with torch.no_grad():
+            self.encoder.weight.copy_(torch.tensor([[8.0], [1.0], [0.0]]))
+            self.decoder.weight.copy_(torch.tensor([[1.0 / 9.0, 1.0 / 9.0, 0.0]]))
 
     def encode(self, values):
         return self.encoder(values)
@@ -476,6 +496,240 @@ def test_paired_reverse_patch_requires_frozen_shift_matched_controls(
         )
     assert torch.equal(target_generator.get_state(), target_entry)
     assert torch.equal(source_generator.get_state(), source_entry)
+
+
+def test_paired_reverse_patch_can_use_shrink_only_decoded_dose_matching(
+    causal_inputs,
+) -> None:
+    X, y = causal_inputs
+    target_classifier = FakeOfficialClassifier(temporary=True)
+    source_classifier = FakeOfficialClassifier(temporary=False)
+    target = _paired_driver(target_classifier, checkpoint_sha="b" * 64)
+    source = _paired_driver(source_classifier, checkpoint_sha="c" * 64)
+    target_generator = target_classifier.model_.row_interactor._identity_generator
+    source_generator = source_classifier.model_.row_interactor._identity_generator
+    target_entry = target_generator.get_state().clone()
+    source_entry = source_generator.get_state().clone()
+    target_classifier.predict_proba(X.copy())
+    target_final = target_generator.get_state().clone()
+    source_classifier.predict_proba(X.copy())
+    source_final = source_generator.get_state().clone()
+    target_generator.set_state(target_entry)
+    source_generator.set_state(source_entry)
+
+    evaluation = run_official_tabicl_causal_edits(
+        target,
+        X,
+        y,
+        site="row_interactor",
+        autoencoder=ImbalancedExactAutoencoder(),
+        normalizer=MeanRMSNormalizer(torch.zeros(1), torch.ones(1)),
+        target_features=(0,),
+        control_features=(1,),
+        dataset_id="toy-official",
+        sample_ids=("row-0", "row-1"),
+        representation_qualification=_paired_qualification(),
+        target_condition="temporary",
+        paired_source=PairedReversePatchSource(source, "none"),
+        maximum_symmetric_donor_shift_rms_ratio=1.25,
+        matched_control_dose=(
+            "per_call_decoded_rms_clip_to_smaller_without_amplification"
+        ),
+    )
+
+    assert evaluation.matched_control_dose == (
+        "per_call_decoded_rms_clip_to_smaller_without_amplification"
+    )
+    for balance in (
+        evaluation.paired_ablation_displacement_balance,
+        evaluation.paired_donor_displacement_balance,
+    ):
+        assert balance is not None
+        assert balance["passed"] is True
+        assert balance["symmetric_rms_ratio"] == pytest.approx(1.0, abs=1e-5)
+        matching = balance["dose_matching"]
+        assert matching["amplification_allowed"] is False
+        assert matching["full_edit"]["symmetric_rms_ratio"] == pytest.approx(
+            8.0, rel=1e-5
+        )
+        assert matching["dose_matched_partial_edit"][
+            "symmetric_rms_ratio"
+        ] == pytest.approx(1.0, abs=1e-5)
+        for call in matching["by_call"]:
+            assert call["target_scale"] == pytest.approx(0.125, rel=1e-5)
+            assert call["control_scale"] == 1.0
+            assert call["scaled_symmetric_rms_ratio"] == pytest.approx(
+                1.0, abs=1e-5
+            )
+    assert evaluation.paired_donor_shift_balance is not None
+    assert evaluation.paired_donor_shift_balance["symmetric_rms_ratio"] == (
+        pytest.approx(1.0, abs=1e-5)
+    )
+    assert np.array_equal(
+        evaluation.conditions["roundtrip_restore_control"].prediction.probabilities,
+        evaluation.conditions["no_op_reconstruction"].prediction.probabilities,
+    )
+    assert torch.equal(target_generator.get_state(), target_final)
+    assert torch.equal(source_generator.get_state(), source_final)
+
+
+def test_decoded_dose_matching_rejects_zero_control_dose_and_rolls_back(
+    causal_inputs,
+) -> None:
+    X, y = causal_inputs
+    target_classifier = FakeOfficialClassifier(temporary=True)
+    source_classifier = FakeOfficialClassifier(temporary=False)
+    target_generator = target_classifier.model_.row_interactor._identity_generator
+    source_generator = source_classifier.model_.row_interactor._identity_generator
+    target_entry = target_generator.get_state().clone()
+    source_entry = source_generator.get_state().clone()
+
+    with pytest.raises(RuntimeError, match="finite positive"):
+        run_official_tabicl_causal_edits(
+            _paired_driver(target_classifier, checkpoint_sha="b" * 64),
+            X,
+            y,
+            site="row_interactor",
+            autoencoder=ExactOvercompleteAutoencoder(),
+            normalizer=MeanRMSNormalizer(torch.zeros(1), torch.ones(1)),
+            target_features=(0,),
+            control_features=(2,),
+            dataset_id="toy-official",
+            sample_ids=("row-0", "row-1"),
+            representation_qualification=_paired_qualification(),
+            target_condition="temporary",
+            paired_source=PairedReversePatchSource(
+                _paired_driver(source_classifier, checkpoint_sha="c" * 64),
+                "none",
+            ),
+            maximum_symmetric_donor_shift_rms_ratio=1.25,
+            matched_control_dose=(
+                "per_call_decoded_rms_clip_to_smaller_without_amplification"
+            ),
+        )
+
+    assert torch.equal(target_generator.get_state(), target_entry)
+    assert torch.equal(source_generator.get_state(), source_entry)
+
+
+def test_dose_matching_preserves_the_smaller_full_edit_exactly() -> None:
+    record = ActivationRecord(
+        tensor=torch.tensor([[0.1234567], [-0.9876543]], dtype=torch.float32),
+        site="row_interactor",
+        axis_names=("row", "row_representation"),
+        shape=(2, 1),
+        model_sha="a" * 40,
+        checkpoint_sha="b" * 64,
+        preprocessing_view_id="toy-view",
+    )
+    autoencoder = ImbalancedExactAutoencoder()
+    normalizer = MeanRMSNormalizer(torch.zeros(1), torch.ones(1))
+    call = official_causal._encode_call(
+        SimpleNamespace(
+            activations={"row_interactor": record},
+            metadata=SimpleNamespace(call_index=7),
+        ),
+        site="row_interactor",
+        autoencoder=autoencoder,
+        normalizer=normalizer,
+    )
+    target_latent = call.latents.clone()
+    target_latent[:, 0] = 0.0
+    control_latent = call.latents.clone()
+    control_latent[:, 1] = 0.0
+    target_replacement = official_causal._decode_calls(
+        (call,),
+        (target_latent,),
+        autoencoder=autoencoder,
+        normalizer=normalizer,
+    )
+    control_replacement = official_causal._decode_calls(
+        (call,),
+        (control_latent,),
+        autoencoder=autoencoder,
+        normalizer=normalizer,
+    )
+
+    (
+        scaled_target_latents,
+        scaled_control_latents,
+        _scaled_target_replacements,
+        scaled_control_replacements,
+        matching,
+    ) = official_causal._match_decoded_edit_doses_by_call(
+        (call,),
+        (target_latent,),
+        (control_latent,),
+        target_replacement,
+        control_replacement,
+        autoencoder=autoencoder,
+        normalizer=normalizer,
+    )
+
+    assert not torch.equal(scaled_target_latents[0], target_latent)
+    assert torch.equal(scaled_control_latents[0], control_latent)
+    assert torch.equal(scaled_control_replacements[0], control_replacement[0])
+    by_call = matching["by_call"][0]
+    assert by_call["target_full_edit_preserved"] is False
+    assert by_call["control_full_edit_preserved"] is True
+    assert by_call["actual_no_amplification_verified"] is True
+    assert matching["actual_no_amplification_verified"] is True
+    assert by_call["scaled_target_displacement_rms"] <= (
+        by_call["original_target_displacement_rms"]
+    )
+    assert by_call["scaled_control_displacement_rms"] == (
+        by_call["original_control_displacement_rms"]
+    )
+
+
+def test_dose_matching_gates_live_activation_precision() -> None:
+    record = ActivationRecord(
+        tensor=torch.zeros((1, 1), dtype=torch.float16),
+        site="row_interactor",
+        axis_names=("row", "row_representation"),
+        shape=(1, 1),
+        model_sha="a" * 40,
+        checkpoint_sha="b" * 64,
+        preprocessing_view_id="toy-view",
+    )
+    call = official_causal._encode_call(
+        SimpleNamespace(activations={"row_interactor": record}),
+        site="row_interactor",
+        autoencoder=ExactOvercompleteAutoencoder(),
+        normalizer=MeanRMSNormalizer(torch.zeros(1), torch.ones(1)),
+    )
+    assert call.reconstruction.dtype == torch.float16
+    target_latent = call.latents.clone()
+    target_latent[:, 0] = 1e-8
+    control_latent = call.latents.clone()
+    control_latent[:, 1] = 1.0
+    autoencoder = ExactOvercompleteAutoencoder()
+    normalizer = MeanRMSNormalizer(torch.zeros(1), torch.ones(1))
+    target_replacement = official_causal._decode_calls(
+        (call,),
+        (target_latent,),
+        autoencoder=autoencoder,
+        normalizer=normalizer,
+    )
+    control_replacement = official_causal._decode_calls(
+        (call,),
+        (control_latent,),
+        autoencoder=autoencoder,
+        normalizer=normalizer,
+    )
+    assert target_replacement[0].dtype == torch.float16
+    assert float(target_replacement[0].detach().abs().max()) == 0.0
+
+    with pytest.raises(RuntimeError, match="finite positive"):
+        official_causal._match_decoded_edit_doses_by_call(
+            (call,),
+            (target_latent,),
+            (control_latent,),
+            target_replacement,
+            control_replacement,
+            autoencoder=autoencoder,
+            normalizer=normalizer,
+        )
 
 
 def test_qualification_fails_before_any_model_or_rng_change(causal_inputs):
@@ -1262,6 +1516,14 @@ def _install_workflow_fakes(
             classifier = FakeOfficialClassifier(temporary=False)
             classifier.model_.row_identity_mode = "rope"
             classifier.model_.row_interactor.identity_mode = "rope"
+            row_interactor = classifier.model_.row_interactor
+
+            def rope_forward(self, embeddings, **_kwargs):
+                return embeddings.mean(dim=2) + 0.125
+
+            row_interactor.forward = types.MethodType(
+                rope_forward, row_interactor
+            )
         return OfficialTabICLDriver(
             classifier,
             adapter=TabICLAdapter(),
@@ -1522,6 +1784,60 @@ def _enable_exploratory_ranking_paired(
         encoding="utf-8",
     )
     split_digest = verify_file(split_protocol).digest
+    dose_protocol = tmp_path / "whole-row-causal-dose-amendment.json"
+    dose_protocol.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "protocol_id": (
+                    "tabicl-step250k-whole-row-causal-dose-amendment-v1"
+                ),
+                "frozen_at": "2026-08-09T22:36:19+01:00",
+                "parent_split_protocol_id": "toy-whole-row-split",
+                "parent_split_protocol_sha256": split_digest.sha256,
+                "scope": (
+                    "exploratory_pilot_ranking_bound_paired_"
+                    "row_interactor_only"
+                ),
+                "formal_claim": "forbidden",
+                "trigger": (
+                    "A decoded-dose balance gate failed before any target, control, "
+                    "or donor intervention prediction was published."
+                ),
+                "model_outcomes_observed_before_freeze": False,
+                "matched_control_dose": (
+                    "per_call_decoded_rms_clip_to_smaller_without_amplification"
+                ),
+                "reference_activation": "recipient_no_op_reconstruction",
+                "matching_unit": "official_raw_model_call",
+                "dose_metric": (
+                    "root_mean_square_of_decoded_activation_edit_after_cast_to_live_"
+                    "activation_dtype_minus_recipient_no_op_reconstruction_"
+                    "after_same_cast"
+                ),
+                "adjustment": (
+                    "Set the common requested dose to the smaller full-edit dose, "
+                    "retain the smaller latent edit and decoded activation byte-for-"
+                    "byte, shrink only the larger latent edit by their ratio, decode "
+                    "the changed edit again, cast both edit and no-op reconstruction "
+                    "to the live activation dtype, reject any actual per-side dose "
+                    "increase, and gate the actual injected values."
+                ),
+                "amplification_allowed": False,
+                "zero_or_non_finite_dose_policy": "fail_closed",
+                "maximum_post_adjustment_symmetric_rms_ratio": 1.25,
+                "interpretation": (
+                    "The executed interventions are dose-matched partial edits, not "
+                    "complete deletion or complete transplantation. Target ablation "
+                    "and donor patch families are matched only within their own "
+                    "target/control pair and are not dose-comparable to each other."
+                ),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    dose_digest = verify_file(dose_protocol).digest
     parent = verify_run_directory(fixture.parent_dir)
     parent_manifest_digest = verify_file(
         fixture.parent_dir / "manifest.json"
@@ -1574,6 +1890,13 @@ def _enable_exploratory_ranking_paired(
         "conditions": ["rope", "none"],
         "directions": ["rope_to_none", "none_to_rope"],
         "maximum_symmetric_donor_shift_rms_ratio": 1.25,
+        "matched_control_dose": (
+            "per_call_decoded_rms_clip_to_smaller_without_amplification"
+        ),
+        "dose_protocol_id": (
+            "tabicl-step250k-whole-row-causal-dose-amendment-v1"
+        ),
+        "dose_protocol_sha256": dose_digest.sha256,
         "score_definition": (
             "median_dataset_rms_latent_rope_minus_none_times_decoder_norm_"
             "divided_by_pooled_raw_activation_rms"
@@ -1650,6 +1973,11 @@ def _enable_exploratory_ranking_paired(
             "ranking.split_protocol",
             split_digest.sha256,
             split_digest.size_bytes,
+        ),
+        InputDigest(
+            "ranking.dose_protocol",
+            dose_digest.sha256,
+            dose_digest.size_bytes,
         ),
         InputDigest(
             "representation.parent_manifest",
@@ -1763,6 +2091,9 @@ def _enable_exploratory_ranking_paired(
             "control_features": [1],
             "latent_baseline": 0.0,
             "freeze_artifact_path": None,
+            "matched_control_dose": (
+                "per_call_decoded_rms_clip_to_smaller_without_amplification"
+            ),
         }
     )
     config["paired_reverse_patch"] = {
@@ -1783,6 +2114,8 @@ def _enable_exploratory_ranking_paired(
         "expected_selection_sha256": selection_digest.sha256,
         "split_protocol_path": str(split_protocol),
         "expected_split_protocol_sha256": split_digest.sha256,
+        "dose_protocol_path": str(dose_protocol),
+        "expected_dose_protocol_sha256": dose_digest.sha256,
         "directions": ["rope_to_none", "none_to_rope"],
     }
     fixture.config.write_text(
@@ -1792,6 +2125,7 @@ def _enable_exploratory_ranking_paired(
         ranking_dir=ranking_dir,
         selection_path=selection_path,
         split_protocol=split_protocol,
+        dose_protocol=dose_protocol,
         roster=roster,
         attestation=attestation,
     )
@@ -1801,8 +2135,15 @@ def _reseal_ranking_selection_and_split(
     fixture: SimpleNamespace, ranking: SimpleNamespace
 ) -> None:
     split_digest = verify_file(ranking.split_protocol).digest
+    dose_protocol = json.loads(ranking.dose_protocol.read_text(encoding="utf-8"))
+    dose_protocol["parent_split_protocol_sha256"] = split_digest.sha256
+    ranking.dose_protocol.write_text(
+        json.dumps(dose_protocol, sort_keys=True), encoding="utf-8"
+    )
+    dose_digest = verify_file(ranking.dose_protocol).digest
     selection = json.loads(ranking.selection_path.read_text(encoding="utf-8"))
     selection["split_protocol_sha256"] = split_digest.sha256
+    selection["dose_protocol_sha256"] = dose_digest.sha256
     selection["ranking_protocol_sha256"] = official_causal._canonical_sha256(
         selection["ranking_protocol"]
     )
@@ -1831,6 +2172,14 @@ def _reseal_ranking_selection_and_split(
     split_input.update(
         {"sha256": split_digest.sha256, "size_bytes": split_digest.size_bytes}
     )
+    dose_input = next(
+        item
+        for item in manifest["inputs"]
+        if item["role"] == "ranking.dose_protocol"
+    )
+    dose_input.update(
+        {"sha256": dose_digest.sha256, "size_bytes": dose_digest.size_bytes}
+    )
     manifest_path.write_text(
         json.dumps(manifest, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
@@ -1842,6 +2191,7 @@ def _reseal_ranking_selection_and_split(
             "expected_manifest_sha256": verify_file(manifest_path).digest.sha256,
             "expected_selection_sha256": selection_digest.sha256,
             "expected_split_protocol_sha256": split_digest.sha256,
+            "expected_dose_protocol_sha256": dose_digest.sha256,
         }
     )
     fixture.config.write_text(
@@ -2453,6 +2803,14 @@ def test_model_causal_workflow_runs_independent_paired_reverse_patch(
         "donor_patch_gap_closure_denominator",
         "donor_patch_gap_closure_fraction",
     }
+    assert "matched_control_dose" not in paired
+    assert "ranking_dose_protocol_sha256" not in summary["input_bindings"]
+    assert summary["intervention"] == {
+        "target_features": [0],
+        "control_features": [1],
+        "latent_baseline": 0.0,
+        "random_seed": 42,
+    }
     assert paired["source_native"] is not None
     assert paired["source_no_op_gates"]["passed"] is True
     assert paired["donor_shift_balance"]["passed"] is True
@@ -2483,24 +2841,69 @@ def test_exploratory_paired_workflow_binds_completed_ranking_parent(
     assert roles["ranking.split_protocol"] == verify_file(
         ranking.split_protocol
     ).digest.sha256
+    assert roles["ranking.dose_protocol"] == verify_file(
+        ranking.dose_protocol
+    ).digest.sha256
     summary = json.loads(
         (fixture.output / "summary.json").read_text(encoding="utf-8")
+    )
+    predictions = json.loads(
+        (fixture.output / "predictions.json").read_text(encoding="utf-8")
     )
     assert summary["ranking_parent"] == {
         "manifest_sha256": roles["ranking.parent_manifest"],
         "selection_sha256": roles["ranking.selection"],
         "split_protocol_sha256": roles["ranking.split_protocol"],
         "split_protocol_id": "toy-whole-row-split",
+        "dose_protocol_sha256": verify_file(ranking.dose_protocol).digest.sha256,
+        "dose_protocol_id": (
+            "tabicl-step250k-whole-row-causal-dose-amendment-v1"
+        ),
         "target_features": [0],
         "control_features": [1],
         "directions": ["rope_to_none", "none_to_rope"],
         "effective_direction": "rope_to_none",
+        "matched_control_dose": (
+            "per_call_decoded_rms_clip_to_smaller_without_amplification"
+        ),
         "evidence_scope": "exploratory-pilot",
         "formal_claim": "forbidden",
     }
     assert summary["paired_reverse_patch"]["status"] == (
         "measured_exploratory_diagnostic_only"
     )
+    dose_mode = "per_call_decoded_rms_clip_to_smaller_without_amplification"
+    assert summary["intervention"] == {
+        "target_features": [0],
+        "control_features": [1],
+        "latent_baseline": 0.0,
+        "random_seed": 42,
+        "matched_control_dose": dose_mode,
+        "edit_semantics": "per_call_dose_matched_partial_edit",
+    }
+    paired = summary["paired_reverse_patch"]
+    assert paired["matched_control_dose"] == dose_mode
+    assert summary["input_bindings"]["ranking_dose_protocol_sha256"] == (
+        verify_file(ranking.dose_protocol).digest.sha256
+    )
+    assert set(paired["measured_effects"]) == {
+        "mean_log_loss_improvement_vs_recipient_no_op",
+        "mean_log_loss_improvement_vs_paired_matched_random_patch",
+        "mean_log_loss_improvement_of_source_native_vs_recipient_native",
+        "mean_log_loss_improvement_of_source_no_op_vs_recipient_no_op",
+        "donor_patch_gap_closure_denominator",
+        "donor_patch_gap_closure_fraction",
+        "target_ablation_and_donor_patch_dose_comparable",
+    }
+    assert paired["measured_effects"][
+        "target_ablation_and_donor_patch_dose_comparable"
+    ] is False
+    assert set(predictions["paired_reverse_patch_measured_effects"]) == {
+        "log_loss_improvement_vs_recipient_no_op",
+        "log_loss_improvement_vs_paired_matched_random_patch",
+        "log_loss_improvement_of_source_native_vs_recipient_native",
+        "log_loss_improvement_of_source_no_op_vs_recipient_no_op",
+    }
     assert summary["checkpoint_study"]["formal_trust_verified"] is False
 
 
@@ -2514,6 +2917,52 @@ def test_exploratory_paired_workflow_requires_ranking_parent(
     fixture.config.write_text(json.dumps(config), encoding="utf-8")
 
     with pytest.raises(ValueError, match="requires a strict ranking_parent"):
+        official_causal.run(
+            SimpleNamespace(config=fixture.config, output_dir=fixture.output)
+        )
+    assert not fixture.output.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dose_metric", "a different but non-empty metric"),
+        ("protocol_id", "renamed-dose-amendment"),
+    ],
+)
+def test_exploratory_ranking_rejects_resealed_dose_contract_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    ranking = _enable_exploratory_ranking_paired(fixture, tmp_path)
+    _install_workflow_fakes(fixture, monkeypatch, driver_temporary=False)
+    dose = json.loads(ranking.dose_protocol.read_text(encoding="utf-8"))
+    dose[field] = value
+    ranking.dose_protocol.write_text(
+        json.dumps(dose, sort_keys=True), encoding="utf-8"
+    )
+    _reseal_ranking_selection_and_split(fixture, ranking)
+
+    with pytest.raises(ValueError, match="frozen contract"):
+        official_causal.run(
+            SimpleNamespace(config=fixture.config, output_dir=fixture.output)
+        )
+    assert not fixture.output.exists()
+
+
+def test_exploratory_ranking_requires_frozen_dose_mode(
+    tmp_path: Path
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    _enable_exploratory_ranking_paired(fixture, tmp_path)
+    config = json.loads(fixture.config.read_text(encoding="utf-8"))
+    config["intervention"].pop("matched_control_dose")
+    fixture.config.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="requires frozen per-call dose matching"):
         official_causal.run(
             SimpleNamespace(config=fixture.config, output_dir=fixture.output)
         )

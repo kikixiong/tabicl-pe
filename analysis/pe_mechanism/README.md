@@ -189,6 +189,13 @@ or outcomes and publishes only a path-free
 legacy checkpoint workflow remains discovery-only and cannot establish a
 formal mechanism or downstream improvement.
 
+Ranking-bound paired whole-row runs additionally bind
+`protocols/whole-row-causal-dose-amendment-v1.json` by exact digest. That
+amendment was frozen after the original decoded-dose gate stopped the first
+causal attempt, but before any target, control, or donor prediction was
+published. It does not change the split or reselect features from model
+outcomes; it makes the intervention comparison fair at execution time.
+
 ## Official model-causal runs
 
 `model-causal` consumes one completed, strict `train-repr` run and one raw
@@ -210,6 +217,19 @@ Formal paired interventions are restricted to `row_interactor`. At this site,
 PCA/autoencoder/sparse-autoencoder representation of the flattened CLS-slot
 output of RowInteraction. They are not raw table columns, row positions,
 attention heads, positional-encoding indices, or individual model neurons.
+
+For a ranking-bound exploratory paired run, target and matched-control edits
+use per-call decoded-RMS dose matching. Ablation and independently sourced
+donor patches are matched separately against the recipient no-op
+reconstruction. The smaller full-edit dose becomes the common dose and only
+the larger latent edit is shrunk; the smaller edit is reused byte-for-byte.
+The changed latent is decoded again, and the implementation rejects any
+post-cast per-side dose increase before the existing maximum symmetric-ratio
+gate checks the exact activations that will be injected. A zero or non-finite
+dose fails closed. These are therefore
+dose-matched partial edits, not complete deletions or transplants, and effects
+from the ablation and donor families must not be compared as though their doses
+were equal to each other.
 
 Dataset identity is explicitly labelled `discovery`, `validation`, or
 `held_out` and checked against the committed roster. Discovery and validation

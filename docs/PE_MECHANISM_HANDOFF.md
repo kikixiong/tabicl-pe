@@ -50,7 +50,25 @@ with validation explained variance 1.0 and dense AE-384 passed with 0.9773
 pooled, 0.9740 No-PE and 0.9727 RoPE.  The Top-K SAE failed decisively at
 0.6034 pooled validation explained variance despite 0.9906 training fidelity;
 do not tune it on the fixed fidelity roster or carry it into causal edits.
-Neither qualifying representation has yet passed its live model no-op gate.
+PCA passed the recipient and source live no-op gates on the first causal table
+before the unequal-dose gate stopped the run, but those gates remain mandatory
+per table. Dense AE has not undergone a live model-causal run.
+
+The frozen 73-table whole-row PCA ranking selected targets `[0, 7, 5, 3]`
+and matched controls `[181, 502, 153, 310]`. Its first live causal attempt
+published no intervention prediction: the first table's decoded ablation dose
+ratio was `7.81832`, above the frozen `1.25` gate, so the transaction failed
+closed with no output directory. Do not treat that failed attempt as a model
+effect or reuse the unequal full edits.
+
+`whole-row-causal-dose-amendment-v1.json` freezes the outcome-free repair. It
+binds the original split and ranking, matches target/control decoded RMS for
+each raw call by preserving the smaller full edit byte-for-byte and shrinking
+only the larger latent edit, applies the rule separately to ablation and donor
+patches, and rejects any actual per-side dose increase before prediction. Zero
+or non-finite doses fail closed. Report
+the resulting operations as partial edits and never compare ablation and donor
+effect magnitudes as though those two families share one common dose.
 
 The analysis package is a descendant workstream. It must never be imported by
 or copied into a running exploratory training job. Every evidence run uses a
@@ -118,29 +136,35 @@ study caps private activations at 30 GiB and stops new generation below a
 
 ## Ordered continuation
 
-1. Preserve the verified whole-row artifacts and the representation decision:
-   PCA and dense AE qualify for live no-op testing; Top-K SAE is rejected.
-2. For every qualifying model, run live no-op reconstruction first. Then split
-   discovery datasets exactly as frozen in
-   `whole-row-causal-split-v1.json`: 73 for feature ranking and 36 only for
-   causal testing. Choose target and matched random features without using the
-   causal-test outcomes, then run target deletion plus RoPE-to-No-PE and
-   No-PE-to-RoPE independently sourced patches on the pre-hashed sample
-   rosters. Keep the pilot scope discovery-only.
-3. Treat the 36-table result as exploratory because the unsupervised
+1. Preserve the verified whole-row artifacts and representation decision:
+   PCA and dense AE qualify; Top-K SAE is rejected. Do not recollect
+   activations or retrain these dictionaries.
+2. Commit and push the dose-amendment implementation, then regenerate the
+   existing 73-table ranking from a clean detached checkout so its manifest
+   binds the amendment digest. Confirm that the target and control coordinates
+   remain exactly `[0, 7, 5, 3]` and `[181, 502, 153, 310]`.
+3. Run one minimal RoPE-source to No-PE-recipient whole-row PCA campaign on the
+   fixed eight-table causal subset using a non-H100 accelerator. Verify no-op,
+   round-trip, per-call decoded-dose, donor-shift, lineage, and atomic-output
+   gates before aggregating target versus matched-control effects.
+4. If that campaign is null, stop the whole-row PCA branch with a credible
+   exploratory negative result. Run the reverse direction and dense AE only
+   if the PCA result is positive or otherwise scientifically decision-relevant;
+   never expand merely to search for a favorable result.
+5. Treat the 36-table result as exploratory because the unsupervised
    representation dictionary was trained across all 109 discovery datasets;
    it is outcome-disjoint, not representation-level untouched.
-4. Do not resume broad block-0/1 collection over large tables until capture
+6. Do not resume broad block-0/1 collection over large tables until capture
    metadata explicitly represents repeated internal chunk invocations. The
    completed small-roster block-level PCA negative remains valid.
-5. With matched formal checkpoints, run model interventions on every frozen
+7. With matched formal checkpoints, run model interventions on every frozen
    validation dataset, including dose-matched controls and the independently
    bound paired reverse patch. Do not use the word rescue unless all
    source-native/source-no-op and dose gates pass.
-6. Acquire and content-bind the released TabPFN v2.6 checkpoint, then run the
+8. Acquire and content-bind the released TabPFN v2.6 checkpoint, then run the
    registered `W p + b`, `W p`-only, `b`-only, and neither decomposition.
-7. Hash and externally pre-register the selected intervention, baseline,
+9. Hash and externally pre-register the selected intervention, baseline,
    controls, validation fingerprints, and held-out sample rosters. Then run the
    complete candidate-by-held-out-dataset Cartesian set and apply the frozen
    six-component intersection-union plus Holm confirmation rule.
-8. Publish only sanitized code, protocol, aggregate statistics, and provenance.
+10. Publish only sanitized code, protocol, aggregate statistics, and provenance.

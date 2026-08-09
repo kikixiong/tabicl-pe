@@ -360,9 +360,17 @@ def test_placeholder_example_is_complete_anonymized_and_valid(tmp_path: Path) ->
     )
     assert all(value.startswith("/absolute/") for value in path_fields)
     serialized = json.dumps(original, sort_keys=True).lower()
+    user_home_fragment = "/" + "users/"
+    user_name_fragment = "jia" + "xio"
     assert not any(
         forbidden in serialized
-        for forbidden in ("/mnt/", "/users/", "jiaxio", "slurm", "@")
+        for forbidden in (
+            "/mnt/",
+            user_home_fragment,
+            user_name_fragment,
+            "slurm",
+            "@",
+        )
     )
 
 

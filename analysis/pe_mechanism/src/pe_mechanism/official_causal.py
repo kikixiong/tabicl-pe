@@ -131,6 +131,7 @@ class OfficialCausalEvaluation:
     paired_donor_shift_balance: Mapping[str, Any] | None
     paired_ablation_displacement_balance: Mapping[str, Any] | None
     paired_donor_displacement_balance: Mapping[str, Any] | None
+    matched_control_dose: str | None
 
 
 @dataclass(frozen=True)
@@ -228,6 +229,7 @@ def run_official_tabicl_causal_edits(
     target_condition: str | None = None,
     paired_source: PairedReversePatchSource | None = None,
     maximum_symmetric_donor_shift_rms_ratio: float | None = None,
+    matched_control_dose: str | None = None,
 ) -> OfficialCausalEvaluation:
     """Run no-op, target, matched-random, round-trip, and paired edits.
 
@@ -298,10 +300,14 @@ def run_official_tabicl_causal_edits(
         maximum_symmetric_donor_shift_rms_ratio = float(
             maximum_symmetric_donor_shift_rms_ratio
         )
+        if matched_control_dose not in {None, _MATCHED_CONTROL_DOSE}:
+            raise ValueError("matched_control_dose is unsupported")
     elif maximum_symmetric_donor_shift_rms_ratio is not None:
         raise ValueError(
             "maximum donor-shift RMS ratio requires a paired source"
         )
+    elif matched_control_dose is not None:
+        raise ValueError("matched_control_dose requires a paired source")
     if (
         isinstance(random_candidate_pool_size, bool)
         or not isinstance(random_candidate_pool_size, int)
@@ -576,26 +582,6 @@ def run_official_tabicl_causal_edits(
                     autoencoder=autoencoder,
                     normalizer=normalizer,
                 )
-                _, target_prediction = _run_condition(
-                    session,
-                    X,
-                    y,
-                    site=site,
-                    entry_state=entry_state,
-                    expected_final_state=final_state,
-                    native_result=native_result,
-                    replacements=target_replacements,
-                    targets=targets,
-                )
-                conditions["target_baseline_edit"] = _condition_result(
-                    "target_baseline_edit",
-                    target_prediction,
-                    reference_scope="primary",
-                    model_baseline=native,
-                    reconstruction_baseline=no_op,
-                    target_features=features,
-                )
-
                 controls = (
                     frozen_controls
                     if frozen_controls is not None
@@ -624,6 +610,62 @@ def run_official_tabicl_causal_edits(
                     autoencoder=autoencoder,
                     normalizer=normalizer,
                 )
+                ablation_dose_matching = None
+                if matched_control_dose == _MATCHED_CONTROL_DOSE:
+                    (
+                        target_latents,
+                        random_latents,
+                        target_replacements,
+                        random_replacements,
+                        ablation_dose_matching,
+                    ) = _match_decoded_edit_doses_by_call(
+                        encoded_calls,
+                        target_latents,
+                        random_latents,
+                        target_replacements,
+                        random_replacements,
+                        autoencoder=autoencoder,
+                        normalizer=normalizer,
+                    )
+
+                if source_result is not None:
+                    assert maximum_symmetric_donor_shift_rms_ratio is not None
+                    paired_ablation_displacement_balance = (
+                        _decoded_displacement_balance(
+                            no_op_replacements,
+                            target_replacements,
+                            random_replacements,
+                            maximum_symmetric_ratio=(
+                                maximum_symmetric_donor_shift_rms_ratio
+                            ),
+                            label="ablation",
+                        )
+                    )
+                    if ablation_dose_matching is not None:
+                        paired_ablation_displacement_balance = {
+                            **paired_ablation_displacement_balance,
+                            "dose_matching": ablation_dose_matching,
+                        }
+
+                _, target_prediction = _run_condition(
+                    session,
+                    X,
+                    y,
+                    site=site,
+                    entry_state=entry_state,
+                    expected_final_state=final_state,
+                    native_result=native_result,
+                    replacements=target_replacements,
+                    targets=targets,
+                )
+                conditions["target_baseline_edit"] = _condition_result(
+                    "target_baseline_edit",
+                    target_prediction,
+                    reference_scope="primary",
+                    model_baseline=native,
+                    reconstruction_baseline=no_op,
+                    target_features=features,
+                )
                 _, random_prediction = _run_condition(
                     session,
                     X,
@@ -647,26 +689,6 @@ def run_official_tabicl_causal_edits(
 
                 if source_result is not None:
                     assert maximum_symmetric_donor_shift_rms_ratio is not None
-                    paired_ablation_displacement_balance = (
-                        _decoded_displacement_balance(
-                            no_op_replacements,
-                            target_replacements,
-                            random_replacements,
-                            maximum_symmetric_ratio=(
-                                maximum_symmetric_donor_shift_rms_ratio
-                            ),
-                            label="ablation",
-                        )
-                    )
-                    paired_shift_balance = _donor_shift_balance(
-                        encoded_calls,
-                        source_calls,
-                        target_features=features,
-                        control_features=controls,
-                        maximum_symmetric_ratio=(
-                            maximum_symmetric_donor_shift_rms_ratio
-                        ),
-                    )
                     paired_latents = _patched_latents_from_source(
                         encoded_calls,
                         source_calls,
@@ -678,6 +700,67 @@ def run_official_tabicl_causal_edits(
                         autoencoder=autoencoder,
                         normalizer=normalizer,
                     )
+                    paired_control_latents = _patched_latents_from_source(
+                        encoded_calls,
+                        source_calls,
+                        features=controls,
+                    )
+                    paired_control_replacements = _decode_calls(
+                        encoded_calls,
+                        paired_control_latents,
+                        autoencoder=autoencoder,
+                        normalizer=normalizer,
+                    )
+                    donor_dose_matching = None
+                    if matched_control_dose == _MATCHED_CONTROL_DOSE:
+                        (
+                            paired_latents,
+                            paired_control_latents,
+                            paired_replacements,
+                            paired_control_replacements,
+                            donor_dose_matching,
+                        ) = _match_decoded_edit_doses_by_call(
+                            encoded_calls,
+                            paired_latents,
+                            paired_control_latents,
+                            paired_replacements,
+                            paired_control_replacements,
+                            autoencoder=autoencoder,
+                            normalizer=normalizer,
+                        )
+
+                    paired_shift_balance = _donor_shift_balance(
+                        encoded_calls,
+                        paired_latents,
+                        paired_control_latents,
+                        target_features=features,
+                        control_features=controls,
+                        maximum_symmetric_ratio=(
+                            maximum_symmetric_donor_shift_rms_ratio
+                        ),
+                    )
+                    if donor_dose_matching is not None:
+                        paired_shift_balance = {
+                            **paired_shift_balance,
+                            "dose_matching_protocol": matched_control_dose,
+                        }
+                    paired_donor_displacement_balance = (
+                        _decoded_displacement_balance(
+                            no_op_replacements,
+                            paired_replacements,
+                            paired_control_replacements,
+                            maximum_symmetric_ratio=(
+                                maximum_symmetric_donor_shift_rms_ratio
+                            ),
+                            label="donor",
+                        )
+                    )
+                    if donor_dose_matching is not None:
+                        paired_donor_displacement_balance = {
+                            **paired_donor_displacement_balance,
+                            "dose_matching": donor_dose_matching,
+                        }
+
                     _, paired_prediction = _run_condition(
                         session,
                         X,
@@ -696,29 +779,6 @@ def run_official_tabicl_causal_edits(
                         model_baseline=native,
                         reconstruction_baseline=no_op,
                         target_features=features,
-                    )
-
-                    paired_control_latents = _patched_latents_from_source(
-                        encoded_calls,
-                        source_calls,
-                        features=controls,
-                    )
-                    paired_control_replacements = _decode_calls(
-                        encoded_calls,
-                        paired_control_latents,
-                        autoencoder=autoencoder,
-                        normalizer=normalizer,
-                    )
-                    paired_donor_displacement_balance = (
-                        _decoded_displacement_balance(
-                            no_op_replacements,
-                            paired_replacements,
-                            paired_control_replacements,
-                            maximum_symmetric_ratio=(
-                                maximum_symmetric_donor_shift_rms_ratio
-                            ),
-                            label="donor",
-                        )
                     )
                     _, paired_control_prediction = _run_condition(
                         session,
@@ -748,22 +808,27 @@ def run_official_tabicl_causal_edits(
                         no_op.true_class_log_loss
                         - paired_prediction.true_class_log_loss
                     )
-                    paired_improvement_vs_target = (
-                        target_prediction.true_class_log_loss
-                        - paired_prediction.true_class_log_loss
-                    )
-                    paired_native_distance_reduction = np.abs(
-                        target_prediction.true_class_log_loss
-                        - native.true_class_log_loss
-                    ) - np.abs(
-                        paired_prediction.true_class_log_loss
-                        - native.true_class_log_loss
-                    )
-                    paired_effects = (
-                        paired_improvement,
-                        paired_improvement_vs_no_op,
-                        paired_improvement_vs_target,
-                        paired_native_distance_reduction,
+                    if matched_control_dose is None:
+                        paired_improvement_vs_target = (
+                            target_prediction.true_class_log_loss
+                            - paired_prediction.true_class_log_loss
+                        )
+                        paired_native_distance_reduction = np.abs(
+                            target_prediction.true_class_log_loss
+                            - native.true_class_log_loss
+                        ) - np.abs(
+                            paired_prediction.true_class_log_loss
+                            - native.true_class_log_loss
+                        )
+                    paired_effects = tuple(
+                        effect
+                        for effect in (
+                            paired_improvement,
+                            paired_improvement_vs_no_op,
+                            paired_improvement_vs_target,
+                            paired_native_distance_reduction,
+                        )
+                        if effect is not None
                     )
                     if any(not np.isfinite(effect).all() for effect in paired_effects):
                         raise RuntimeError(
@@ -907,6 +972,7 @@ def run_official_tabicl_causal_edits(
             paired_ablation_displacement_balance
         ),
         paired_donor_displacement_balance=paired_donor_displacement_balance,
+        matched_control_dose=matched_control_dose,
     )
 
 
@@ -1099,24 +1165,297 @@ def _patched_latents_from_source(
     return tuple(patched_calls)
 
 
+def _match_decoded_edit_doses_by_call(
+    calls: tuple[_EncodedCall, ...],
+    target_latents: tuple[Tensor, ...],
+    control_latents: tuple[Tensor, ...],
+    target_replacements: tuple[Tensor, ...],
+    control_replacements: tuple[Tensor, ...],
+    *,
+    autoencoder: nn.Module,
+    normalizer: MeanRMSNormalizer,
+) -> tuple[
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    tuple[Tensor, ...],
+    dict[str, Any],
+]:
+    """Shrink the larger decoded edit dose to the smaller dose per raw call.
+
+    The comparison is outcome-free: it uses only the recipient no-op
+    reconstruction and the two decoded activation edits.  Neither side is ever
+    amplified.  The edited latents are decoded again so the existing decoded
+    displacement gate checks the activation values that are actually injected.
+    """
+
+    schedule_lengths = {
+        len(calls),
+        len(target_latents),
+        len(control_latents),
+        len(target_replacements),
+        len(control_replacements),
+    }
+    if schedule_lengths != {len(calls)} or not calls:
+        raise RuntimeError("dose-matching schedules do not align")
+
+    scaled_target_latents: list[Tensor] = []
+    scaled_control_latents: list[Tensor] = []
+    preserve_target_replacement: list[bool] = []
+    preserve_control_replacement: list[bool] = []
+    original_target_squares: list[Tensor] = []
+    original_control_squares: list[Tensor] = []
+    pending_metadata: list[dict[str, Any]] = []
+    for call, target_latent, control_latent, target, control in zip(
+        calls,
+        target_latents,
+        control_latents,
+        target_replacements,
+        control_replacements,
+        strict=True,
+    ):
+        baseline = call.reconstruction
+        if (
+            target_latent.shape != call.latents.shape
+            or control_latent.shape != call.latents.shape
+        ):
+            raise RuntimeError("dose-matching latent shapes differ")
+        if baseline.shape != target.shape or baseline.shape != control.shape:
+            raise RuntimeError("dose-matching decoded activation shapes differ")
+        target_square = (
+            (target - baseline)
+            .detach()
+            .to(dtype=torch.float64, device="cpu")
+            .square()
+        )
+        control_square = (
+            (control - baseline)
+            .detach()
+            .to(dtype=torch.float64, device="cpu")
+            .square()
+        )
+        target_rms = float(torch.sqrt(target_square.mean()).item())
+        control_rms = float(torch.sqrt(control_square.mean()).item())
+        if (
+            not np.isfinite(target_rms)
+            or not np.isfinite(control_rms)
+            or target_rms <= 0.0
+            or control_rms <= 0.0
+        ):
+            raise RuntimeError(
+                "dose matching requires finite positive target and control "
+                "decoded displacement"
+            )
+        common_rms = min(target_rms, control_rms)
+        target_scale = common_rms / target_rms
+        control_scale = common_rms / control_rms
+        if not (
+            0.0 < target_scale <= 1.0
+            and 0.0 < control_scale <= 1.0
+            and max(target_scale, control_scale) == 1.0
+        ):
+            raise RuntimeError("dose matching attempted amplification")
+        preserve_target = target_scale == 1.0
+        preserve_control = control_scale == 1.0
+        scaled_target_latents.append(
+            target_latent
+            if preserve_target
+            else call.latents + target_scale * (target_latent - call.latents)
+        )
+        scaled_control_latents.append(
+            control_latent
+            if preserve_control
+            else call.latents + control_scale * (control_latent - call.latents)
+        )
+        preserve_target_replacement.append(preserve_target)
+        preserve_control_replacement.append(preserve_control)
+        original_target_squares.append(target_square.reshape(-1))
+        original_control_squares.append(control_square.reshape(-1))
+        pending_metadata.append(
+            {
+                "call_index": call.capture.metadata.call_index,
+                "vector_count": int(target_square.numel()),
+                "original_target_displacement_rms": target_rms,
+                "original_control_displacement_rms": control_rms,
+                "original_symmetric_rms_ratio": (
+                    _symmetric_non_negative_ratio(target_rms, control_rms)
+                ),
+                "common_requested_displacement_rms": common_rms,
+                "target_scale": target_scale,
+                "control_scale": control_scale,
+                "target_full_edit_preserved": preserve_target,
+                "control_full_edit_preserved": preserve_control,
+            }
+        )
+
+    scaled_target_tuple = tuple(scaled_target_latents)
+    scaled_control_tuple = tuple(scaled_control_latents)
+    decoded_target_replacements = _decode_calls(
+        calls,
+        scaled_target_tuple,
+        autoencoder=autoencoder,
+        normalizer=normalizer,
+    )
+    decoded_control_replacements = _decode_calls(
+        calls,
+        scaled_control_tuple,
+        autoencoder=autoencoder,
+        normalizer=normalizer,
+    )
+    scaled_target_replacements = tuple(
+        original if preserve else decoded
+        for original, decoded, preserve in zip(
+            target_replacements,
+            decoded_target_replacements,
+            preserve_target_replacement,
+            strict=True,
+        )
+    )
+    scaled_control_replacements = tuple(
+        original if preserve else decoded
+        for original, decoded, preserve in zip(
+            control_replacements,
+            decoded_control_replacements,
+            preserve_control_replacement,
+            strict=True,
+        )
+    )
+
+    scaled_target_squares: list[Tensor] = []
+    scaled_control_squares: list[Tensor] = []
+    by_call: list[dict[str, Any]] = []
+    for call, target, control, original_target, original_control, metadata in zip(
+        calls,
+        scaled_target_replacements,
+        scaled_control_replacements,
+        target_replacements,
+        control_replacements,
+        pending_metadata,
+        strict=True,
+    ):
+        baseline = call.reconstruction
+        target_square = (
+            (target - baseline)
+            .detach()
+            .to(dtype=torch.float64, device="cpu")
+            .square()
+        )
+        control_square = (
+            (control - baseline)
+            .detach()
+            .to(dtype=torch.float64, device="cpu")
+            .square()
+        )
+        target_rms = float(torch.sqrt(target_square.mean()).item())
+        control_rms = float(torch.sqrt(control_square.mean()).item())
+        ratio = _symmetric_non_negative_ratio(target_rms, control_rms)
+        if (
+            not np.isfinite(target_rms)
+            or not np.isfinite(control_rms)
+            or target_rms <= 0.0
+            or control_rms <= 0.0
+            or not np.isfinite(ratio)
+        ):
+            raise RuntimeError(
+                "dose-matched decoded displacement is zero or non-finite"
+            )
+        if target_rms > metadata["original_target_displacement_rms"] or (
+            control_rms > metadata["original_control_displacement_rms"]
+        ):
+            raise RuntimeError(
+                "dose matching amplified an actual decoded displacement"
+            )
+        if metadata["target_full_edit_preserved"] and not torch.equal(
+            target, original_target
+        ):
+            raise RuntimeError("dose matching changed the smaller target full edit")
+        if metadata["control_full_edit_preserved"] and not torch.equal(
+            control, original_control
+        ):
+            raise RuntimeError("dose matching changed the smaller control full edit")
+        scaled_target_squares.append(target_square.reshape(-1))
+        scaled_control_squares.append(control_square.reshape(-1))
+        by_call.append(
+            {
+                **metadata,
+                "scaled_target_displacement_rms": target_rms,
+                "scaled_control_displacement_rms": control_rms,
+                "scaled_symmetric_rms_ratio": ratio,
+                "actual_no_amplification_verified": True,
+            }
+        )
+
+    def _pooled_rms(squares: Sequence[Tensor]) -> float:
+        return float(torch.sqrt(torch.cat(tuple(squares)).mean()).item())
+
+    original_target_rms = _pooled_rms(original_target_squares)
+    original_control_rms = _pooled_rms(original_control_squares)
+    scaled_target_rms = _pooled_rms(scaled_target_squares)
+    scaled_control_rms = _pooled_rms(scaled_control_squares)
+    metadata = {
+        "protocol": _MATCHED_CONTROL_DOSE,
+        "reference": "recipient_no_op_reconstruction",
+        "operation": "per_call_shrink_larger_decoded_rms_to_smaller",
+        "amplification_allowed": False,
+        "actual_no_amplification_verified": True,
+        "full_edit": {
+            "target_displacement_rms": original_target_rms,
+            "control_displacement_rms": original_control_rms,
+            "symmetric_rms_ratio": _symmetric_non_negative_ratio(
+                original_target_rms, original_control_rms
+            ),
+        },
+        "dose_matched_partial_edit": {
+            "target_displacement_rms": scaled_target_rms,
+            "control_displacement_rms": scaled_control_rms,
+            "symmetric_rms_ratio": _symmetric_non_negative_ratio(
+                scaled_target_rms, scaled_control_rms
+            ),
+        },
+        "by_call": by_call,
+    }
+    return (
+        scaled_target_tuple,
+        scaled_control_tuple,
+        scaled_target_replacements,
+        scaled_control_replacements,
+        metadata,
+    )
+
+
 def _donor_shift_balance(
     recipient_calls: tuple[_EncodedCall, ...],
-    source_calls: tuple[_EncodedCall, ...],
+    target_patched_calls: tuple[Tensor, ...],
+    control_patched_calls: tuple[Tensor, ...],
     *,
     target_features: Sequence[int],
     control_features: Sequence[int],
     maximum_symmetric_ratio: float,
 ) -> dict[str, Any]:
+    if not (
+        len(recipient_calls)
+        == len(target_patched_calls)
+        == len(control_patched_calls)
+    ) or not recipient_calls:
+        raise RuntimeError("paired donor latent schedules do not align")
     target_squares: list[Tensor] = []
     control_squares: list[Tensor] = []
     by_call: list[dict[str, Any]] = []
-    for recipient, source in zip(recipient_calls, source_calls, strict=True):
-        if recipient.latents.shape != source.latents.shape:
-            raise RuntimeError("paired source and target latent coordinates differ")
-        target_delta = source.latents[:, list(target_features)] - (
+    for recipient, target_patched, control_patched in zip(
+        recipient_calls,
+        target_patched_calls,
+        control_patched_calls,
+        strict=True,
+    ):
+        if (
+            recipient.latents.shape != target_patched.shape
+            or recipient.latents.shape != control_patched.shape
+        ):
+            raise RuntimeError("paired donor latent coordinates differ")
+        target_delta = target_patched[:, list(target_features)] - (
             recipient.latents[:, list(target_features)]
         )
-        control_delta = source.latents[:, list(control_features)] - (
+        control_delta = control_patched[:, list(control_features)] - (
             recipient.latents[:, list(control_features)]
         )
         target_square = target_delta.detach().to(torch.float64).square().sum(dim=1)
@@ -1306,12 +1645,13 @@ def _encode_call(
         autoencoder=autoencoder,
         normalizer=normalizer,
     )
+    live_dtype = torch.as_tensor(record.tensor).dtype
     return _EncodedCall(
         capture=capture,
         record=record,
         raw=encoded.raw,
         latents=encoded.latents,
-        reconstruction=encoded.reconstruction,
+        reconstruction=encoded.reconstruction.to(dtype=live_dtype),
     )
 
 
@@ -1338,7 +1678,7 @@ def _decode_calls(
                 autoencoder=autoencoder,
                 mean=mean,
                 rms=rms,
-            )
+            ).to(dtype=call.reconstruction.dtype)
         )
     return tuple(decoded)
 
@@ -1347,9 +1687,9 @@ def _reconstruction_mse(calls: tuple[_EncodedCall, ...]) -> float:
     squared_error = 0.0
     count = 0
     for call in calls:
-        difference = call.reconstruction.detach().to(device="cpu") - call.raw.to(
-            device="cpu"
-        )
+        difference = call.reconstruction.detach().to(
+            device="cpu", dtype=torch.float64
+        ) - call.raw.to(device="cpu", dtype=torch.float64)
         squared_error += float(difference.square().sum())
         count += difference.numel()
     value = squared_error / count
@@ -1480,6 +1820,8 @@ _RANKING_PARENT_FIELDS = {
     "expected_selection_sha256",
     "split_protocol_path",
     "expected_split_protocol_sha256",
+    "dose_protocol_path",
+    "expected_dose_protocol_sha256",
     "directions",
 }
 _RANKING_SELECTION_FIELDS = {
@@ -1491,6 +1833,9 @@ _RANKING_SELECTION_FIELDS = {
     "conditions",
     "directions",
     "maximum_symmetric_donor_shift_rms_ratio",
+    "matched_control_dose",
+    "dose_protocol_id",
+    "dose_protocol_sha256",
     "score_definition",
     "decoder_norm_space",
     "raw_activation_rms_definition",
@@ -1543,6 +1888,10 @@ _RANKING_SCORE_ID = (
 _RANKING_RAW_RMS_DEFINITION = (
     "root_mean_square_of_pooled_aligned_none_and_rope_raw_values"
 )
+_MATCHED_CONTROL_DOSE = (
+    "per_call_decoded_rms_clip_to_smaller_without_amplification"
+)
+_DOSE_PROTOCOL_ID = "tabicl-step250k-whole-row-causal-dose-amendment-v1"
 _CHECKPOINT_STUDY_TRUST_FIELDS = {
     "checkpoint_path",
     "expected_checkpoint_sha256",
@@ -1662,6 +2011,7 @@ def run(args: Any) -> int:
             "expected_freeze_artifact_sha256",
             "selection_run_dir",
             "expected_selection_manifest_sha256",
+            "matched_control_dose",
         },
     )
     classifier_config = _exact_object(
@@ -1679,6 +2029,11 @@ def run(args: Any) -> int:
             required=_RANKING_PARENT_FIELDS,
         )
     )
+    matched_control_dose = intervention.get("matched_control_dose")
+    if matched_control_dose is not None and matched_control_dose != (
+        _MATCHED_CONTROL_DOSE
+    ):
+        raise ValueError("intervention matched_control_dose is unsupported")
     raw_paired_config = config.get("paired_reverse_patch")
     paired_config = (
         None
@@ -1736,6 +2091,10 @@ def run(args: Any) -> int:
         raise ValueError(
             "ranking_parent is restricted to exploratory_pilot discovery runs"
         )
+    if ranking_config is not None and matched_control_dose != _MATCHED_CONTROL_DOSE:
+        raise ValueError(
+            "ranking-bound causal execution requires frozen per-call dose matching"
+        )
     if (
         checkpoint_study["scope"] == "exploratory_pilot"
         and paired_config is not None
@@ -1744,6 +2103,8 @@ def run(args: Any) -> int:
         raise ValueError(
             "exploratory paired reverse patch requires a strict ranking_parent"
         )
+    if ranking_config is None and matched_control_dose is not None:
+        raise ValueError("matched_control_dose is restricted to ranking-bound runs")
     expected_sample_roster_sha256 = (
         _required_sha256(dataset_config, "expected_sample_roster_sha256")
         if ranking_config is not None
@@ -1982,6 +2343,7 @@ def run(args: Any) -> int:
     ranking_manifest_file = None
     ranking_selection_file = None
     ranking_split_protocol_file = None
+    ranking_dose_protocol_file = None
     configured_ranking_directions: tuple[str, ...] | None = None
     if ranking_config is not None:
         configured_ranking_directions = _ranking_directions(
@@ -2024,6 +2386,15 @@ def run(args: Any) -> int:
             ),
             expected_sha256=_required_sha256(
                 ranking_config, "expected_split_protocol_sha256"
+            ),
+        )
+        ranking_dose_protocol_file = verify_file(
+            _absolute_file(
+                ranking_config["dose_protocol_path"],
+                name="ranking_parent.dose_protocol_path",
+            ),
+            expected_sha256=_required_sha256(
+                ranking_config, "expected_dose_protocol_sha256"
             ),
         )
 
@@ -2098,11 +2469,13 @@ def run(args: Any) -> int:
     if ranking_manifest_file is not None:
         assert ranking_selection_file is not None
         assert ranking_split_protocol_file is not None
+        assert ranking_dose_protocol_file is not None
         additional_paths.update(
             {
                 "ranking.parent_manifest": ranking_manifest_file.path,
                 "ranking.selection": ranking_selection_file.path,
                 "ranking.split_protocol": ranking_split_protocol_file.path,
+                "ranking.dose_protocol": ranking_dose_protocol_file.path,
             }
         )
         expected_additional.update(
@@ -2113,6 +2486,9 @@ def run(args: Any) -> int:
                 "ranking.selection": ranking_selection_file.digest.sha256,
                 "ranking.split_protocol": (
                     ranking_split_protocol_file.digest.sha256
+                ),
+                "ranking.dose_protocol": (
+                    ranking_dose_protocol_file.digest.sha256
                 ),
             }
         )
@@ -2299,11 +2675,13 @@ def run(args: Any) -> int:
     if ranking_parent is not None:
         assert ranking_selection_file is not None
         assert ranking_split_protocol_file is not None
+        assert ranking_dose_protocol_file is not None
         assert configured_ranking_directions is not None
         ranking_parent_binding = _validate_ranking_parent(
             ranking_parent,
             context.additional_file("ranking.selection"),
             context.additional_file("ranking.split_protocol"),
+            context.additional_file("ranking.dose_protocol"),
             context=context,
             ranking_parent_manifest_sha256=context.additional_file(
                 "ranking.parent_manifest"
@@ -2321,6 +2699,7 @@ def run(args: Any) -> int:
             target_features=target_features,
             control_features=configured_controls,
             latent_baseline=latent_baseline,
+            matched_control_dose=matched_control_dose,
             configured_directions=configured_ranking_directions,
             paired_source_binding=paired_source_binding,
             sample_roster_sha256=context.additional_file(
@@ -2510,6 +2889,7 @@ def run(args: Any) -> int:
         target_condition=context.condition,
         paired_source=paired_source,
         maximum_symmetric_donor_shift_rms_ratio=paired_shift_ratio_limit,
+        matched_control_dose=matched_control_dose,
     )
     if evaluation.source_evidence_level != "strict":
         raise RuntimeError("official classifier source evidence was not strict")
@@ -3381,6 +3761,7 @@ def _validate_ranking_parent(
     parent: RunManifest,
     verified_selection: Any,
     verified_split_protocol: Any,
+    verified_dose_protocol: Any,
     *,
     context: Any,
     ranking_parent_manifest_sha256: str,
@@ -3395,6 +3776,7 @@ def _validate_ranking_parent(
     target_features: Sequence[int],
     control_features: Sequence[int] | None,
     latent_baseline: Any,
+    matched_control_dose: str | None,
     configured_directions: Sequence[str],
     paired_source_binding: Mapping[str, Any] | None,
     sample_roster_sha256: str,
@@ -3455,6 +3837,7 @@ def _validate_ranking_parent(
         ),
         "representation.model": representation_model_sha256,
         "ranking.split_protocol": verified_split_protocol.digest.sha256,
+        "ranking.dose_protocol": verified_dose_protocol.digest.sha256,
     }
     mismatched_inputs = {
         role: (registered_inputs.get(role), expected)
@@ -3482,6 +3865,11 @@ def _validate_ranking_parent(
         sample_count=sample_count,
         evaluation_split=evaluation_split,
     )
+    dose = _ranking_dose_protocol(
+        verified_dose_protocol,
+        split_protocol_id=split["protocol_id"],
+        split_protocol_sha256=verified_split_protocol.digest.sha256,
+    )
     _validate_ranking_parent_input_schema(
         parent,
         source_lineage=source_lineage,
@@ -3498,6 +3886,9 @@ def _validate_ranking_parent(
         "maximum_symmetric_donor_shift_rms_ratio": split[
             "maximum_symmetric_donor_shift_rms_ratio"
         ],
+        "matched_control_dose": dose["matched_control_dose"],
+        "dose_protocol_id": dose["protocol_id"],
+        "dose_protocol_sha256": verified_dose_protocol.digest.sha256,
         "score_definition": _RANKING_SCORE_ID,
         "decoder_norm_space": "raw_activation_after_denormalize",
         "raw_activation_rms_definition": _RANKING_RAW_RMS_DEFINITION,
@@ -3533,6 +3924,10 @@ def _validate_ranking_parent(
     if tuple(configured_directions) != tuple(selection["directions"]):
         raise ValueError(
             "configured ranking directions differ from selection.json"
+        )
+    if matched_control_dose != dose["matched_control_dose"]:
+        raise ValueError(
+            "configured matched-control dose differs from the frozen dose protocol"
         )
     if paired_source_binding is None:
         raise ValueError(
@@ -3780,12 +4175,113 @@ def _validate_ranking_parent(
         "selection_sha256": verified_selection.digest.sha256,
         "split_protocol_sha256": verified_split_protocol.digest.sha256,
         "split_protocol_id": split["protocol_id"],
+        "dose_protocol_sha256": verified_dose_protocol.digest.sha256,
+        "dose_protocol_id": dose["protocol_id"],
         "target_features": list(selection_targets),
         "control_features": list(selection_controls),
         "directions": list(configured_directions),
         "effective_direction": effective_direction,
+        "matched_control_dose": matched_control_dose,
         "evidence_scope": "exploratory-pilot",
         "formal_claim": "forbidden",
+    }
+
+
+def _ranking_dose_protocol(
+    verified: Any,
+    *,
+    split_protocol_id: str,
+    split_protocol_sha256: str,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(verified.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("ranking dose protocol is not valid JSON") from error
+    payload = _exact_object(
+        payload,
+        label="ranking dose protocol",
+        required={
+            "schema_version",
+            "protocol_id",
+            "frozen_at",
+            "parent_split_protocol_id",
+            "parent_split_protocol_sha256",
+            "scope",
+            "formal_claim",
+            "trigger",
+            "model_outcomes_observed_before_freeze",
+            "matched_control_dose",
+            "reference_activation",
+            "matching_unit",
+            "dose_metric",
+            "adjustment",
+            "amplification_allowed",
+            "zero_or_non_finite_dose_policy",
+            "maximum_post_adjustment_symmetric_rms_ratio",
+            "interpretation",
+        },
+    )
+    expected = {
+        "schema_version": 1,
+        "protocol_id": _DOSE_PROTOCOL_ID,
+        "frozen_at": "2026-08-09T22:36:19+01:00",
+        "parent_split_protocol_id": split_protocol_id,
+        "parent_split_protocol_sha256": split_protocol_sha256,
+        "scope": "exploratory_pilot_ranking_bound_paired_row_interactor_only",
+        "formal_claim": "forbidden",
+        "trigger": (
+            "A decoded-dose balance gate failed before any target, control, "
+            "or donor intervention prediction was published."
+        ),
+        "model_outcomes_observed_before_freeze": False,
+        "matched_control_dose": _MATCHED_CONTROL_DOSE,
+        "reference_activation": "recipient_no_op_reconstruction",
+        "matching_unit": "official_raw_model_call",
+        "dose_metric": (
+            "root_mean_square_of_decoded_activation_edit_after_cast_to_live_"
+            "activation_dtype_minus_recipient_no_op_reconstruction_after_same_cast"
+        ),
+        "adjustment": (
+            "Set the common requested dose to the smaller full-edit dose, retain "
+            "the smaller latent edit and decoded activation byte-for-byte, shrink "
+            "only the larger latent edit by their ratio, decode the changed edit "
+            "again, cast both edit and no-op reconstruction to the live activation "
+            "dtype, reject any actual per-side dose increase, and gate the actual "
+            "injected values."
+        ),
+        "amplification_allowed": False,
+        "zero_or_non_finite_dose_policy": "fail_closed",
+        "maximum_post_adjustment_symmetric_rms_ratio": 1.25,
+        "interpretation": (
+            "The executed interventions are dose-matched partial edits, not "
+            "complete deletion or complete transplantation. Target ablation and "
+            "donor patch families are matched only within their own target/control "
+            "pair and are not dose-comparable to each other."
+        ),
+    }
+    mismatches = {
+        name: (payload.get(name), value)
+        for name, value in expected.items()
+        if payload.get(name) != value
+    }
+    if mismatches:
+        raise ValueError(
+            f"ranking dose protocol differs from the frozen contract: {mismatches}"
+        )
+    for name in (
+        "frozen_at",
+        "trigger",
+        "dose_metric",
+        "adjustment",
+        "interpretation",
+    ):
+        if not isinstance(payload[name], str) or not payload[name]:
+            raise TypeError(f"ranking dose protocol {name} must be non-empty")
+    return {
+        "protocol_id": require_public_label(
+            payload["protocol_id"], name="ranking dose protocol_id"
+        ),
+        "matched_control_dose": _MATCHED_CONTROL_DOSE,
     }
 
 
@@ -3968,6 +4464,7 @@ def _validate_ranking_parent_input_schema(
 
     singleton_roles = {
         "ranking.split_protocol",
+        "ranking.dose_protocol",
         "representation.parent_manifest",
         "representation.model",
     }
@@ -6269,14 +6766,6 @@ def _predictions_payload(
             is not None
         )
         assert (
-            evaluation.paired_reverse_patch_log_loss_improvement_vs_target_baseline
-            is not None
-        )
-        assert (
-            evaluation.paired_reverse_patch_native_distance_reduction_vs_target_baseline
-            is not None
-        )
-        assert (
             evaluation.paired_source_native_log_loss_improvement_vs_recipient_native
             is not None
         )
@@ -6291,12 +6780,6 @@ def _predictions_payload(
             "log_loss_improvement_vs_paired_matched_random_patch": (
                 evaluation.paired_reverse_patch_log_loss_improvement_vs_matched_random
             ),
-            "log_loss_improvement_vs_target_baseline_edit": (
-                evaluation.paired_reverse_patch_log_loss_improvement_vs_target_baseline
-            ),
-            "native_distance_reduction_vs_target_baseline_edit": (
-                evaluation.paired_reverse_patch_native_distance_reduction_vs_target_baseline
-            ),
             "log_loss_improvement_of_source_native_vs_recipient_native": (
                 evaluation.paired_source_native_log_loss_improvement_vs_recipient_native
             ),
@@ -6304,6 +6787,25 @@ def _predictions_payload(
                 evaluation.paired_source_no_op_log_loss_improvement_vs_recipient_no_op
             ),
         }
+        if evaluation.matched_control_dose is None:
+            assert (
+                evaluation.paired_reverse_patch_log_loss_improvement_vs_target_baseline
+                is not None
+            )
+            assert (
+                evaluation.paired_reverse_patch_native_distance_reduction_vs_target_baseline
+                is not None
+            )
+            paired_effects.update(
+                {
+                    "log_loss_improvement_vs_target_baseline_edit": (
+                        evaluation.paired_reverse_patch_log_loss_improvement_vs_target_baseline
+                    ),
+                    "native_distance_reduction_vs_target_baseline_edit": (
+                        evaluation.paired_reverse_patch_native_distance_reduction_vs_target_baseline
+                    ),
+                }
+            )
     paired_source_native = None
     if evaluation.paired_source_native_prediction is not None:
         source_native = evaluation.paired_source_native_prediction
@@ -6408,14 +6910,6 @@ def _summary_payload(
             is not None
         )
         assert (
-            evaluation.paired_reverse_patch_log_loss_improvement_vs_target_baseline
-            is not None
-        )
-        assert (
-            evaluation.paired_reverse_patch_native_distance_reduction_vs_target_baseline
-            is not None
-        )
-        assert (
             evaluation.paired_source_native_log_loss_improvement_vs_recipient_native
             is not None
         )
@@ -6449,16 +6943,6 @@ def _summary_payload(
                     evaluation.paired_reverse_patch_log_loss_improvement_vs_matched_random
                 )
             ),
-            "mean_log_loss_improvement_vs_target_baseline_edit": float(
-                np.mean(
-                    evaluation.paired_reverse_patch_log_loss_improvement_vs_target_baseline
-                )
-            ),
-            "mean_native_distance_reduction_vs_target_baseline_edit": float(
-                np.mean(
-                    evaluation.paired_reverse_patch_native_distance_reduction_vs_target_baseline
-                )
-            ),
             "mean_log_loss_improvement_of_source_native_vs_recipient_native": (
                 mean_source_native_advantage
             ),
@@ -6474,6 +6958,33 @@ def _summary_payload(
                 else mean_gap_closure / mean_source_no_op_advantage
             ),
         }
+        if evaluation.matched_control_dose is None:
+            assert (
+                evaluation.paired_reverse_patch_log_loss_improvement_vs_target_baseline
+                is not None
+            )
+            assert (
+                evaluation.paired_reverse_patch_native_distance_reduction_vs_target_baseline
+                is not None
+            )
+            paired_measured_effects.update(
+                {
+                    "mean_log_loss_improvement_vs_target_baseline_edit": float(
+                        np.mean(
+                            evaluation.paired_reverse_patch_log_loss_improvement_vs_target_baseline
+                        )
+                    ),
+                    "mean_native_distance_reduction_vs_target_baseline_edit": float(
+                        np.mean(
+                            evaluation.paired_reverse_patch_native_distance_reduction_vs_target_baseline
+                        )
+                    ),
+                }
+            )
+        else:
+            paired_measured_effects[
+                "target_ablation_and_donor_patch_dose_comparable"
+            ] = False
     paired_direction = (
         None
         if paired_source_binding is None
@@ -6560,6 +7071,22 @@ def _summary_payload(
             }
         ),
     }
+    intervention_summary = {
+        "target_features": list(target_features),
+        "control_features": (
+            None if control_features is None else list(control_features)
+        ),
+        "latent_baseline": latent_baseline,
+        "random_seed": random_seed,
+    }
+    if evaluation.matched_control_dose is not None:
+        paired_summary["matched_control_dose"] = evaluation.matched_control_dose
+        intervention_summary.update(
+            {
+                "matched_control_dose": evaluation.matched_control_dose,
+                "edit_semantics": "per_call_dose_matched_partial_edit",
+            }
+        )
     return _json_safe(
         {
             "schema_version": 1,
@@ -6577,14 +7104,7 @@ def _summary_payload(
             },
             "conditions": condition_metrics,
             "matched_control_features": evaluation.matched_control_features,
-            "intervention": {
-                "target_features": list(target_features),
-                "control_features": (
-                    None if control_features is None else list(control_features)
-                ),
-                "latent_baseline": latent_baseline,
-                "random_seed": random_seed,
-            },
+            "intervention": intervention_summary,
             "mechanistic_rescue": {
                 "passed": evaluation.mechanistic_rescue_passed,
                 "status": (
@@ -6647,6 +7167,15 @@ def _summary_payload(
                     None
                     if ranking_parent_binding is None
                     else ranking_parent_binding["split_protocol_sha256"]
+                ),
+                **(
+                    {}
+                    if ranking_parent_binding is None
+                    else {
+                        "ranking_dose_protocol_sha256": (
+                            ranking_parent_binding["dose_protocol_sha256"]
+                        )
+                    }
                 ),
                 "checkpoint_study_sha256": checkpoint_study[
                     "binding_sha256"

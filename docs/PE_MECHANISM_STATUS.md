@@ -41,7 +41,7 @@ Implemented and regression tested:
   and evaluates `W p + b`, `W p`, `b`, and neither on the same fitted model,
   with exact full/native and hook-restoration gates.
 
-The current immutable mechanism execution commit is
+The immutable whole-row collection execution commit is
 `b2db3517e3dbc9d224daa1651a5ee4e56d430e14`, pushed on
 `codex/pe-mechanism-sae-v2`. It descends from the first execution commit
 `4b797135b655ee181647c84fed3df946f942f248` and adds whole-row
@@ -139,14 +139,42 @@ as expected for a non-compressing coordinate baseline.  Dense AE-384 retained
 0.9773 pooled, 0.9740 for No-PE and 0.9727 for RoPE.  The 8x Top-K SAE with
 `k=64` retained 0.9906 on its training activations but collapsed to 0.6034 on
 the disjoint fidelity roster (0.6000 No-PE and 0.6173 RoPE), so it is rejected
-without validation-driven retuning.  PCA and dense AE still require live
-model no-op checks before causal use.  These are reconstruction results, not
-evidence of a positional mechanism or downstream improvement.
+without validation-driven retuning. PCA passed the recipient and source live
+no-op gates on the first causal table before the unequal-dose gate stopped the
+run; those gates must still pass independently on every executed table. Dense
+AE has not undergone a live model-causal run. These are reconstruction and
+plumbing results, not evidence of a positional mechanism or downstream
+improvement.
 
 Because the unsupervised representation dictionary used all 109 discovery
 datasets, the 36 causal-test datasets are disjoint from feature ranking and
 model outcomes but are not representation-level untouched holdouts.  Results
 from the legacy step-250000 pair therefore remain explicitly exploratory.
+
+The first outcome-free whole-row PCA ranking over the frozen 73-table subset
+also completed. It selected PCA coordinates `0`, `7`, `5`, and `3` as targets
+and `181`, `502`, `153`, and `310` as their pre-frozen matched controls. The
+four target scores were approximately `15.3224`, `5.3421`, `4.7173`, and
+`3.4854`, with nonzero evidence on all 73 ranking tables. This establishes a
+large condition-associated representation shift, not causal importance.
+
+The first live whole-row causal attempt then stopped safely on the first table,
+before publishing any target, control, or donor prediction. The decoded
+target/control ablation displacement ratio was `7.81832`, exceeding the frozen
+maximum of `1.25`; consequently no causal output directory or performance
+result exists. This exposed an unfair intervention-dose comparison rather than
+a model, checkpoint, or accelerator failure.
+
+An outcome-free amendment is now frozen in
+`analysis/pe_mechanism/protocols/whole-row-causal-dose-amendment-v1.json`.
+For each raw official model call and separately for ablation and donor patches,
+it shrinks only the latent edit that produced the larger decoded RMS dose,
+never amplifies either side, preserves the smaller edit byte-for-byte, and
+reruns the decoded-dose gate on the actual injected activations after explicitly
+rejecting any per-side dose increase. The executed interventions must be
+reported as dose-matched partial edits. The original split, target ranking, and
+random-control draw stay
+unchanged; the amendment is content-bound through ranking and causal manifests.
 
 A real released TabPFN v2.6 checkpoint is not locally available to this
 workstream. The mutable descendant tree now contains an offline official
@@ -157,11 +185,14 @@ and a clean TabPFN v7.1.1 checkout.
 
 Still required before a mechanistic claim:
 
-- pass live model no-op gates for the qualifying PCA and dense-AE
-  representations; the failed Top-K SAE is ineligible;
-- run discovery-only target deletion, matched random controls and independently
-  sourced patches in both RoPE/No-PE directions. Restoring the same latent is
-  only a round-trip plumbing control;
+- complete one minimal A10 whole-row PCA run with the frozen per-call
+  dose-matched target/control edits. If it remains null against the matched
+  control, preserve the result as a credible exploratory negative and do not
+  expand this branch merely to search for a positive result;
+- only after a positive or otherwise decision-relevant PCA signal, test the
+  reverse donor direction and qualifying dense AE. The failed Top-K SAE is
+  ineligible, and restoring the same latent remains only a round-trip plumbing
+  control;
 - acquire and content-bind the licensed released TabPFN v2.6 checkpoint before
   running its registered positional-term decomposition;
 - obtain matched formal RoPE, Temporary and No-PE checkpoints before any

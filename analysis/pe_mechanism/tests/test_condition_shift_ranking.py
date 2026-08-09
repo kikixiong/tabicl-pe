@@ -220,6 +220,51 @@ def _split_protocol(path: Path) -> Path:
     return path
 
 
+def _dose_protocol(path: Path, split_path: Path) -> Path:
+    payload = {
+        "schema_version": 1,
+        "protocol_id": "tabicl-step250k-whole-row-causal-dose-amendment-v1",
+        "frozen_at": "2026-08-09T22:36:19+01:00",
+        "parent_split_protocol_id": "unit-whole-row-causal-split-v1",
+        "parent_split_protocol_sha256": _file_sha256(split_path),
+        "scope": "exploratory_pilot_ranking_bound_paired_row_interactor_only",
+        "formal_claim": "forbidden",
+        "trigger": (
+            "A decoded-dose balance gate failed before any target, control, "
+            "or donor intervention prediction was published."
+        ),
+        "model_outcomes_observed_before_freeze": False,
+        "matched_control_dose": (
+            "per_call_decoded_rms_clip_to_smaller_without_amplification"
+        ),
+        "reference_activation": "recipient_no_op_reconstruction",
+        "matching_unit": "official_raw_model_call",
+        "dose_metric": (
+            "root_mean_square_of_decoded_activation_edit_after_cast_to_live_"
+            "activation_dtype_minus_recipient_no_op_reconstruction_after_same_cast"
+        ),
+        "adjustment": (
+            "Set the common requested dose to the smaller full-edit dose, retain "
+            "the smaller latent edit and decoded activation byte-for-byte, shrink "
+            "only the larger latent edit by their ratio, decode the changed edit "
+            "again, cast both edit and no-op reconstruction to the live activation "
+            "dtype, reject any actual per-side dose increase, and gate the actual "
+            "injected values."
+        ),
+        "amplification_allowed": False,
+        "zero_or_non_finite_dose_policy": "fail_closed",
+        "maximum_post_adjustment_symmetric_rms_ratio": 1.25,
+        "interpretation": (
+            "The executed interventions are dose-matched partial edits, not "
+            "complete deletion or complete transplantation. Target ablation and "
+            "donor patch families are matched only within their own target/control "
+            "pair and are not dose-comparable to each other."
+        ),
+    }
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    return path
+
+
 def _completed_parent_and_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, dict[str, Any], dict[str, tuple[Path, dict[str, str]]]]:
@@ -249,6 +294,7 @@ def _completed_parent_and_config(
         SimpleNamespace(config=representation_path, output_dir=parent_dir)
     ) == 0
     split_path = _split_protocol(tmp_path / "split-protocol.json")
+    dose_path = _dose_protocol(tmp_path / "dose-protocol.json", split_path)
     rank_config: dict[str, Any] = {
         "representation_run_dir": str(parent_dir),
         "expected_parent_manifest_sha256": _file_sha256(
@@ -260,6 +306,10 @@ def _completed_parent_and_config(
         "split_protocol": {
             "path": str(split_path),
             "expected_sha256": _file_sha256(split_path),
+        },
+        "dose_protocol": {
+            "path": str(dose_path),
+            "expected_sha256": _file_sha256(dose_path),
         },
         "ranking": {
             "dataset_ids": ["train-a"],
@@ -365,6 +415,7 @@ def test_run_publishes_bound_path_free_selection_atomically(
     roles = {item["role"] for item in manifest["inputs"]}
     assert {
         "ranking.split_protocol",
+        "ranking.dose_protocol",
         "representation.parent_manifest",
         "representation.model",
     } <= roles
@@ -372,6 +423,12 @@ def test_run_publishes_bound_path_free_selection_atomically(
     assert set(selection["activation_sha256_by_condition"]) == {"none", "rope"}
     assert selection["decoder_norm_space"] == "raw_activation_after_denormalize"
     assert selection["maximum_symmetric_donor_shift_rms_ratio"] == 1.25
+    assert selection["matched_control_dose"] == (
+        "per_call_decoded_rms_clip_to_smaller_without_amplification"
+    )
+    assert selection["dose_protocol_sha256"] == _file_sha256(
+        Path(config["dose_protocol"]["path"])
+    )
     _assert_path_free(selection)
 
     with pytest.raises(FileExistsError):
@@ -420,6 +477,76 @@ def test_run_rejects_split_protocol_parameter_drift(
     config["ranking"]["random_candidate_pool_size"] = 2
     output = tmp_path / "rank-output"
     with pytest.raises(ValueError, match="frozen feature protocol"):
+        run(
+            SimpleNamespace(
+                config=_write_rank_config(tmp_path, config), output_dir=output
+            )
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("amplification_allowed", True),
+        ("protocol_id", "renamed-dose-amendment"),
+    ],
+)
+def test_run_rejects_dose_protocol_drift_without_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    _parent, config, _runs = _completed_parent_and_config(tmp_path, monkeypatch)
+    dose_path = Path(config["dose_protocol"]["path"])
+    dose = json.loads(dose_path.read_text(encoding="utf-8"))
+    dose[field] = value
+    dose_path.write_text(json.dumps(dose, sort_keys=True), encoding="utf-8")
+    config["dose_protocol"]["expected_sha256"] = _file_sha256(dose_path)
+    output = tmp_path / "rank-output"
+
+    with pytest.raises(ValueError, match="frozen contract"):
+        run(
+            SimpleNamespace(
+                config=_write_rank_config(tmp_path, config), output_dir=output
+            )
+        )
+    assert not output.exists()
+
+
+def test_run_rejects_dose_protocol_schema_extension_without_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _parent, config, _runs = _completed_parent_and_config(tmp_path, monkeypatch)
+    dose_path = Path(config["dose_protocol"]["path"])
+    dose = json.loads(dose_path.read_text(encoding="utf-8"))
+    dose["unregistered_override"] = True
+    dose_path.write_text(json.dumps(dose, sort_keys=True), encoding="utf-8")
+    config["dose_protocol"]["expected_sha256"] = _file_sha256(dose_path)
+    output = tmp_path / "rank-output"
+
+    with pytest.raises(ValueError, match="dose protocol fields mismatch"):
+        run(
+            SimpleNamespace(
+                config=_write_rank_config(tmp_path, config), output_dir=output
+            )
+        )
+    assert not output.exists()
+
+
+def test_run_rejects_resealed_dose_metric_drift_without_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _parent, config, _runs = _completed_parent_and_config(tmp_path, monkeypatch)
+    dose_path = Path(config["dose_protocol"]["path"])
+    dose = json.loads(dose_path.read_text(encoding="utf-8"))
+    dose["dose_metric"] = "a different but non-empty metric"
+    dose_path.write_text(json.dumps(dose, sort_keys=True), encoding="utf-8")
+    config["dose_protocol"]["expected_sha256"] = _file_sha256(dose_path)
+    output = tmp_path / "rank-output"
+
+    with pytest.raises(ValueError, match="frozen contract"):
         run(
             SimpleNamespace(
                 config=_write_rank_config(tmp_path, config), output_dir=output
