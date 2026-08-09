@@ -2552,8 +2552,12 @@ def _assert_collect_lineage(
             raise ValueError("collect manifest model_family does not match train-repr")
         if exact_manifest.model_revision != context.model_revision:
             raise ValueError("collect manifest model_revision does not match train-repr")
-        if tuple(sorted(exact_manifest.sites)) != tuple(sorted(context.sites)):
-            raise ValueError("collect manifest sites do not match train-repr provenance")
+        selected_site = context.sites[0]
+        if selected_site not in exact_manifest.sites:
+            raise ValueError(
+                "collect manifest sites do not match train-repr provenance: "
+                "selected site is absent"
+            )
         if exact_manifest.dataset_manifest != context.inputs.dataset_manifest.digest:
             raise ValueError("collect manifest dataset manifest does not match train-repr")
         if exact_manifest.training_code_sha != context.inputs.training_code.head_sha:

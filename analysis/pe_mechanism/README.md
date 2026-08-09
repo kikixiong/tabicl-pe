@@ -161,6 +161,11 @@ binds each checkpoint and requires the same data roster, official ensemble
 views, feature/class shuffles, feature grouping, activation axes, and sampled
 coordinates. Equal array shapes alone are not alignment evidence.
 
+Each representation dictionary selects exactly one activation site. A strict
+parent collection may contain additional captured sites, but the selected site
+must be declared by that parent and every referenced activation artifact must
+belong to the selected site; the unused sites are never imported implicitly.
+
 Dense autoencoders, exact PCA, and top-k sparse autoencoders are available.
 Representation fidelity is measured on datasets excluded from representation
 training. Passing reconstruction is necessary but does not establish a

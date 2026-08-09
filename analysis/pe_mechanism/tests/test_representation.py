@@ -509,6 +509,42 @@ def _mutate_index_and_reseal(run_dir: Path, mutation) -> None:
     manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
 
 
+def _add_official_collect_site(run_dir: Path, *, site: str) -> dict[str, str]:
+    index_path = run_dir / "activation-index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    source_site = index["sites"][0]
+    added_site = json.loads(json.dumps(source_site))
+    added_site["site"] = site
+    added_artifacts: dict[str, str] = {}
+    for dataset in added_site["datasets"]:
+        source_name = dataset["file"]
+        source_path = run_dir / source_name
+        added_name = f"{source_path.stem}-{site}{source_path.suffix}"
+        (run_dir / added_name).write_bytes(source_path.read_bytes())
+        dataset["file"] = added_name
+        added_artifacts[dataset["dataset_id"]] = added_name
+    index["sites"].append(added_site)
+    index["sites"].sort(key=lambda entry: entry["site"])
+    index_path.write_text(json.dumps(index, sort_keys=True), encoding="utf-8")
+
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sites"] = sorted([*manifest["sites"], site])
+    artifacts = {
+        artifact["name"]: artifact for artifact in manifest["artifacts"]
+    }
+    for artifact_name in ["activation-index.json", *added_artifacts.values()]:
+        digest = _digest(run_dir / artifact_name)
+        artifacts[artifact_name] = {
+            "name": artifact_name,
+            "sha256": digest.sha256,
+            "size_bytes": digest.size_bytes,
+        }
+    manifest["artifacts"] = [artifacts[name] for name in sorted(artifacts)]
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    return added_artifacts
+
+
 def _mutate_activation_and_reseal(
     run_dir: Path, artifact_name: str, mutation
 ) -> None:
@@ -939,6 +975,41 @@ def test_run_reads_json_and_publishes_only_to_validated_output(
 
     with pytest.raises(FileExistsError):
         run(SimpleNamespace(config=config_path, output_dir=output_dir))
+
+
+def test_run_selects_one_site_from_strict_multi_site_collect_parents(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, runs = _strict_lineage_config(tmp_path, monkeypatch)
+    for run_dir, _ in runs.values():
+        _add_official_collect_site(run_dir, site="row_block_1")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    output_dir = tmp_path / "multi-site-output"
+
+    assert run(SimpleNamespace(config=config_path, output_dir=output_dir)) == 0
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sites"] == ["row_block_0"]
+
+
+def test_run_rejects_artifact_from_unselected_site_in_multi_site_parent(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, runs = _strict_lineage_config(tmp_path, monkeypatch)
+    run_dir, _ = runs["none"]
+    added_artifacts = _add_official_collect_site(run_dir, site="row_block_1")
+    training = config["training_by_condition"]
+    assert isinstance(training, dict)
+    none = training["none"]
+    assert isinstance(none, dict)
+    reference = none["train-a"]
+    assert isinstance(reference, dict)
+    reference["artifact"] = added_artifacts["train-a"]
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact site does not match"):
+        run(SimpleNamespace(config=config_path, output_dir=tmp_path / "output"))
 
 
 def test_run_rejects_relative_output_before_writing(tmp_path, monkeypatch) -> None:
