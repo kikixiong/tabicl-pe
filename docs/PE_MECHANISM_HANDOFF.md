@@ -70,6 +70,21 @@ or non-finite doses fail closed. Report
 the resulting operations as partial edits and never compare ablation and donor
 effect magnitudes as though those two families share one common dose.
 
+Exact analysis SHA `fd3b1d9addafc46533d1cb461e347f46ab2c8c96` passed the
+complete software/public gates, regenerated the identical target/control
+ranking with the dose amendment bound, and completed the one permitted
+eight-table RoPE-source to No-PE-recipient campaign on a non-H100 accelerator.
+All execution gates passed. The maximum full-edit decoded-dose ratio was 37.63
+and the maximum executed ratio was 1.000000064 with no amplification.
+
+The result is a credible exploratory negative. Ablation target-minus-control
+mean log loss was `-7.83e-4` (3/8 positive; descriptive exact `p=0.2422`).
+Donor target-minus-control mean log-loss improvement was `1.56e-4` (4/8
+positive; descriptive `p=0.5547`). Preserve the sanitized finding at
+`analysis/pe_mechanism/findings/whole-row-pca-dose-matched-exploratory-negative-v1.json`.
+Do not run the reverse direction or dense AE merely to search for a positive
+result; the stopping rule has fired.
+
 The analysis package is a descendant workstream. It must never be imported by
 or copied into a running exploratory training job. Every evidence run uses a
 clean, detached checkout of the exact training/model SHA and records the exact
@@ -139,18 +154,15 @@ study caps private activations at 30 GiB and stops new generation below a
 1. Preserve the verified whole-row artifacts and representation decision:
    PCA and dense AE qualify; Top-K SAE is rejected. Do not recollect
    activations or retrain these dictionaries.
-2. Commit and push the dose-amendment implementation, then regenerate the
-   existing 73-table ranking from a clean detached checkout so its manifest
-   binds the amendment digest. Confirm that the target and control coordinates
-   remain exactly `[0, 7, 5, 3]` and `[181, 502, 153, 310]`.
-3. Run one minimal RoPE-source to No-PE-recipient whole-row PCA campaign on the
-   fixed eight-table causal subset using a non-H100 accelerator. Verify no-op,
-   round-trip, per-call decoded-dose, donor-shift, lineage, and atomic-output
-   gates before aggregating target versus matched-control effects.
-4. If that campaign is null, stop the whole-row PCA branch with a credible
-   exploratory negative result. Run the reverse direction and dense AE only
-   if the PCA result is positive or otherwise scientifically decision-relevant;
-   never expand merely to search for a favorable result.
+2. Preserve the dose-amendment execution at exact SHA `fd3b1d9...`, its
+   unchanged target/control ranking and the completed eight-table aggregate.
+   Do not rerun or expand the whole-row PCA branch: it met the pre-declared
+   stopping condition for a credible exploratory negative.
+3. Do not run the reverse donor direction or dense AE on these legacy
+   checkpoints merely to search for a favorable result. Reopen either only for
+   a separately justified, outcome-independent question.
+4. Keep the sanitized finding and private aggregate content-bound; never
+   publish the raw predictions, checkpoint material, logs or machine paths.
 5. Treat the 36-table result as exploratory because the unsupervised
    representation dictionary was trained across all 109 discovery datasets;
    it is outcome-disjoint, not representation-level untouched.

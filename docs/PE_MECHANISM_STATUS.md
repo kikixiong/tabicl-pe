@@ -176,6 +176,31 @@ reported as dose-matched partial edits. The original split, target ranking, and
 random-control draw stay
 unchanged; the amendment is content-bound through ranking and causal manifests.
 
+The amendment implementation passed 390 mechanism regressions, Ruff, package
+build and the repository-wide public-history gate before direct push. A clean
+checkout of exact analysis SHA `fd3b1d9addafc46533d1cb461e347f46ab2c8c96`
+then regenerated the 73-table ranking. Targets, controls and all median scores
+were byte-for-byte identical to the original ranking, while the new manifest
+binds the amendment digest.
+
+The single pre-declared eight-table RoPE-source to No-PE-recipient campaign
+subsequently completed on a non-H100 accelerator. All recipient/source no-op,
+round-trip, alignment, lineage, per-call dose and atomic-output gates passed.
+Unequal full edits reached a symmetric decoded-dose ratio of 37.63; the maximum
+ratio actually executed after matching was 1.000000064, with no amplification.
+The maximum no-op probability difference was `6.38e-6` and maximum
+reconstruction MSE was `3.78e-13`.
+
+The causal result is a credible exploratory negative. Target ablation was not
+more damaging than matched-control ablation: macro target-minus-control mean
+log loss was `-7.83e-4`, median `-5.83e-4`, positive on 3/8 datasets, with
+descriptive exact sign-flip `p=0.2422`. Target donor patches were effectively
+indistinguishable from matched-control donor patches: mean log-loss improvement
+`1.56e-4`, median `2.25e-5`, positive on 4/8 datasets, descriptive
+`p=0.5547`. The reverse direction and dense AE are therefore not run merely to
+search for a positive result. The sanitized finding is recorded in
+`analysis/pe_mechanism/findings/whole-row-pca-dose-matched-exploratory-negative-v1.json`.
+
 A real released TabPFN v2.6 checkpoint is not locally available to this
 workstream. The mutable descendant tree now contains an offline official
 fixed-weight TALENT runner for `Wp+b`, `Wp`, `b`, and zero-position conditions,
@@ -185,23 +210,20 @@ and a clean TabPFN v7.1.1 checkout.
 
 Still required before a mechanistic claim:
 
-- complete one minimal A10 whole-row PCA run with the frozen per-call
-  dose-matched target/control edits. If it remains null against the matched
-  control, preserve the result as a credible exploratory negative and do not
-  expand this branch merely to search for a positive result;
-- only after a positive or otherwise decision-relevant PCA signal, test the
-  reverse donor direction and qualifying dense AE. The failed Top-K SAE is
-  ineligible, and restoring the same latent remains only a round-trip plumbing
-  control;
+- preserve the completed whole-row PCA result as a credible exploratory
+  negative; do not run the reverse donor direction or qualifying dense AE
+  merely to search for a positive result. The failed Top-K SAE remains
+  ineligible;
 - acquire and content-bind the licensed released TabPFN v2.6 checkpoint before
   running its registered positional-term decomposition;
 - obtain matched formal RoPE, Temporary and No-PE checkpoints before any
   validation selection or held-out TALENT/TabArena confirmation. The legacy
   pair cannot be promoted into that workflow.
 
-No mechanism result, sparse feature, downstream improvement, or efficiency
-gain is claimed at this stage.  Existing pilot checkpoints remain diagnostic
-and cannot be promoted to confirmatory three-arm evidence.
+No supported sparse feature, downstream improvement, or efficiency gain is
+claimed at this stage. The negative mechanism result is exploratory; existing
+pilot checkpoints remain diagnostic and cannot be promoted to confirmatory
+three-arm evidence.
 
 ## Acceptance gates
 

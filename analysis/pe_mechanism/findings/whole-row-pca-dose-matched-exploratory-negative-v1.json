@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "finding_id": "tabicl-step250k-whole-row-pca-dose-matched-exploratory-negative-v1",
+  "analysis": "exploratory-whole-row-pca-dose-matched-causal-aggregate",
+  "evidence_scope": "legacy-step250k-eight-table-exploratory",
+  "formal_claim": "forbidden",
+  "analysis_code_sha": "fd3b1d9addafc46533d1cb461e347f46ab2c8c96",
+  "model_code_sha": "2d44e7540ffd4ec6216aa0058970b1de1034aa1d",
+  "checkpoint_step": 250000,
+  "direction": "rope_to_none",
+  "representation": "whole-row-pca-512",
+  "target_features": [0, 7, 5, 3],
+  "control_features": [181, 502, 153, 310],
+  "dose_protocol_id": "tabicl-step250k-whole-row-causal-dose-amendment-v1",
+  "dose_protocol_sha256": "64c051a022260411ea70d4ce72341d5da881e1f2d78da33e8b944ddc453f424d",
+  "dose_mode": "per_call_decoded_rms_clip_to_smaller_without_amplification",
+  "dataset_roster": [
+    "autoUniv-au4-2500",
+    "electricity",
+    "company_bankruptcy_prediction",
+    "mfeat-fourier",
+    "microaggregation2",
+    "led7",
+    "rl",
+    "wine-quality-red"
+  ],
+  "dataset_count": 8,
+  "sample_count": 2048,
+  "private_input_manifest_set_sha256": "8912c7ffbc3c8e7b4580a0bdef8df68b5bfe25a0b8097e71cca1f54401b4a02c",
+  "private_campaign_sha256": "3ccfba589b2f884f24657bb8b4e06e5c52c2ab58fa78a1ad671a7c533503ca2a",
+  "private_aggregate_sha256": "479cde264d2e3e8e798df7eb962eb89e18a2abce31fd65c889850f7a4866d7ef",
+  "gates": {
+    "all_passed": true,
+    "actual_no_amplification_verified": true,
+    "maximum_full_edit_symmetric_dose_ratio": 37.62857757345781,
+    "maximum_executed_symmetric_dose_ratio": 1.0000000636533941,
+    "maximum_no_op_probability_difference": 6.377696990966797e-06,
+    "maximum_no_op_reconstruction_mse": 3.783279380952516e-13
+  },
+  "macro_dataset_level": {
+    "ablation_target_minus_control_mean_log_loss": {
+      "mean": -0.0007830857721186143,
+      "median": -0.0005827335288975689,
+      "positive_datasets": 3,
+      "negative_datasets": 5,
+      "two_sided_exact_sign_flip_p_descriptive": 0.2421875
+    },
+    "donor_target_minus_control_mean_log_loss_improvement": {
+      "mean": 0.00015568955511695566,
+      "median": 2.253913878005597e-05,
+      "positive_datasets": 4,
+      "negative_datasets": 4,
+      "two_sided_exact_sign_flip_p_descriptive": 0.5546875
+    }
+  },
+  "verdict": {
+    "pca_condition_specific_mechanism_supported": false,
+    "inference_enhancement_candidate": false,
+    "branch_action": "stop_without_reverse_direction_or_dense_ae_expansion",
+    "reason": "Dose-matched target ablation was not more damaging than its matched control, while target donor patches were tiny, evenly split in sign, and not distinguishable from matched-control donor patches."
+  },
+  "statistical_note": "Exact sign-flip values are descriptive only. The checkpoints are legacy exploratory pilots, and representation learning used all 109 discovery tables; this result cannot be promoted to a formal three-arm claim."
+}

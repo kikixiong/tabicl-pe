@@ -344,6 +344,18 @@ scoped instrumentation tests. Real TabPFN evidence must use the licensed,
 version-pinned checkpoint and strict `tabpfn-localize` provenance described
 above; synthetic adapter tests are not reported as benchmark evidence.
 
+## Recorded exploratory findings
+
+The matched-step legacy TabICLv2 whole-row PCA study is recorded in
+[`findings/whole-row-pca-dose-matched-exploratory-negative-v1.json`](findings/whole-row-pca-dose-matched-exploratory-negative-v1.json).
+After per-call target/control doses were matched without amplification, neither
+target ablation nor RoPE-to-No-PE target donor patches consistently exceeded
+their frozen matched controls across the eight-table causal roster. This is a
+credible exploratory negative for the selected PCA directions, not evidence
+that positional encoding is irrelevant and not a formal three-arm result. The
+pre-declared stopping rule therefore forbids expanding to the reverse direction
+or dense autoencoder merely to search for a positive result.
+
 ## Development tests
 
 Keep the environment, bytecode, and test caches outside the source tree. One
