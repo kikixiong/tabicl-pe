@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-from .adapters.base import ActivationRecord
+from .adapters.base import ACTIVATION_VECTOR_AXIS_NAMES, ActivationRecord
 from .adapters.tabicl import same_feature_group_map
 from .collect import (
     DEFAULT_MAX_PRIVATE_BYTES,
@@ -144,7 +144,7 @@ class _CoordinateReservoir:
             raise ValueError("call_index must be a non-negative integer")
         array = _to_numpy(values)
         if array.ndim < 2:
-            raise ValueError("captured activations must have an embedding axis")
+            raise ValueError("captured activations must have a vector axis")
         if any(dimension <= 0 for dimension in array.shape):
             raise ValueError("captured activation dimensions must be non-empty")
         if not np.issubdtype(array.dtype, np.number):
@@ -153,7 +153,7 @@ class _CoordinateReservoir:
             raise ValueError("captured activations must be finite")
         flattened = array.reshape(-1, array.shape[-1])
         if self.feature_dim is not None and flattened.shape[1] != self.feature_dim:
-            raise ValueError("activation embedding dimension changed across raw calls")
+            raise ValueError("activation vector dimension changed across raw calls")
         coordinate_dim = array.ndim - 1
         if self.coordinate_dim is not None and coordinate_dim != self.coordinate_dim:
             raise ValueError("activation rank changed across raw calls")
@@ -860,8 +860,11 @@ def _validate_activation_record(
         raise RuntimeError(
             "captured activation view differs from official call metadata"
         )
-    if not record.axis_names or record.axis_names[-1] != "embedding":
-        raise RuntimeError("captured activation must end in an embedding axis")
+    if (
+        not record.axis_names
+        or record.axis_names[-1] not in ACTIVATION_VECTOR_AXIS_NAMES
+    ):
+        raise RuntimeError("captured activation must end in a supported vector axis")
     for axis in record.axis_names:
         require_portable_identifier(axis, name="activation axis")
     array = _to_numpy(record.tensor)

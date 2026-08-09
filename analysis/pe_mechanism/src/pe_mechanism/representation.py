@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
+from .adapters.base import ACTIVATION_VECTOR_AXIS_NAMES
 from .identifiers import require_portable_identifier, require_public_label
 from .manifest import ArtifactDigest, InputDigest, RunManifest
 from .provenance import (
@@ -1899,8 +1900,10 @@ def _parse_official_collect_activation_index(
             raise ValueError("official collect sites must be unique")
         sites.append(site)
         axis_names = _portable_string_list(raw_site["axis_names"], name="axis_names")
-        if not axis_names or axis_names[-1] != "embedding":
-            raise ValueError("official collect site axes must end in embedding")
+        if not axis_names or axis_names[-1] not in ACTIVATION_VECTOR_AXIS_NAMES:
+            raise ValueError(
+                "official collect site axes must end in a supported vector axis"
+            )
         if len(set(axis_names)) != len(axis_names):
             raise ValueError("official collect site axes must be unique")
         raw_site_datasets = raw_site["datasets"]

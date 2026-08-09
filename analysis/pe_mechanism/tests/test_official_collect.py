@@ -63,6 +63,7 @@ def _strict_provenance(
     checkpoint: Path,
     dataset_manifest: Path,
     condition: str = "none",
+    site: str = "row_interactor.blocks.0",
 ) -> dict[str, object]:
     repository = tmp_path / "verified-source"
     repository.mkdir()
@@ -79,7 +80,7 @@ def _strict_provenance(
         "model_family": "tabicl-v2",
         "model_revision": "step-210000",
         "condition": condition,
-        "sites": ["row_interactor.blocks.0"],
+        "sites": [site],
         "checkpoint_path": str(checkpoint),
         "dataset_manifest_path": str(dataset_manifest),
         "training_code_root": str(repository),
@@ -102,6 +103,8 @@ class _FakeOfficialDriver:
         cache: object = None,
         fail_prediction: bool = False,
         extra_cls_tokens: int = 0,
+        site: str = "row_interactor.blocks.0",
+        row_vector_axis: str = "row_representation",
     ) -> None:
         raw = SimpleNamespace(
             _cache=cache,
@@ -126,24 +129,31 @@ class _FakeOfficialDriver:
         self.source_evidence_level = "strict"
         self.fail_prediction = fail_prediction
         self.extra_cls_tokens = extra_cls_tokens
+        self.site = site
+        self.row_vector_axis = row_vector_axis
         self.last_prediction_rows: int | None = None
 
     def predict_proba(self, X, *, y, sites, require_exact_baseline):
         if self.fail_prediction:
             raise RuntimeError("synthetic prediction failure")
         assert require_exact_baseline is True
-        assert tuple(sites) == ("row_interactor.blocks.0",)
+        assert tuple(sites) == (self.site,)
         rows = len(X)
         self.last_prediction_rows = rows
         labels = np.asarray(y, dtype=np.int64)
         probabilities = np.full((rows, 2), 0.15, dtype=np.float64)
         probabilities[np.arange(rows), labels] = 0.85
         token_count = 3 + self.extra_cls_tokens
-        activation = np.arange(
-            2 * (rows + 6) * token_count * 4, dtype=np.float32
-        ).reshape(
-            2, rows + 6, token_count, 4
-        )
+        if self.site == "row_interactor":
+            activation = np.arange(
+                2 * (rows + 6) * 16, dtype=np.float32
+            ).reshape(2, rows + 6, 16)
+            axis_names = ("table", "row", self.row_vector_axis)
+        else:
+            activation = np.arange(
+                2 * (rows + 6) * token_count * 4, dtype=np.float32
+            ).reshape(2, rows + 6, token_count, 4)
+            axis_names = ("table", "row", "feature_group_or_cls", "embedding")
         group_map = ((1, 2), (2, 0), (0, 1))
         metadata = OfficialForwardMetadata(
             call_index=0,
@@ -159,8 +169,8 @@ class _FakeOfficialDriver:
         )
         record = ActivationRecord(
             tensor=activation,
-            site="row_interactor.blocks.0",
-            axis_names=("table", "row", "feature_group_or_cls", "embedding"),
+            site=self.site,
+            axis_names=axis_names,
             shape=activation.shape,
             model_sha=self.model_sha,
             checkpoint_sha=self.checkpoint_sha,
@@ -174,7 +184,7 @@ class _FakeOfficialDriver:
             forward_calls=(
                 OfficialForwardCapture(
                     metadata=metadata,
-                    activations={"row_interactor.blocks.0": record},
+                    activations={self.site: record},
                 ),
             ),
             metrics=OfficialInferenceMetrics(
@@ -197,6 +207,8 @@ class _FakeFactory:
         fail_prediction: bool = False,
         mutate_after_load: Path | None = None,
         extra_cls_tokens: int = 0,
+        site: str = "row_interactor.blocks.0",
+        row_vector_axis: str = "row_representation",
     ) -> None:
         self.mode = mode
         self.feature_group = feature_group
@@ -204,6 +216,8 @@ class _FakeFactory:
         self.fail_prediction = fail_prediction
         self.mutate_after_load = mutate_after_load
         self.extra_cls_tokens = extra_cls_tokens
+        self.site = site
+        self.row_vector_axis = row_vector_axis
         self.fit_contexts: list[str] = []
         self.training_rows: list[int] = []
         self.estimator_options: list[dict[str, object]] = []
@@ -235,6 +249,8 @@ class _FakeFactory:
             cache=self.cache,
             fail_prediction=self.fail_prediction,
             extra_cls_tokens=self.extra_cls_tokens,
+            site=self.site,
+            row_vector_axis=self.row_vector_axis,
         )
         self.drivers.append(driver)
         return driver
@@ -248,6 +264,7 @@ def _write_config(
     max_classes: int = 10,
     condition: str = "none",
     n_classes: int = 2,
+    site: str = "row_interactor.blocks.0",
 ) -> tuple[Path, Path, Path, Path]:
     dataset = _write_talent_dataset(
         tmp_path / "talent", name="toy", n_classes=n_classes
@@ -277,6 +294,7 @@ def _write_config(
             checkpoint=checkpoint,
             dataset_manifest=dataset_manifest,
             condition=condition,
+            site=site,
         ),
     }
     config_path = tmp_path / "official-collect.json"
@@ -355,8 +373,18 @@ def test_official_collection_is_train_only_bounded_deterministic_and_path_free(
     assert all("/" not in item["role"] for item in manifest["inputs"])
 
 
+@pytest.mark.parametrize(
+    ("site", "vector_axis"),
+    [
+        ("row_interactor.blocks.0", "embedding"),
+        ("row_interactor", "row_representation"),
+    ],
+)
 def test_completed_official_collect_runs_feed_strict_representation_training(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+    vector_axis: str,
 ) -> None:
     talent_root = tmp_path / "talent"
     train_dataset = _write_talent_dataset(talent_root, name="train-a")
@@ -381,6 +409,7 @@ def test_completed_official_collect_runs_feed_strict_representation_training(
         checkpoint=checkpoint,
         dataset_manifest=dataset_manifest,
         condition="none",
+        site=site,
     )
     private_root = tmp_path / "private-study"
     private_root.mkdir()
@@ -405,8 +434,9 @@ def test_completed_official_collect_runs_feed_strict_representation_training(
         config_path.write_text(json.dumps(config), encoding="utf-8")
         output = private_root / f"official-{split}"
         index = run_official_collection(
-            config_path, output, driver_factory=_FakeFactory()
+            config_path, output, driver_factory=_FakeFactory(site=site)
         )
+        assert index["sites"][0]["axis_names"][-1] == vector_axis
         sources[split] = (output, index["sites"][0]["datasets"][0]["file"])
 
     representation_config = {
@@ -451,6 +481,29 @@ def test_completed_official_collect_runs_feed_strict_representation_training(
     assert metrics["source_lineage"]["source_kind"] == (
         "official_tabicl_bounded_activation_index"
     )
+
+
+def test_official_collection_rejects_an_unknown_terminal_vector_axis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, private_root, _dataset, _checkpoint = _write_config(
+        tmp_path,
+        monkeypatch,
+        site="row_interactor",
+    )
+    output = private_root / "invalid-vector-axis"
+
+    with pytest.raises(RuntimeError, match="supported vector axis"):
+        run_official_collection(
+            config,
+            output,
+            driver_factory=_FakeFactory(
+                site="row_interactor",
+                row_vector_axis="unknown_vector",
+            ),
+        )
+
+    assert not output.exists()
 
 
 def test_mixed_case_site_roster_uses_the_canonical_dataset_order(

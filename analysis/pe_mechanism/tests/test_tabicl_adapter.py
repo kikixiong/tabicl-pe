@@ -181,6 +181,11 @@ def test_capture_labels_axes_infers_groups_and_rejects_repeated_calls(prepared):
         "cls",
         "embedding",
     )
+    assert sites["row_interactor"].axis_names == (
+        "table",
+        "row",
+        "row_representation",
+    )
     requested = [
         "col_embedder",
         "row_interactor.tf_row.blocks.0.attn",

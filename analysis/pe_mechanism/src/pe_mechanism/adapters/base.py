@@ -9,6 +9,14 @@ from pathlib import Path
 from typing import Any, ContextManager
 
 
+# Activation analysis treats the final tensor dimension as one learned vector.
+# Most internal transformer sites call that axis ``embedding``.  TabICLv2's
+# complete RowInteraction output instead concatenates its CLS tokens and names
+# the resulting 512-wide axis ``row_representation``.  Keep those semantics
+# distinct while sharing the same vector-sampling and representation pipeline.
+ACTIVATION_VECTOR_AXIS_NAMES = frozenset({"embedding", "row_representation"})
+
+
 @dataclass(frozen=True)
 class ActivationSite:
     """A stable activation name and its documented tensor-axis semantics."""
