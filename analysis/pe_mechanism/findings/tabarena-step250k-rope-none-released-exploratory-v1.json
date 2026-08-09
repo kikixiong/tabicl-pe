@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "finding_id": "tabicl-step250k-tabarena-rope-none-released-exploratory-v1",
+  "study": "tabicl-step250k-tabarena-v0.1-classification",
+  "evidence_scope": "exploratory_same_step_pilot_plus_released_reference",
+  "formal_claim": "forbidden",
+  "formal_eligible": false,
+  "leaderboard_replication": false,
+  "protocol": {
+    "benchmark": "TabArena",
+    "suite_version": "v0.1",
+    "task_subset": "lite",
+    "problem_types": [
+      "binary",
+      "multiclass"
+    ],
+    "task_count": 38,
+    "result_count": 114,
+    "comparison_step": 250000,
+    "seed": 42,
+    "n_estimators": 1,
+    "ensemble_size": 1,
+    "augmentation": "none"
+  },
+  "coverage": {
+    "classification_roster": "complete",
+    "model_constraints_applied": false,
+    "tasks_above_500_native_features": [
+      "hiva_agnostic",
+      "kddcup09_appetency"
+    ]
+  },
+  "code_provenance": {
+    "analysis_code_sha": "7552aa4eded415affc4f8d8e4d4e13f26646bc7a",
+    "benchmark_code_sha": "c987d91556a14d4c9b3383c35d1b0ec68ff81883",
+    "model_code_sha": "2d44e7540ffd4ec6216aa0058970b1de1034aa1d",
+    "training_code_sha": "2d44e7540ffd4ec6216aa0058970b1de1034aa1d",
+    "dataset_roster_sha256": "3c26133c8b986aba530624b5c7a5dee42e4b29938bc09afa04f76b6462c4adf1",
+    "checkpoint_pair_manifest_sha256": "14a8c5069f1b6609ac5020caf9c544d98fb276b910028203912379e47b483447"
+  },
+  "checkpoint_digests": {
+    "rope_step250000": "8dd12abadc32ae57b30a2249696efb8e9081a3ea0db2cdd9807ffb150ffb15b3",
+    "none_step250000": "5251d99bc34109d5c9923d93d48c647f70d0c82bbd51557939d586c82779fac4",
+    "released_reference": "bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0"
+  },
+  "private_evidence_digests": {
+    "run_manifest_sha256": "811b9e7095aaa502826b383e2a63a7b9fb9c54b83a93e06e7d55724a7d7e780c",
+    "results_archive_sha256": "5aaced42b857a47e4aabc3a047df8b866617eecf74af2e93db8d45f9671e7877",
+    "runtime_summary_sha256": "ce2b10ed246fd38ec06af5b07bf4b56b3cc42273afa190358d8747d623109939",
+    "result_summary_sha256": "5caf9752f83f3dfa99ea13145dbbd4b4969915e8d2a933b4ff51f824d8839308"
+  },
+  "overall_mean_rank_lower_is_better": {
+    "released": 1.3421052631578947,
+    "none": 2.1842105263157894,
+    "rope": 2.473684210526316
+  },
+  "per_dataset_best_arm_counts": {
+    "released": 28,
+    "none": 6,
+    "rope": 4
+  },
+  "overall_scale_free_comparisons": [
+    {
+      "left_arm": "none",
+      "right_arm": "rope",
+      "left_wins": 24,
+      "right_wins": 14,
+      "ties": 0,
+      "two_sided_exact_sign_test_p": 0.14330665429588407
+    },
+    {
+      "left_arm": "released",
+      "right_arm": "rope",
+      "left_wins": 32,
+      "right_wins": 6,
+      "ties": 0,
+      "two_sided_exact_sign_test_p": 0.000024342560209333897
+    },
+    {
+      "left_arm": "released",
+      "right_arm": "none",
+      "left_wins": 31,
+      "right_wins": 7,
+      "ties": 0,
+      "two_sided_exact_sign_test_p": 0.00011616700794547796
+    }
+  ],
+  "metric_groups": {
+    "roc_auc": {
+      "dataset_count": 30,
+      "macro_mean_metric_error_lower_is_better": {
+        "released": 0.14662423936548735,
+        "none": 0.15487664770210266,
+        "rope": 0.15678775772688816
+      },
+      "none_vs_rope": {
+        "none_wins": 17,
+        "rope_wins": 13,
+        "ties": 0,
+        "mean_metric_error_improvement_for_none": 0.0019111100247855154,
+        "paired_bootstrap_95ci": [
+          -0.0013435696839581622,
+          0.00584491858091421
+        ],
+        "two_sided_exact_sign_test_p": 0.584664711728692
+      }
+    },
+    "log_loss": {
+      "dataset_count": 8,
+      "macro_mean_metric_error_lower_is_better": {
+        "released": 0.24395103860412232,
+        "none": 0.25094904648637706,
+        "rope": 0.2552569762
+      },
+      "none_vs_rope": {
+        "none_wins": 7,
+        "rope_wins": 1,
+        "ties": 0,
+        "mean_metric_error_improvement_for_none": 0.00430792976231395,
+        "paired_bootstrap_95ci": [
+          0.0002048260198678556,
+          0.009762766844412959
+        ],
+        "two_sided_exact_sign_test_p": 0.0703125
+      }
+    }
+  },
+  "verdict": {
+    "released_reference_outperforms_both_step250000_pilots_under_this_protocol": true,
+    "rope_benefit_at_step250000_supported": false,
+    "none_superiority_at_step250000_supported": false,
+    "none_exploratory_direction_is_better": true,
+    "inference_enhancement_candidate": false,
+    "reason": "No-PE beat RoPE on 24 of 38 tasks and had lower mean metric error in both metric groups, but the overall paired sign test was not significant and the run used legacy pilot checkpoints with a minimal non-leaderboard inference budget. The released reference clearly beat both pilots, so the step-250000 pair is not release-equivalent evidence.",
+    "next_action": "Do not tune on these 38 tasks. Repeat the frozen evaluation contract only when the matched formal RoPE, Temporary and No-PE checkpoints are available."
+  },
+  "statistical_note": "Cross-metric conclusions use only within-dataset ranks and wins. Raw error means and paired intervals are reported separately for ROC-AUC error and log loss. P-values are unadjusted exploratory summaries."
+}
