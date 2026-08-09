@@ -116,6 +116,13 @@ frozen in
 `analysis/pe_mechanism/protocols/whole-row-representation-v2.json`: full-rank
 PCA-512, dense AE-384 and an 8x Top-K SAE with `k=64`, with deterministic
 equal-per-dataset sampling and no tuning on the fidelity roster.
+The 109 discovery datasets are also frozen into 73 feature-ranking datasets and
+36 disjoint causal-test datasets by
+`analysis/pe_mechanism/protocols/whole-row-causal-split-v1.json`.  The
+representation dictionary may use all 109 datasets without labels or model
+outcomes, but target/control features may use only the 73-table ranking subset;
+causal effects are measured only on the 36-table test subset with pre-hashed
+sample rosters.
 
 A real released TabPFN v2.6 checkpoint is not locally available to this
 workstream. The mutable descendant tree now contains an offline official

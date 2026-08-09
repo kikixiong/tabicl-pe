@@ -119,10 +119,12 @@ study caps private activations at 30 GiB and stops new generation below a
    sampling. Reject a model if pooled or either-condition validation explained
    variance is below 95%; do not tune on the eight fidelity datasets.
 3. For every qualifying model, run live no-op reconstruction first. Then split
-   discovery datasets deterministically into ranking and causal-test subsets,
-   choose target and matched random features without using the causal-test
-   outcomes, and run target deletion plus RoPE-to-No-PE and No-PE-to-RoPE
-   independently sourced patches. Keep the pilot scope discovery-only.
+   discovery datasets exactly as frozen in
+   `whole-row-causal-split-v1.json`: 73 for feature ranking and 36 only for
+   causal testing. Choose target and matched random features without using the
+   causal-test outcomes, then run target deletion plus RoPE-to-No-PE and
+   No-PE-to-RoPE independently sourced patches on the pre-hashed sample
+   rosters. Keep the pilot scope discovery-only.
 4. Do not resume broad block-0/1 collection over large tables until capture
    metadata explicitly represents repeated internal chunk invocations. The
    completed small-roster block-level PCA negative remains valid.
