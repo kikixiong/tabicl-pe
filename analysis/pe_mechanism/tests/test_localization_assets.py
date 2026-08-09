@@ -15,6 +15,7 @@ from pe_mechanism.provenance import VerifiedConfiguration, load_verified_json_co
 PACKAGE_ROOT = Path(__file__).parents[1]
 EXAMPLE = PACKAGE_ROOT / "examples" / "localize-matched-step.example.json"
 WRAPPER = PACKAGE_ROOT / "scripts" / "slurm_fixed_weight_localization.sh"
+COLLECT_WRAPPER = PACKAGE_ROOT / "scripts" / "slurm_official_collect.sh"
 
 
 def _valid_wrapper_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
@@ -31,6 +32,7 @@ def _valid_wrapper_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
         "{\n"
         "  printf 'PYTHONNOUSERSITE=%s\\n' \"${PYTHONNOUSERSITE-}\"\n"
         "  printf 'PYTHONDONTWRITEBYTECODE=%s\\n' \"${PYTHONDONTWRITEBYTECODE-}\"\n"
+        "  printf 'PYTHONHASHSEED=%s\\n' \"${PYTHONHASHSEED-}\"\n"
         "  printf 'PYTHONPATH=%s\\n' \"${PYTHONPATH-}\"\n"
         "  printf 'ARG=%s\\n' \"$@\"\n"
         "} > \"$WRAPPER_CAPTURE\"\n",
@@ -121,6 +123,7 @@ def test_slurm_wrapper_has_fixed_resources_and_exact_invocation(tmp_path: Path) 
     assert capture.read_text(encoding="utf-8").splitlines() == [
         "PYTHONNOUSERSITE=1",
         "PYTHONDONTWRITEBYTECODE=1",
+        "PYTHONHASHSEED=0",
         (
             f"PYTHONPATH={environment['PE_ANALYSIS_ROOT']}/src:"
             f"{environment['PE_MODEL_ROOT']}/src"
@@ -129,6 +132,51 @@ def test_slurm_wrapper_has_fixed_resources_and_exact_invocation(tmp_path: Path) 
         "ARG=-m",
         "ARG=pe_mechanism",
         "ARG=localize",
+        "ARG=--config",
+        f"ARG={environment['PE_CONFIG']}",
+        "ARG=--output-dir",
+        f"ARG={environment['PE_OUTPUT_DIR']}",
+    ]
+
+
+def test_official_collect_wrapper_freezes_hash_seed_and_exact_invocation(
+    tmp_path: Path,
+) -> None:
+    text = COLLECT_WRAPPER.read_text(encoding="utf-8")
+    for directive in (
+        "#SBATCH --partition=h100",
+        "#SBATCH --qos=short",
+        "#SBATCH --time=01:00:00",
+        "#SBATCH --gres=gpu:1",
+        "#SBATCH --cpus-per-task=16",
+        "#SBATCH --mem=64G",
+    ):
+        assert directive in text
+    assert "export PYTHONHASHSEED=0" in text
+    assert "nvidia-smi" not in text
+    assert "git " not in text
+
+    environment, capture = _valid_wrapper_environment(tmp_path)
+    completed = subprocess.run(
+        ["bash", str(COLLECT_WRAPPER)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "PYTHONNOUSERSITE=1",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PYTHONHASHSEED=0",
+        (
+            f"PYTHONPATH={environment['PE_ANALYSIS_ROOT']}/src:"
+            f"{environment['PE_MODEL_ROOT']}/src"
+        ),
+        "ARG=-B",
+        "ARG=-m",
+        "ARG=pe_mechanism",
+        "ARG=official-collect",
         "ARG=--config",
         f"ARG={environment['PE_CONFIG']}",
         "ARG=--output-dir",

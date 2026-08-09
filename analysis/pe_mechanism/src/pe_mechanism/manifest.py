@@ -17,6 +17,7 @@ Command = Literal[
     "collect",
     "ablate",
     "localize",
+    "tabpfn-localize",
     "train-repr",
     "reconstruction-sensitivity",
     "model-causal",
@@ -29,6 +30,7 @@ _COMMANDS = {
     "collect",
     "ablate",
     "localize",
+    "tabpfn-localize",
     "train-repr",
     "reconstruction-sensitivity",
     "model-causal",
@@ -36,7 +38,8 @@ _COMMANDS = {
     "confirm-features",
 }
 _LEGACY_COMMANDS = (
-    _COMMANDS - {"localize", "select-features", "confirm-features"}
+    _COMMANDS
+    - {"localize", "tabpfn-localize", "select-features", "confirm-features"}
 ) | {
     "causal"
 }

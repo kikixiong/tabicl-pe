@@ -16,6 +16,7 @@ from pe_mechanism import cli
         ("official-collect", ".official_collect"),
         ("ablate", ".ablate"),
         ("localize", ".localization"),
+        ("tabpfn-localize", ".tabpfn_localization"),
         ("train-repr", ".representation"),
         ("reconstruction-sensitivity", ".causal"),
         ("model-causal", ".official_causal"),

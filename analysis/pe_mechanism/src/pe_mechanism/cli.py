@@ -18,6 +18,7 @@ _COMMAND_MODULES = {
     "official-collect": "official_collect",
     "ablate": "ablate",
     "localize": "localization",
+    "tabpfn-localize": "tabpfn_localization",
     "train-repr": "representation",
     "reconstruction-sensitivity": "causal",
     "model-causal": "official_causal",
@@ -51,6 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         "ablate": "Run component and positional-encoding ablations.",
         "localize": "Run matched-step fixed-weight PE localization.",
+        "tabpfn-localize": (
+            "Run official TabPFN v2.6 fixed-weight position localization."
+        ),
         "train-repr": "Train dense or sparse representation models.",
         "reconstruction-sensitivity": (
             "Run reconstruction-space sensitivity diagnostics; this is not a model causal test."

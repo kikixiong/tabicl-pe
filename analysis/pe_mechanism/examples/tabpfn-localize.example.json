@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "private_study_root": "/absolute/private/tabpfn-localization",
+  "datasets": [
+    {
+      "dataset_id": "placeholder-dataset",
+      "path": "/absolute/data/talent/placeholder-dataset",
+      "expected_input_sha256": {
+        "info.json": "1111111111111111111111111111111111111111111111111111111111111111",
+        "N_train.npy": "2222222222222222222222222222222222222222222222222222222222222222",
+        "N_val.npy": "3333333333333333333333333333333333333333333333333333333333333333",
+        "N_test.npy": "4444444444444444444444444444444444444444444444444444444444444444",
+        "y_train.npy": "5555555555555555555555555555555555555555555555555555555555555555",
+        "y_val.npy": "6666666666666666666666666666666666666666666666666666666666666666",
+        "y_test.npy": "7777777777777777777777777777777777777777777777777777777777777777"
+      }
+    }
+  ],
+  "roster_split": "discovery",
+  "evaluation_split": "val",
+  "trusted_pickle": false,
+  "seed": 42,
+  "max_classes": 10,
+  "device": "cuda",
+  "max_private_bytes": 32212254720,
+  "min_free_bytes": 21474836480,
+  "provenance": {
+    "model_family": "tabpfn-v2.6",
+    "model_revision": "v7.1.1",
+    "condition": "position-components",
+    "sites": [
+      "feature_positional_embedding"
+    ],
+    "checkpoint_path": "/absolute/checkpoints/tabpfn-v2.6-classifier-v2.6_default.ckpt",
+    "dataset_manifest_path": "/absolute/manifests/talent-discovery.json",
+    "training_code_root": "/absolute/source/tabpfn-v7.1.1",
+    "model_code_root": "/absolute/source/tabpfn-v7.1.1",
+    "analysis_code_root": "/absolute/source/tabicl-pe",
+    "expected_checkpoint_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+    "expected_dataset_manifest_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+    "expected_training_code_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected_model_code_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected_analysis_code_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "allow_exploratory_legacy": false
+  }
+}

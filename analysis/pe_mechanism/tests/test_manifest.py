@@ -130,6 +130,34 @@ def test_exploratory_legacy_downgrade_is_explicit() -> None:
     assert manifest.evidence_level == "exploratory_legacy"
 
 
+def test_tabpfn_localize_is_registered_only_for_strict_schema_v2() -> None:
+    manifest = make_manifest(
+        command="tabpfn-localize",
+        model_family="tabpfn-v2.6",
+        model_revision="v7.1.1",
+        condition="position-components",
+        sites=("feature_positional_embedding",),
+    )
+    assert manifest.command == "tabpfn-localize"
+
+    legacy = {
+        "schema_version": 1,
+        "command": "tabpfn-localize",
+        "model_family": "tabpfn-v2.6",
+        "model_revision": "v7.1.1",
+        "model_code_sha": GIT_SHA,
+        "checkpoint_sha256": HASH,
+        "dataset_manifest_sha256": HASH,
+        "configuration_sha256": HASH,
+        "condition": "position-components",
+        "sites": ["feature_positional_embedding"],
+        "seed": 42,
+        "created_at_utc": "2026-08-07T12:00:00Z",
+    }
+    with pytest.raises(ValueError, match="unsupported legacy command"):
+        LegacyRunManifest.from_dict(legacy)
+
+
 def test_manifest_writer_requires_actual_verified_inputs(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

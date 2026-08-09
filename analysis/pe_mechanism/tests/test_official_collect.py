@@ -453,6 +453,63 @@ def test_completed_official_collect_runs_feed_strict_representation_training(
     )
 
 
+def test_mixed_case_site_roster_uses_the_canonical_dataset_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    talent_root = tmp_path / "talent"
+    alpha = _write_talent_dataset(talent_root, name="Alpha")
+    beta = _write_talent_dataset(talent_root, name="beta")
+    checkpoint = tmp_path / "model.ckpt"
+    checkpoint.write_bytes(b"fixed checkpoint")
+    dataset_manifest = tmp_path / "datasets.json"
+    dataset_manifest.write_text(
+        json.dumps(
+            {
+                "assignments": [
+                    {"name": "Alpha", "split": "discovery"},
+                    {"name": "beta", "split": "discovery"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    private_root = tmp_path / "private-study"
+    private_root.mkdir()
+    config = {
+        "schema_version": 1,
+        "private_study_root": str(private_root),
+        "datasets": [
+            {"dataset_id": "beta", "path": str(beta)},
+            {"dataset_id": "Alpha", "path": str(alpha)},
+        ],
+        "roster_split": "discovery",
+        "evaluation_split": "val",
+        "seed": 42,
+        "max_vectors_per_dataset_site": 7,
+        "dtype": "float16",
+        "provenance": _strict_provenance(
+            tmp_path,
+            monkeypatch,
+            checkpoint=checkpoint,
+            dataset_manifest=dataset_manifest,
+            condition="none",
+        ),
+    }
+    config_path = tmp_path / "mixed-case.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    index = run_official_collection(
+        config_path,
+        private_root / "mixed-case",
+        driver_factory=_FakeFactory(),
+    )
+
+    canonical = ["Alpha", "beta"]
+    assert [item["dataset_id"] for item in index["datasets"]] == canonical
+    for site in index["sites"]:
+        assert [item["dataset_id"] for item in site["datasets"]] == canonical
+
+
 def test_official_collection_records_cls_extended_activation_shapes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

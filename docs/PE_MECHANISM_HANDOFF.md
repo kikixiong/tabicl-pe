@@ -24,9 +24,18 @@ included in the first representation comparison without a reliable matched
 checkpoint.
 
 The step-250000 pair belongs to the legacy pilot lineage and is discovery-only.
-Matched step-250000 downstream and mechanism runs have not yet been executed.
-A released TabPFN v2.6 checkpoint is not currently available locally, so its
-real-model experiments cannot begin until that checkpoint is acquired and
+Matched step-250000 localization has now been executed from pushed analysis
+commit `4b797135b655ee181647c84fed3df946f942f248`. The result localizes the strongest
+small loss effect to RowInteraction block 1 and uses block 0 as the site
+comparison; it does not establish a mechanism or an enhancement. Strict paired
+activation collection for both sites and both arms has also completed on eight
+discovery datasets. The first independent eight-dataset fidelity collection is
+quarantined: it exposed a mixed-case site-roster ordering bug and a
+process-hash-dependent normalization-view order, so strict representation
+alignment rejects it. Re-collect that roster only after the canonical ordering
+fix and hash-seed-frozen wrapper are pushed. A released TabPFN v2.6 checkpoint
+is not currently available locally, so its real-model experiments cannot begin
+until official license/access requirements are satisfied and the checkpoint is
 content-bound.
 
 The analysis package is a descendant workstream. It must never be imported by
@@ -95,26 +104,34 @@ study caps private activations at 30 GiB and stops new generation below a
 
 ## Ordered continuation
 
-1. From clean exact training and analysis SHAs, run matched step-250000
-   fixed-weight PE localization on the frozen discovery roster, then run
-   official activation collection on the selected discovery sites and prove
-   the complete collect-to-representation-to-live intervention path. The pilot
-   pair must never be used for validation or held-out claims.
-2. Run method-level ablations on the TALENT discovery roster and propose
+1. Commit and push the canonical mixed-case site-roster fix and the
+   `PYTHONHASHSEED=0` scheduled collector, then re-collect the independent
+   fidelity roster under that exact commit. Require the strict parser and every
+   cross-condition normalization view, shuffle, call index and sampled
+   coordinate to match before continuing. Never manually reorder an existing
+   index.
+2. Train shared PCA, dense-autoencoder, and top-k sparse-autoencoder
+   representations on the completed aligned Stable RoPE/No-PE block-1
+   activations, with block 0 as the matched site control. Use the corrected
+   validation-assigned activations only for the frozen reconstruction-fidelity
+   gate; do not select features or methods from them. The pilot pair must never
+   be used for validation or held-out mechanism claims.
+3. Run live method-level interventions on the TALENT discovery roster and
+   propose
    candidate latent features. The implemented validation workflow may freeze
    at most two candidates using candidate-level six-component tests and
-   Benjamini-Yekutieli correction; do not select sites or features from
-   held-out data.
-3. Train PCA, dense, and sparse representations on aligned Stable RoPE/No-PE
-   activations. Reject any coordinate or inference-contract mismatch.
-4. Run model interventions on every frozen validation dataset, including
+   Benjamini-Yekutieli correction only after matched formal checkpoints exist;
+   do not promote the exploratory pilot into that workflow.
+4. Reject any representation whose condition coordinates, official inference
+   contract, checkpoint lineage, or reconstruction-fidelity gate fails.
+5. With matched formal checkpoints, run model interventions on every frozen validation dataset, including
    dose-matched controls and the independently bound paired reverse patch. Do
    not use the word rescue unless all source-native/source-no-op and dose gates
    pass.
-5. Acquire and content-bind the released TabPFN v2.6 checkpoint, then run the
+6. Acquire and content-bind the released TabPFN v2.6 checkpoint, then run the
    registered `W p + b`, `W p`-only, `b`-only, and neither decomposition.
-6. Hash and externally pre-register the selected intervention, baseline,
+7. Hash and externally pre-register the selected intervention, baseline,
    controls, validation fingerprints, and held-out sample rosters. Then run the
    complete candidate-by-held-out-dataset Cartesian set and apply the frozen
    six-component intersection-union plus Holm confirmation rule.
-7. Publish only sanitized code, protocol, aggregate statistics, and provenance.
+8. Publish only sanitized code, protocol, aggregate statistics, and provenance.

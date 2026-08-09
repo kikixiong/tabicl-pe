@@ -4,13 +4,14 @@ This is an independent analysis package for studying how positional encodings
 affect TabICLv2 and TabPFN v2.6. It is deliberately separate from the immutable
 formal-training candidate and does not change the public `tabicl` API.
 
-The command-line interface exposes nine workflows:
+The command-line interface exposes ten workflows:
 
 ```text
 pe-mechanism collect          --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism official-collect --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism ablate           --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism localize         --config CONFIG.json --output-dir /absolute/external/run
+pe-mechanism tabpfn-localize  --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism train-repr       --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism reconstruction-sensitivity --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism model-causal     --config CONFIG.json --output-dir /absolute/external/run
@@ -27,7 +28,11 @@ a model. `localize` is the discovery-only fixed-weight TabICLv2 route for a
 content-verified, same-step Stable RoPE/No-PE pilot pair. It evaluates the
 native models alongside an explicit RoPE no-op, all-off, query-only, key-only,
 phase, frequency-band, and block-local conditions while keeping official
-preprocessing and inference paired. `reconstruction-sensitivity` is an
+preprocessing and inference paired. `tabpfn-localize` is the discovery-only
+official TabPFN v2.6 route. It fits one fixed-seed classifier on each TALENT
+training split and, without refitting, compares the native positional
+projection (`Wp+b`) with weight-only (`Wp`), bias-only (`b`), and zero-position
+conditions on validation rows. `reconstruction-sensitivity` is an
 activation-space diagnostic and is not a causal model result.
 
 `--output-dir` is always required. It must be an absolute path outside the Git
@@ -52,6 +57,50 @@ arrays, the paired official ensemble schedule, and a path-free runtime/version
 attestation. These fields make metrics independently recomputable without
 loading pickle-backed output artifacts.
 
+## Official TabPFN v2.6 fixed-weight localization
+
+Start from the fully placeholder-only
+[`examples/tabpfn-localize.example.json`](examples/tabpfn-localize.example.json).
+Replace every `/absolute/...` value and every placeholder hash. The example
+describes a numeric-only TALENT dataset; if a dataset has categorical arrays,
+also list every consumed `C_train.npy`, `C_val.npy`, and `C_test.npy` file and
+its precommitted SHA-256. The dataset manifest must assign the complete roster
+to `discovery`; this command fits `train`, evaluates `val`, and refuses the
+reserved test split.
+
+The run has external prerequisites that this repository cannot satisfy:
+
+- Read and accept the official
+  [TabPFN 2.6 non-commercial license](https://huggingface.co/Prior-Labs/tabpfn_2_6/blob/main/LICENSE)
+  before using the weights, and confirm that the intended use is permitted.
+- Follow the official
+  [gated-model access instructions](https://docs.priorlabs.ai/how-to-access-gated-models).
+  For token-based acquisition from a notebook or headless client, expose the
+  account API key as `TABPFN_TOKEN`; the documented manual download is an
+  alternative. Never place the token in a config, log, manifest, or Git
+  repository.
+- Acquire the v2.6 classifier checkpoint outside this workflow, place
+  `tabpfn-v2.6-classifier-v2.6_default.ckpt` locally, and record its measured
+  SHA-256 in the private config. The runner disables downloads and has no
+  fallback checkpoint, so a missing or mismatched file fails closed.
+- Use a clean checkout of the audited TabPFN `v7.1.1` source, bind its full Git
+  SHA in both training- and model-code provenance, and bind the clean analysis
+  checkout separately. A package with the same version label is not sufficient
+  provenance.
+
+For every dataset, the official estimator is fitted once on training rows with
+one ensemble member and a fixed random state. The same fitted estimator then
+produces paired `Wp+b`, `Wp`, `b`, and zero-position probabilities; the full
+policy must be byte-identical to native `predict_proba`, and every temporary
+hook must restore exactly. The private run publishes `predictions.npz`,
+`results.json`, `summary.json`, and `manifest.json` atomically. Predictions are
+stored as float32, labels as portable int64 class indices, and raw class values
+are never published: only their type and content hash are recorded. This is a
+component-localization experiment, not evidence that any component is a causal
+mechanism or that the result generalizes beyond the discovery roster.
+
+## Scheduled TabICL localization
+
 For one scheduled H100 run, use
 [`scripts/slurm_fixed_weight_localization.sh`](scripts/slurm_fixed_weight_localization.sh).
 It accepts only absolute paths through five environment variables and sets an
@@ -73,6 +122,16 @@ sbatch --chdir=/absolute/external/slurm-work \
 
 Supply scheduler stdout and stderr destinations externally if needed; the
 wrapper deliberately contains no machine-specific artifact or log path.
+
+For strict activation collection, use
+[`scripts/slurm_official_collect.sh`](scripts/slurm_official_collect.sh) with
+the same five environment variables. The bound TabICL revision constructs the
+normalization-view dictionary through a Python set, so separate condition
+processes can otherwise receive different view orders despite an equal model
+seed. The wrapper freezes `PYTHONHASHSEED=0`; `train-repr` additionally compares
+the actual normalization views, shuffles, call indices, and sampled coordinates
+and rejects any residual mismatch. Do not feed manually reordered indexes or
+activation shards into representation training.
 
 ## Provenance and privacy
 
@@ -238,9 +297,9 @@ parents, sample rosters, raw TALENT inputs, configurations, checkpoints, and
 Git evidence by digest; none of their filesystem paths are serialized.
 
 The TabPFN v2.6 adapter provides exact additive-position decomposition and
-scoped instrumentation tests. Real TabPFN evidence still requires a separately
-available, version-pinned released checkpoint; synthetic adapter tests are not
-reported as benchmark evidence.
+scoped instrumentation tests. Real TabPFN evidence must use the licensed,
+version-pinned checkpoint and strict `tabpfn-localize` provenance described
+above; synthetic adapter tests are not reported as benchmark evidence.
 
 ## Development tests
 

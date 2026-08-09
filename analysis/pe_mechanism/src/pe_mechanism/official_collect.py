@@ -960,7 +960,11 @@ def _assemble_index(
                 "site": site,
                 "axis_names": site_axes[site],
                 "datasets": sorted(
-                    site_datasets[site], key=lambda entry: str(entry["dataset_id"])
+                    site_datasets[site],
+                    key=lambda entry: (
+                        str(entry["dataset_id"]).casefold(),
+                        str(entry["dataset_id"]),
+                    ),
                 ),
             }
             for site in context.sites

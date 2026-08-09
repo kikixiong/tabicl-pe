@@ -41,11 +41,14 @@ Implemented and regression tested:
   and evaluates `W p + b`, `W p`, `b`, and neither on the same fitted model,
   with exact full/native and hook-restoration gates.
 
-The complete current v2 worktree regression is 1080 passed (2 skipped) for the
-root package and 323 passed for the mechanism package; Ruff also passes over
-the complete mechanism source and test trees. These are implementation checks,
-not scientific results. The exact tree must still be committed and pushed
-before a scheduled run can satisfy strict analysis-code provenance.
+The first immutable mechanism execution commit is
+`4b797135b655ee181647c84fed3df946f942f248`, pushed on
+`codex/pe-mechanism-sae-v2`. Before that push, the complete v2 worktree
+regression was 1080 passed (2 skipped) for the root package and 323 passed for
+the mechanism package; Ruff also passed over the complete mechanism source and
+test trees. These are implementation checks, not scientific results. New
+TabPFN runner work in the mutable descendant tree must receive a new commit and
+repeat the relevant gates before it can provide execution provenance.
 
 An exploratory Stable RoPE/No-PE checkpoint pair at exactly step 250000 has
 been copied and content-verified outside the repository. Both checkpoints load
@@ -65,26 +68,65 @@ complete official path:
   probability deviation `5.96e-7` and zero measured accuracy change.
 
 This verifies plumbing and provenance, not a positional mechanism. The matched
-step-250000 downstream evaluation and mechanism comparison have not yet been
-run. Their discovery-only runner and H100 Slurm wrapper are now implemented,
-but they do not become immutable evidence until this branch is committed,
-pushed, and executed from a clean exact checkout. A real released TabPFN v2.6
-checkpoint is not locally available to this workstream; its current coverage is
-the offline official driver and synthetic API tests, not a real-model result.
+step-250000 discovery localization has now also run from a clean checkout of
+the pushed analysis commit on eight TALENT datasets. The run and every stored
+prediction were independently re-hashed and the metrics were recomputed from
+the stored float32 probabilities. The native RoPE condition was byte-exact to
+the official baseline.
+
+The localization result is diagnostic rather than a win/loss claim. Disabling
+RoPE only in RowInteraction block 1 produced the clearest repeatable loss
+signal: mean log-loss effect versus native was about `-7.55e-4`, where negative
+means the intervention was worse. Block 0 was a useful matched comparison and
+block 2 was near-neutral. Several PE edits changed individual probabilities
+substantially while mean accuracy and log loss moved little. Native No-PE and
+RoPE were also close in aggregate on this small roster despite large prediction
+differences, so downstream scores alone do not explain the representation
+mechanism.
+
+Following that result, official activations were collected for block 1 and
+block 0 from both matched checkpoints. The strict runs cover eight discovery
+datasets, two sites, and two conditions. Every shard contains 8192 sampled
+128-dimensional vectors; paired RoPE/No-PE call indices and activation
+coordinates are exactly equal, and independent verification found no
+non-finite values or public-metadata path leakage.
+
+The first attempt to collect a second, disjoint eight-dataset roster for the
+representation-reconstruction fidelity gate completed numerically, but a
+strict parent parse correctly rejected it. Mixed-case dataset names exposed an
+index-ordering mismatch, and separate Python processes exposed hash-seed-driven
+reversal of the official normalization-view order. Those outputs are not
+admissible representation parents. The mutable descendant fixes canonical
+case-insensitive site ordering, supplies a scheduled collector that freezes
+`PYTHONHASHSEED=0`, and tests both invariants. The fidelity roster must be
+re-collected from the next pushed commit and pass the actual cross-condition
+schedule/alignment gate before AE/SAE training. This roster is used only for the
+pre-registered reconstruction gate, never to choose a site, feature,
+intervention, or claimed mechanism; the legacy checkpoint study remains
+`formal_eligible=false`.
+
+A real released TabPFN v2.6 checkpoint is not locally available to this
+workstream. The mutable descendant tree now contains an offline official
+fixed-weight TALENT runner for `Wp+b`, `Wp`, `b`, and zero-position conditions,
+but its real-model run remains gated on official license acceptance, token-based
+checkpoint access, content verification, a new clean pushed analysis commit,
+and a clean TabPFN v7.1.1 checkout.
 
 Still required before a mechanistic claim:
 
-- matched step-250000 downstream and mechanism runs from the verified Stable
-  RoPE/No-PE exploratory pair;
+- shared PCA, dense-autoencoder, and top-k sparse-autoencoder training at block
+  1 plus the block-0 site control, followed by discovery-only live model
+  interventions with matched random and reconstruction controls;
 - real independently sourced paired reverse-patch runs over the frozen
-  validation roster. Restoring the same latent is only a round-trip plumbing
-  control;
-- a pushed immutable descendant analysis SHA with its CPU regression and public
-  hygiene checks repeated; the immutable training SHA and its 12/12 H100 gate
-  are already established;
+  discovery roster for the exploratory pilot. Restoring the same latent is
+  only a round-trip plumbing control;
+- a new pushed immutable descendant analysis SHA for the TabPFN runner, with
+  its regression and public-hygiene checks repeated; the immutable training SHA
+  and its 12/12 H100 gate are already established;
 - actual validation selection, an externally pre-registered freeze, and the
   complete held-out TALENT confirmation run before any feature is called
-  replicated.
+  replicated; these confirmation stages require matched formal checkpoints and
+  cannot consume the legacy pilot as formal evidence.
 
 No mechanism result, sparse feature, downstream improvement, or efficiency
 gain is claimed at this stage.  Existing pilot checkpoints remain diagnostic
