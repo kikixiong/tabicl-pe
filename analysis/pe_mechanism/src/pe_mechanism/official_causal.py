@@ -4006,28 +4006,51 @@ def _validate_ranking_parent_input_schema(
         "rope",
     }:
         raise ValueError("ranking source collect lineage must contain none and rope")
-    claimed_collect: list[str] = []
+    collect_lineage_by_condition: dict[str, set[str]] = {}
     for condition in ("none", "rope"):
         values = raw_collect_lineage[condition]
-        if not isinstance(values, (list, tuple)) or len(values) != 1:
+        if not isinstance(values, (list, tuple)) or not values:
             raise ValueError(
-                "ranking requires exactly one collect parent per condition"
+                "ranking source lineage requires collect parents for each condition"
             )
-        claimed_collect.append(
+        normalized = tuple(
             _required_sha256_value(
-                values[0], name=f"ranking {condition} collect parent"
+                value, name=f"ranking {condition} collect parent"
             )
+            for value in values
         )
-    if len(set(claimed_collect)) != 2:
-        raise ValueError("ranking collect parents must be distinct")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(
+                "ranking source collect lineage must be unique per condition"
+            )
+        collect_lineage_by_condition[condition] = set(normalized)
+
     manifest_inputs = grouped["collect_manifest"]
-    if set(manifest_inputs) != set(claimed_collect):
+    if len(manifest_inputs) != 2:
         raise ValueError(
-            "ranking collect-manifest roles differ from representation lineage"
+            "ranking parent must select exactly one collect parent per condition"
         )
     if any(item.sha256 != suffix for suffix, item in manifest_inputs.items()):
         raise ValueError(
             "ranking collect-manifest role suffix differs from its file digest"
+        )
+    selected = set(manifest_inputs)
+    selected_by_condition = {
+        condition: selected & collect_lineage_by_condition[condition]
+        for condition in ("none", "rope")
+    }
+    if any(len(values) != 1 for values in selected_by_condition.values()):
+        raise ValueError(
+            "ranking parent must select exactly one registered collect parent "
+            "from each condition"
+        )
+    if set().union(*selected_by_condition.values()) != selected:
+        raise ValueError(
+            "ranking collect-manifest roles contain an unregistered parent"
+        )
+    if selected_by_condition["none"] & selected_by_condition["rope"]:
+        raise ValueError(
+            "ranking collect parent cannot belong to both conditions"
         )
     if set(grouped["collect_index"]) != set(manifest_inputs):
         raise ValueError(

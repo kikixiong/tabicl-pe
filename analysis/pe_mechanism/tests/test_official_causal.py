@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -36,6 +37,7 @@ from pe_mechanism.official_tabicl import (
 )
 from pe_mechanism.provenance import (
     VerifiedRunContext,
+    load_verified_run_manifest,
     verify_file,
     verify_git_tree,
     verify_run_directory,
@@ -2664,6 +2666,68 @@ def test_exploratory_ranking_rejects_outcome_or_unknown_parent_input(
             SimpleNamespace(config=fixture.config, output_dir=fixture.output)
         )
     assert not fixture.output.exists()
+
+
+def test_ranking_parent_schema_selects_one_discovery_collect_per_condition(
+    tmp_path: Path,
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    ranking = _enable_exploratory_ranking_paired(fixture, tmp_path)
+    parent = load_verified_run_manifest(ranking.ranking_dir / "manifest.json")
+    source_lineage = copy.deepcopy(fixture.source_lineage)
+    source_lineage["collect_parent_manifests_sha256"]["none"].append(
+        "1" * 64
+    )
+    source_lineage["collect_parent_manifests_sha256"]["rope"].append(
+        "2" * 64
+    )
+
+    official_causal._validate_ranking_parent_input_schema(
+        parent,
+        source_lineage=source_lineage,
+        ranking_dataset_count=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda lineage, selected: lineage[
+            "collect_parent_manifests_sha256"
+        ]["none"].remove(selected["none"]),
+        lambda lineage, selected: lineage[
+            "collect_parent_manifests_sha256"
+        ]["rope"].append(selected["none"]),
+    ],
+)
+def test_ranking_parent_schema_rejects_missing_or_ambiguous_condition_collect(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    ranking = _enable_exploratory_ranking_paired(fixture, tmp_path)
+    parent = load_verified_run_manifest(ranking.ranking_dir / "manifest.json")
+    source_lineage = copy.deepcopy(fixture.source_lineage)
+    selected = {
+        condition: values[0]
+        for condition, values in source_lineage[
+            "collect_parent_manifests_sha256"
+        ].items()
+    }
+    source_lineage["collect_parent_manifests_sha256"]["none"].append(
+        "1" * 64
+    )
+    source_lineage["collect_parent_manifests_sha256"]["rope"].append(
+        "2" * 64
+    )
+    mutation(source_lineage, selected)
+
+    with pytest.raises(ValueError, match="exactly one registered collect parent"):
+        official_causal._validate_ranking_parent_input_schema(
+            parent,
+            source_lineage=source_lineage,
+            ranking_dataset_count=1,
+        )
 
 
 def test_model_causal_paired_reverse_patch_rejects_resealed_bad_attestation(
