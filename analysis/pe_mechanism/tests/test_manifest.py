@@ -158,6 +158,19 @@ def test_tabpfn_localize_is_registered_only_for_strict_schema_v2() -> None:
         LegacyRunManifest.from_dict(legacy)
 
 
+def test_tabarena_evaluate_is_registered_with_explicit_exploratory_scope() -> None:
+    manifest = make_manifest(
+        command="tabarena-evaluate",
+        model_revision="step-250000-plus-released",
+        condition="tabarena-rope-none-released",
+        sites=("tabarena-v0.1-classification",),
+        evidence_level="exploratory_legacy",
+        legacy_reasons=("legacy_pilot_checkpoint",),
+    )
+    assert manifest.command == "tabarena-evaluate"
+    assert manifest.evidence_level == "exploratory_legacy"
+
+
 def test_manifest_writer_requires_actual_verified_inputs(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

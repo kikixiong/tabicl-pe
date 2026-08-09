@@ -24,6 +24,7 @@ Command = Literal[
     "model-causal",
     "select-features",
     "confirm-features",
+    "tabarena-evaluate",
 ]
 EvidenceLevel = Literal["strict", "exploratory_legacy"]
 
@@ -38,6 +39,7 @@ _COMMANDS = {
     "model-causal",
     "select-features",
     "confirm-features",
+    "tabarena-evaluate",
 }
 _LEGACY_COMMANDS = (
     _COMMANDS
@@ -47,6 +49,7 @@ _LEGACY_COMMANDS = (
         "rank-condition-shift",
         "select-features",
         "confirm-features",
+        "tabarena-evaluate",
     }
 ) | {
     "causal"

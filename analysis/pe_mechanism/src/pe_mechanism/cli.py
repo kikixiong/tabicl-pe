@@ -25,6 +25,7 @@ _COMMAND_MODULES = {
     "model-causal": "official_causal",
     "select-features": "feature_selection",
     "confirm-features": "confirmation",
+    "tabarena-evaluate": "tabarena_evaluation",
 }
 
 
@@ -71,6 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         "confirm-features": (
             "Confirm frozen features across the complete held-out roster."
+        ),
+        "tabarena-evaluate": (
+            "Evaluate a same-step TabICL pair and released reference on TabArena."
         ),
     }
     for command in _COMMAND_MODULES:

@@ -23,6 +23,7 @@ from pe_mechanism import cli
         ("model-causal", ".official_causal"),
         ("select-features", ".feature_selection"),
         ("confirm-features", ".confirmation"),
+        ("tabarena-evaluate", ".tabarena_evaluation"),
     ],
 )
 def test_cli_dispatches_to_lazy_workflow_module(

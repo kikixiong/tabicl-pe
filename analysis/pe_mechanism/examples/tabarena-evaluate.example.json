@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "study": {
+    "comparison_step": 250000,
+    "seed": 42,
+    "checkpoint_study": "exploratory_same_step_pilot",
+    "formal_eligible": false,
+    "task_subset": "lite",
+    "problem_types": [
+      "binary",
+      "multiclass"
+    ],
+    "device": "cuda",
+    "n_estimators": 1,
+    "augmentation": "none",
+    "ensemble_size": 1,
+    "cache_mode": "ignore",
+    "debug_mode": true,
+    "bootstrap_resamples": 10000,
+    "classifier_options": {
+      "norm_methods": [
+        "none",
+        "power"
+      ],
+      "feat_shuffle_method": "latin",
+      "class_shuffle_method": "shift",
+      "outlier_threshold": 4.0,
+      "softmax_temperature": 0.9,
+      "average_logits": true,
+      "support_many_classes": true,
+      "batch_size": 8,
+      "kv_cache": false,
+      "use_amp": "auto",
+      "use_fa3": false,
+      "offload_mode": "auto",
+      "verbose": false
+    }
+  },
+  "checkpoints": {
+    "pair_manifest_path": "/absolute/private/checkpoint-pair/SNAPSHOT_MANIFEST.json",
+    "expected_pair_manifest_sha256": "14a8c5069f1b6609ac5020caf9c544d98fb276b910028203912379e47b483447",
+    "pair_checksums_path": "/absolute/private/checkpoint-pair/SHA256SUMS",
+    "expected_pair_checksums_sha256": "f55d03a728ffb1c8e20f08227db654040261accce0803d65fbd84817dfca9889",
+    "none_path": "/absolute/private/checkpoint-pair/none-seed42-stage1-step-250000.ckpt",
+    "expected_none_sha256": "5251d99bc34109d5c9923d93d48c647f70d0c82bbd51557939d586c82779fac4",
+    "released_path": "/absolute/private/released-tabicl-reference.ckpt",
+    "expected_released_sha256": "bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0"
+  },
+  "benchmark": {
+    "tabarena_code_root": "/absolute/clean/tabarena",
+    "expected_tabarena_code_sha": "c987d91556a14d4c9b3383c35d1b0ec68ff81883",
+    "openml_cache_root": "/absolute/private/openml-cache",
+    "suite_version": "v0.1",
+    "expected_task_count": 38,
+    "expected_result_count": 114
+  },
+  "provenance": {
+    "model_family": "tabicl-v2",
+    "model_revision": "step-250000-plus-released",
+    "condition": "tabarena-rope-none-released",
+    "sites": [
+      "tabarena-v0.1-classification"
+    ],
+    "checkpoint_path": "/absolute/private/checkpoint-pair/rope-seed42-stage1-step-250000.ckpt",
+    "dataset_manifest_path": "/absolute/source/analysis/pe_mechanism/manifests/tabarena-v0.1-classification-roster.json",
+    "training_code_root": "/absolute/clean/tabicl-training",
+    "model_code_root": "/absolute/clean/tabicl-model",
+    "analysis_code_root": "/absolute/clean/tabicl-pe-analysis",
+    "expected_checkpoint_sha256": "8dd12abadc32ae57b30a2249696efb8e9081a3ea0db2cdd9807ffb150ffb15b3",
+    "expected_dataset_manifest_sha256": "3c26133c8b986aba530624b5c7a5dee42e4b29938bc09afa04f76b6462c4adf1",
+    "expected_training_code_sha": "2d44e7540ffd4ec6216aa0058970b1de1034aa1d",
+    "expected_model_code_sha": "2d44e7540ffd4ec6216aa0058970b1de1034aa1d",
+    "expected_analysis_code_sha": "3333333333333333333333333333333333333333",
+    "allow_exploratory_legacy": false
+  }
+}

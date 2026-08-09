@@ -4,7 +4,7 @@ This is an independent analysis package for studying how positional encodings
 affect TabICLv2 and TabPFN v2.6. It is deliberately separate from the immutable
 formal-training candidate and does not change the public `tabicl` API.
 
-The command-line interface exposes eleven workflows:
+The command-line interface exposes twelve workflows:
 
 ```text
 pe-mechanism collect          --config CONFIG.json --output-dir /absolute/external/run
@@ -18,6 +18,7 @@ pe-mechanism reconstruction-sensitivity --config CONFIG.json --output-dir /absol
 pe-mechanism model-causal     --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism select-features  --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism confirm-features --config CONFIG.json --output-dir /absolute/external/run
+pe-mechanism tabarena-evaluate --config CONFIG.json --output-dir /absolute/external/run
 ```
 
 `collect` is a low-level importer for already generated activation arrays.
@@ -35,6 +36,35 @@ training split and, without refitting, compares the native positional
 projection (`Wp+b`) with weight-only (`Wp`), bias-only (`b`), and zero-position
 conditions on validation rows. `reconstruction-sensitivity` is an
 activation-space diagnostic and is not a causal model result.
+
+`tabarena-evaluate` runs the complete 38-task TabArena v0.1 classification
+roster at split 0 for an exact-step RoPE/No-PE pilot pair and the released
+TabICL reference. All three systems use one estimator, seed 42, no added
+augmentation, the same explicit classifier settings, and no automatic model
+download. The workflow verifies the checkpoint pair, its checksum marker, all
+source revisions, and the public roster before constructing exactly 114 jobs.
+It writes a flat, atomically published private run containing per-task metrics,
+paired summaries, runtime provenance, and an archive of the freshly generated
+TabArena result cache. This is a same-budget exploratory comparison, not a
+leaderboard reproduction or a substitute for matched formal
+RoPE/Temporary/No-PE checkpoints. Start from
+[`examples/tabarena-evaluate.example.json`](examples/tabarena-evaluate.example.json)
+and schedule the full run with
+[`scripts/slurm_tabarena_evaluate.sh`](scripts/slurm_tabarena_evaluate.sh).
+Submit it from a private working directory and explicitly route both scheduler
+streams outside every source checkout; otherwise Slurm's default
+`slurm-<job>.out` would dirty the verified analysis tree before the program can
+start. For example:
+
+```bash
+sbatch --chdir=/absolute/private/slurm-work \
+  --output=/absolute/private/logs/tabarena-%j.out \
+  --error=/absolute/private/logs/tabarena-%j.err \
+  analysis/pe_mechanism/scripts/slurm_tabarena_evaluate.sh
+```
+
+Pass the four required `PE_*` variables with `--export` or from a private
+submit wrapper. Do not submit the public script directly from its checkout.
 
 `--output-dir` is always required. It must be an absolute path outside the Git
 source tree. Checkpoints, activations, predictions, logs, caches, and generated
