@@ -55,6 +55,10 @@ scheduler-log attestation after all nine allocations are successfully terminal.
 
 Evaluation and benchmark implementation are intentionally outside the formal
 training candidate. Do not add evaluation code to a training-protocol change.
+Mechanism work lives only on its descendant analysis branch under
+`analysis/pe_mechanism`; it must not be copied into an active training
+checkout. Read `docs/PE_MECHANISM_STATUS.md` and
+`docs/PE_MECHANISM_HANDOFF.md` before changing that workstream.
 
 Never commit cluster-specific paths, scheduler job identifiers, logs,
 checkpoints, raw predictions, telemetry exports, credentials, or personal

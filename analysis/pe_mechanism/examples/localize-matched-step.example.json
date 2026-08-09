@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "private_study_root": "/absolute/private/pe-localization",
+  "datasets": [
+        {
+            "dataset_id": "replace-with-talent-dataset",
+            "path": "/absolute/talent/replace-with-talent-dataset",
+            "expected_input_sha256": {
+                "info.json": "5555555555555555555555555555555555555555555555555555555555555555",
+                "N_train.npy": "6666666666666666666666666666666666666666666666666666666666666666",
+                "N_val.npy": "7777777777777777777777777777777777777777777777777777777777777777",
+                "N_test.npy": "8888888888888888888888888888888888888888888888888888888888888888",
+                "y_train.npy": "9999999999999999999999999999999999999999999999999999999999999999",
+                "y_val.npy": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "y_test.npy": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+        }
+  ],
+  "roster_split": "discovery",
+  "evaluation_split": "val",
+  "trusted_pickle": false,
+  "seed": 42,
+  "max_classes": 10,
+    "device": "cuda",
+    "estimator_options": {
+        "n_estimators": 2,
+        "batch_size": 2,
+        "use_amp": false,
+        "use_fa3": false,
+        "random_state": 42
+    },
+  "max_private_bytes": 32212254720,
+  "min_free_bytes": 21474836480,
+  "checkpoint_study": "exploratory_pilot",
+  "comparison_step": 250000,
+  "rope_conditions": [
+    {
+      "name": "full"
+    },
+    {
+      "name": "all_off",
+      "rotate_queries": false,
+      "rotate_keys": false
+    },
+    {
+      "name": "q_only",
+      "rotate_queries": true,
+      "rotate_keys": false
+    },
+    {
+      "name": "k_only",
+      "rotate_queries": false,
+      "rotate_keys": true
+    },
+    {
+      "name": "phase_half",
+      "phase_strength": 0.5
+    },
+    {
+            "name": "keep_low_only",
+            "frequency_band": "low"
+        },
+        {
+            "name": "keep_high_only",
+            "frequency_band": "high"
+    },
+    {
+      "name": "block_0_off",
+      "blocks": [
+        0
+      ],
+      "rotate_queries": false,
+      "rotate_keys": false
+    },
+    {
+      "name": "block_1_off",
+      "blocks": [
+        1
+      ],
+      "rotate_queries": false,
+      "rotate_keys": false
+    },
+    {
+      "name": "block_2_off",
+      "blocks": [
+        2
+      ],
+      "rotate_queries": false,
+      "rotate_keys": false
+    }
+  ],
+  "secondary_checkpoint_path": "/absolute/checkpoints/none-step-250000.ckpt",
+  "expected_secondary_checkpoint_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "snapshot_manifest_path": "/absolute/manifests/matched-step-250000.json",
+  "expected_snapshot_manifest_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+  "provenance": {
+    "model_family": "tabicl-v2",
+    "model_revision": "replace-with-pilot-source-sha",
+    "condition": "matched-step-rope-none",
+    "sites": [
+      "row_interactor.tf_row.blocks.0",
+      "row_interactor.tf_row.blocks.1",
+      "row_interactor.tf_row.blocks.2"
+    ],
+    "checkpoint_path": "/absolute/checkpoints/rope-step-250000.ckpt",
+    "expected_checkpoint_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "dataset_manifest_path": "/absolute/manifests/talent-discovery.json",
+    "expected_dataset_manifest_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    "training_code_root": "/absolute/src/pilot-tabicl",
+    "model_code_root": "/absolute/src/pilot-tabicl",
+    "analysis_code_root": "/absolute/src/tabicl-pe-mechanism-v2",
+    "expected_training_code_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected_model_code_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected_analysis_code_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "allow_exploratory_legacy": false
+  }
+}

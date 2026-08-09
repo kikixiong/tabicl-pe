@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.26.1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tabfm-pe-mechanism"
+version = "0.1.0"
+description = "Reproducible positional-encoding mechanism analysis for tabular foundation models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+pe-mechanism = "pe_mechanism.cli:main"
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src/pe_mechanism", "README.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pe_mechanism"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# Ruff 0.16 broadened its implicit defaults substantially. Keep this package's
+# correctness baseline explicit so a tool upgrade cannot silently redefine CI.
+select = ["E4", "E7", "E9", "F"]

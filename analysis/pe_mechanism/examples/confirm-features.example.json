@@ -1,0 +1,67 @@
+{
+  "provenance": {
+    "model_family": "tabicl-v2",
+    "model_revision": "replace-with-formal-training-sha",
+    "condition": "none",
+    "sites": [
+      "row_interactor"
+    ],
+    "checkpoint_path": "/absolute/checkpoints/recipient-stage3.ckpt",
+    "dataset_manifest_path": "/absolute/manifests/mechanism-dataset-split.json",
+    "training_code_root": "/absolute/src/tabicl-pe",
+    "model_code_root": "/absolute/src/tabicl-pe",
+    "analysis_code_root": "/absolute/src/tabicl-pe"
+  },
+  "selection_run_dir": "/absolute/runs/selection/frozen-run",
+  "expected_selection_manifest_sha256": "abababababababababababababababababababababababababababababababab",
+  "heldout_runs": [
+    {
+      "candidate_id": "candidate-row-feature-0001",
+      "dataset_id": "heldout-dataset-01",
+      "run_dir": "/absolute/runs/heldout/candidate-row-feature-0001/dataset-01",
+      "expected_manifest_sha256": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "candidate_id": "candidate-row-feature-0001",
+      "dataset_id": "heldout-dataset-02",
+      "run_dir": "/absolute/runs/heldout/candidate-row-feature-0001/dataset-02",
+      "expected_manifest_sha256": "0202020202020202020202020202020202020202020202020202020202020202"
+    },
+    {
+      "candidate_id": "candidate-row-feature-0001",
+      "dataset_id": "heldout-dataset-03",
+      "run_dir": "/absolute/runs/heldout/candidate-row-feature-0001/dataset-03",
+      "expected_manifest_sha256": "0303030303030303030303030303030303030303030303030303030303030303"
+    },
+    {
+      "candidate_id": "candidate-row-feature-0001",
+      "dataset_id": "heldout-dataset-04",
+      "run_dir": "/absolute/runs/heldout/candidate-row-feature-0001/dataset-04",
+      "expected_manifest_sha256": "0404040404040404040404040404040404040404040404040404040404040404"
+    },
+    {
+      "candidate_id": "candidate-row-feature-0001",
+      "dataset_id": "heldout-dataset-05",
+      "run_dir": "/absolute/runs/heldout/candidate-row-feature-0001/dataset-05",
+      "expected_manifest_sha256": "0505050505050505050505050505050505050505050505050505050505050505"
+    },
+    {
+      "candidate_id": "candidate-row-feature-0001",
+      "dataset_id": "heldout-dataset-06",
+      "run_dir": "/absolute/runs/heldout/candidate-row-feature-0001/dataset-06",
+      "expected_manifest_sha256": "0606060606060606060606060606060606060606060606060606060606060606"
+    },
+    {
+      "candidate_id": "candidate-row-feature-0001",
+      "dataset_id": "heldout-dataset-07",
+      "run_dir": "/absolute/runs/heldout/candidate-row-feature-0001/dataset-07",
+      "expected_manifest_sha256": "0707070707070707070707070707070707070707070707070707070707070707"
+    },
+    {
+      "candidate_id": "candidate-row-feature-0001",
+      "dataset_id": "heldout-dataset-08",
+      "run_dir": "/absolute/runs/heldout/candidate-row-feature-0001/dataset-08",
+      "expected_manifest_sha256": "0808080808080808080808080808080808080808080808080808080808080808"
+    }
+  ]
+}

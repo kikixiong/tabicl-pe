@@ -1,0 +1,55 @@
+name: pe-mechanism
+
+permissions:
+  contents: read
+
+on:
+  push:
+    paths:
+      - "analysis/pe_mechanism/**"
+      - "docs/PE_MECHANISM_*.md"
+      - "experiments/PE_MECHANISM_SAE.md"
+      - "tests/test_public_candidate_hygiene.py"
+      - ".github/workflows/pe-mechanism.yml"
+  pull_request:
+    paths:
+      - "analysis/pe_mechanism/**"
+      - "docs/PE_MECHANISM_*.md"
+      - "experiments/PE_MECHANISM_SAE.md"
+      - "tests/test_public_candidate_hygiene.py"
+      - ".github/workflows/pe-mechanism.yml"
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Public-history hygiene compares the candidate with an immutable
+          # baseline commit, so the default single-commit checkout is insufficient.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install analysis package
+        run: |
+          python -m pip install -e ".[test]"
+          python -m pip install -e "analysis/pe_mechanism[test]"
+          python -m pip install "ruff==0.16.1"
+      - name: Run static checks
+        run: python -m ruff check analysis/pe_mechanism/src analysis/pe_mechanism/tests
+      - name: Run analysis tests
+        run: python -m pytest -q analysis/pe_mechanism/tests
+      - name: Check public history and artifact hygiene
+        env:
+          TABICL_CANDIDATE_SHA: HEAD
+        run: python -m pytest -q tests/test_public_candidate_hygiene.py
+      - name: Build wheel and source archive
+        run: |
+          python -m pip install build
+          python -m build analysis/pe_mechanism --outdir "${{ runner.temp }}/dist"

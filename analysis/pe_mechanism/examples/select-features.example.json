@@ -1,0 +1,175 @@
+{
+  "provenance": {
+    "model_family": "tabicl-v2",
+    "model_revision": "replace-with-formal-training-sha",
+    "condition": "none",
+    "sites": [
+      "row_interactor"
+    ],
+    "checkpoint_path": "/absolute/checkpoints/recipient-stage3.ckpt",
+    "dataset_manifest_path": "/absolute/manifests/mechanism-dataset-split.json",
+    "training_code_root": "/absolute/src/tabicl-pe",
+    "model_code_root": "/absolute/src/tabicl-pe",
+    "analysis_code_root": "/absolute/src/tabicl-pe"
+  },
+  "selection": {
+    "metric": "mean_delta_log_loss_vs_no_op",
+    "direction": "target_greater_than_matched_control",
+    "fdr_alpha": 0.05,
+    "confidence_level": 0.95,
+    "bootstrap_resamples": 10000,
+    "sign_flip_resamples": 100000,
+    "random_seed": 42,
+    "minimum_validation_datasets": 8,
+    "minimum_positive_fraction": 0.75,
+    "maximum_selections": 1,
+    "ranking_rule": "maximum_minimum_mean_evidence",
+    "evidence_family": [
+      {
+        "name": "target_damage",
+        "metric": "mean_delta_log_loss_vs_no_op",
+        "direction": "positive",
+        "scope": "candidate"
+      },
+      {
+        "name": "ablation_specificity",
+        "metric": "target_minus_matched_control_mean_delta_log_loss_vs_no_op",
+        "direction": "positive",
+        "scope": "candidate"
+      },
+      {
+        "name": "donor_rescue",
+        "metric": "mean_log_loss_improvement_vs_recipient_no_op",
+        "direction": "positive",
+        "scope": "candidate"
+      },
+      {
+        "name": "donor_specificity",
+        "metric": "mean_log_loss_improvement_vs_paired_matched_random_patch",
+        "direction": "positive",
+        "scope": "candidate"
+      },
+      {
+        "name": "source_advantage",
+        "metric": "intersection_source_native_and_no_op_advantage",
+        "direction": "both_positive",
+        "scope": "global"
+      }
+    ],
+    "paired_source_direction": {
+      "source_condition": "rope",
+      "recipient_condition": "none"
+    },
+    "maximum_symmetric_donor_shift_rms_ratio": 1.25,
+    "multiplicity_method": "benjamini-yekutieli"
+  },
+  "candidates": [
+    {
+      "candidate_id": "candidate-row-feature-0001",
+      "target_features": [
+        1
+      ],
+      "control_features": [
+        101
+      ],
+      "latent_baseline": 0.0,
+      "validation_runs": [
+        {
+          "dataset_id": "validation-dataset-01",
+          "run_dir": "/absolute/runs/validation/candidate-row-feature-0001/dataset-01",
+          "expected_manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "dataset_id": "validation-dataset-02",
+          "run_dir": "/absolute/runs/validation/candidate-row-feature-0001/dataset-02",
+          "expected_manifest_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        {
+          "dataset_id": "validation-dataset-03",
+          "run_dir": "/absolute/runs/validation/candidate-row-feature-0001/dataset-03",
+          "expected_manifest_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        {
+          "dataset_id": "validation-dataset-04",
+          "run_dir": "/absolute/runs/validation/candidate-row-feature-0001/dataset-04",
+          "expected_manifest_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        {
+          "dataset_id": "validation-dataset-05",
+          "run_dir": "/absolute/runs/validation/candidate-row-feature-0001/dataset-05",
+          "expected_manifest_sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+        },
+        {
+          "dataset_id": "validation-dataset-06",
+          "run_dir": "/absolute/runs/validation/candidate-row-feature-0001/dataset-06",
+          "expected_manifest_sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+        },
+        {
+          "dataset_id": "validation-dataset-07",
+          "run_dir": "/absolute/runs/validation/candidate-row-feature-0001/dataset-07",
+          "expected_manifest_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+        },
+        {
+          "dataset_id": "validation-dataset-08",
+          "run_dir": "/absolute/runs/validation/candidate-row-feature-0001/dataset-08",
+          "expected_manifest_sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+        }
+      ]
+    }
+  ],
+  "heldout": {
+    "sample_rosters": [
+      {
+        "dataset_id": "heldout-dataset-01",
+        "sample_roster_path": "/absolute/rosters/heldout-dataset-01.json",
+        "expected_sample_roster_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "dataset_id": "heldout-dataset-02",
+        "sample_roster_path": "/absolute/rosters/heldout-dataset-02.json",
+        "expected_sample_roster_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      {
+        "dataset_id": "heldout-dataset-03",
+        "sample_roster_path": "/absolute/rosters/heldout-dataset-03.json",
+        "expected_sample_roster_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      {
+        "dataset_id": "heldout-dataset-04",
+        "sample_roster_path": "/absolute/rosters/heldout-dataset-04.json",
+        "expected_sample_roster_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      {
+        "dataset_id": "heldout-dataset-05",
+        "sample_roster_path": "/absolute/rosters/heldout-dataset-05.json",
+        "expected_sample_roster_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      {
+        "dataset_id": "heldout-dataset-06",
+        "sample_roster_path": "/absolute/rosters/heldout-dataset-06.json",
+        "expected_sample_roster_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "dataset_id": "heldout-dataset-07",
+        "sample_roster_path": "/absolute/rosters/heldout-dataset-07.json",
+        "expected_sample_roster_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "dataset_id": "heldout-dataset-08",
+        "sample_roster_path": "/absolute/rosters/heldout-dataset-08.json",
+        "expected_sample_roster_sha256": "1212121212121212121212121212121212121212121212121212121212121212"
+      }
+    ],
+    "confirmation": {
+      "alpha": 0.05,
+      "confidence_level": 0.95,
+      "sign_flip_resamples": 100000,
+      "bootstrap_resamples": 10000,
+      "minimum_positive_fraction": 0.75,
+      "multiplicity_method": "holm",
+      "minimum_heldout_datasets": 8,
+      "random_seed": 42,
+      "bootstrap_method": "paired-dataset-bootstrap"
+    }
+  }
+}
