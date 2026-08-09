@@ -16,7 +16,10 @@ from torch import nn
 
 import pe_mechanism.official_causal as official_causal
 from pe_mechanism.adapters.tabicl import TabICLAdapter
-from pe_mechanism.causal import model_decoder_feature_norms
+from pe_mechanism.causal import (
+    model_decoder_feature_norms,
+    raw_space_decoder_feature_norms,
+)
 from pe_mechanism.manifest import (
     ArtifactDigest,
     FileDigest,
@@ -1160,6 +1163,7 @@ def _workflow_fixture(tmp_path: Path) -> SimpleNamespace:
         transaction_ledger=transaction_ledger,
         config=config,
         output=tmp_path / "published-model-causal",
+        recipient_condition="temporary",
     )
 
 
@@ -1189,7 +1193,7 @@ def _install_workflow_fakes(
             command=command,
             model_family="tabicl-v2",
             model_revision="step-210000",
-            condition="temporary",
+            condition=fixture.recipient_condition,
             sites=("row_interactor",),
             seed=seed,
             additional_input_paths=additional_input_paths,
@@ -1199,7 +1203,7 @@ def _install_workflow_fakes(
             inputs=verified,
             model_family="tabicl-v2",
             model_revision="step-210000",
-            condition="temporary",
+            condition=fixture.recipient_condition,
             sites=("row_interactor",),
         )
 
@@ -1227,7 +1231,9 @@ def _install_workflow_fakes(
                     "minimum_explained_variance": 0.95,
                     "validation_by_condition": {
                         condition: dict(metrics)
-                        for condition in ("rope", "temporary")
+                        for condition in fixture.source_lineage[
+                            "condition_checkpoints_sha256"
+                        ]
                     },
                     "worst_condition_explained_variance": 0.99,
                     "native_score_gate": "pending",
@@ -1441,6 +1447,404 @@ def _enable_validation_paired_reverse_patch(
         json.dumps(config, sort_keys=True), encoding="utf-8"
     )
     return attestation
+
+
+def _enable_exploratory_ranking_paired(
+    fixture: SimpleNamespace, tmp_path: Path
+) -> SimpleNamespace:
+    fixture.recipient_condition = "none"
+    source_lineage = json.loads(json.dumps(fixture.source_lineage))
+    source_lineage["condition_checkpoints_sha256"]["none"] = (
+        source_lineage["condition_checkpoints_sha256"].pop("temporary")
+    )
+    source_lineage["collect_parent_manifests_sha256"]["none"] = (
+        source_lineage["collect_parent_manifests_sha256"].pop("temporary")
+    )
+    fixture.source_lineage = source_lineage
+
+    roster = tmp_path / "pilot-ranking-roster.json"
+    roster.write_text(
+        json.dumps(
+            {
+                "dataset_id": "pilot-dataset",
+                "split": "val",
+                "row_indices": [0],
+                "sample_ids": ["pilot-0"],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    roster_digest = verify_file(roster).digest
+    split_protocol = tmp_path / "whole-row-causal-split.json"
+    split_protocol.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "protocol_id": "toy-whole-row-split",
+                "feature_ranking_datasets": ["ranking-dataset"],
+                "causal_test_datasets": ["pilot-dataset"],
+                "causal_sample_protocol": {
+                    "split": "val",
+                    "maximum_rows_per_dataset": 1,
+                    "selection": "Use the frozen validation row.",
+                    "sample_roster_sha256_by_dataset": {
+                        "pilot-dataset": roster_digest.sha256
+                    },
+                    "sample_count_by_dataset": {"pilot-dataset": 1},
+                },
+                "feature_protocol": {
+                    "target_count": 1,
+                    "score": (
+                        "median across feature-ranking datasets of RMS "
+                        "RoPE-minus-No-PE latent difference times "
+                        "decoder-direction norm divided by raw activation RMS"
+                    ),
+                    "minimum_nonzero_ranking_datasets": 1,
+                    "matched_control": (
+                        "activation-frequency and log-decoder-norm "
+                        "nearest-neighbour pool of size 1, sampled once with "
+                        "seed 42 without replacement"
+                    ),
+                    "same_features_both_directions": True,
+                },
+                "causal_protocol": {
+                    "directions": ["rope_to_none", "none_to_rope"],
+                    "maximum_symmetric_donor_shift_rms_ratio": 1.25,
+                    "checkpoint_scope": "exploratory_pilot",
+                    "formal_claim": "forbidden",
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    split_digest = verify_file(split_protocol).digest
+    parent = verify_run_directory(fixture.parent_dir)
+    parent_manifest_digest = verify_file(
+        fixture.parent_dir / "manifest.json"
+    ).digest
+    representation_digest = verify_file(fixture.representation).digest
+    model = ExactOvercompleteAutoencoder()
+    normalizer = MeanRMSNormalizer(torch.zeros(1), torch.ones(1))
+    decoder_norms = (
+        raw_space_decoder_feature_norms(model, normalizer)
+        .cpu()
+        .numpy()
+    )
+    median_scores = np.asarray([3.0, 2.0, 1.0], dtype=np.float64)
+    nonzero_counts = np.asarray([1, 1, 1], dtype=np.int64)
+    activation_frequencies = np.asarray([0.5, 0.5, 0.1], dtype=np.float64)
+    ranking_protocol = {
+        "dataset_ids": ["ranking-dataset"],
+        "minimum_nonzero_datasets": 1,
+        "target_count": 1,
+        "random_candidate_pool_size": 1,
+        "random_seed": 42,
+        "activation_frequency_threshold": 1e-8,
+        "decoder_norm_space": "raw_activation_after_denormalize",
+        "latent_baseline": 0.0,
+        "same_features_both_directions": True,
+    }
+    activation_files = {}
+    activation_binding = {}
+    for condition in ("none", "rope"):
+        path = tmp_path / f"ranking-{condition}-activation.npz"
+        path.write_bytes(f"verified-{condition}-activation".encode())
+        activation_files[condition] = path
+        activation_binding[condition] = {
+            "ranking-dataset": verify_file(path).digest.sha256
+        }
+    top_features = [
+        {
+            "feature": index,
+            "score": float(median_scores[index]),
+            "nonzero_dataset_count": int(nonzero_counts[index]),
+        }
+        for index in range(3)
+    ]
+    selection = {
+        "schema_version": 1,
+        "analysis": "exploratory-condition-shift-ranking",
+        "evidence_scope": "exploratory-pilot",
+        "formal_claim": "forbidden",
+        "site": "row_interactor",
+        "conditions": ["rope", "none"],
+        "directions": ["rope_to_none", "none_to_rope"],
+        "maximum_symmetric_donor_shift_rms_ratio": 1.25,
+        "score_definition": (
+            "median_dataset_rms_latent_rope_minus_none_times_decoder_norm_"
+            "divided_by_pooled_raw_activation_rms"
+        ),
+        "decoder_norm_space": "raw_activation_after_denormalize",
+        "raw_activation_rms_definition": (
+            "root_mean_square_of_pooled_aligned_none_and_rope_raw_values"
+        ),
+        "representation_parent_manifest_sha256": (
+            parent_manifest_digest.sha256
+        ),
+        "representation_model_sha256": representation_digest.sha256,
+        "representation_source_lineage_sha256": (
+            official_causal._canonical_sha256(source_lineage)
+        ),
+        "ranking_source_lineage_sha256": (
+            official_causal._canonical_sha256(source_lineage)
+        ),
+        "split_protocol_id": "toy-whole-row-split",
+        "split_protocol_sha256": split_digest.sha256,
+        "ranking_dataset_roster_sha256": (
+            official_causal._canonical_sha256(["ranking-dataset"])
+        ),
+        "activation_sha256_by_condition": activation_binding,
+        "activation_binding_sha256": (
+            official_causal._canonical_sha256(activation_binding)
+        ),
+        "inference_contract_sha256": source_lineage[
+            "inference_contract_sha256"
+        ],
+        "condition_checkpoints_sha256": source_lineage[
+            "condition_checkpoints_sha256"
+        ],
+        "ranking_protocol": ranking_protocol,
+        "ranking_protocol_sha256": official_causal._canonical_sha256(
+            ranking_protocol
+        ),
+        "dataset_score_sha256": {"ranking-dataset": "a" * 64},
+        "raw_activation_rms_by_dataset": {"ranking-dataset": 1.0},
+        "median_scores": median_scores.tolist(),
+        "median_scores_sha256": (
+            official_causal._ranking_numeric_array_sha256(median_scores)
+        ),
+        "nonzero_dataset_counts": nonzero_counts.tolist(),
+        "nonzero_dataset_counts_sha256": (
+            official_causal._ranking_numeric_array_sha256(nonzero_counts)
+        ),
+        "activation_frequencies": activation_frequencies.tolist(),
+        "activation_frequencies_sha256": (
+            official_causal._ranking_numeric_array_sha256(
+                activation_frequencies
+            )
+        ),
+        "decoder_norms": decoder_norms.tolist(),
+        "decoder_norms_sha256": (
+            official_causal._ranking_numeric_array_sha256(decoder_norms)
+        ),
+        "top_features": top_features,
+        "target_features": [0],
+        "control_features": [1],
+        "latent_baseline": 0.0,
+        "parent_seed": 42,
+    }
+    ranking_dir = tmp_path / "ranking-parent-run"
+    ranking_dir.mkdir()
+    selection_path = ranking_dir / "selection.json"
+    selection_path.write_text(
+        json.dumps(selection, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    selection_digest = verify_file(selection_path).digest
+    ranking_inputs = [
+        InputDigest(
+            "ranking.split_protocol",
+            split_digest.sha256,
+            split_digest.size_bytes,
+        ),
+        InputDigest(
+            "representation.parent_manifest",
+            parent_manifest_digest.sha256,
+            parent_manifest_digest.size_bytes,
+        ),
+        InputDigest(
+            "representation.model",
+            representation_digest.sha256,
+            representation_digest.size_bytes,
+        ),
+    ]
+    for index, digest in enumerate(
+        sorted(
+            value[0]
+            for value in source_lineage[
+                "collect_parent_manifests_sha256"
+            ].values()
+        )
+    ):
+        ranking_inputs.extend(
+            (
+                InputDigest(
+                    f"source.collect_manifest.{digest}",
+                    digest,
+                    1,
+                ),
+                InputDigest(
+                    f"source.collect_index.{digest}",
+                    f"{index + 1}" * 64,
+                    1,
+                ),
+            )
+        )
+    for index, condition in enumerate(("none", "rope")):
+        digest = verify_file(activation_files[condition]).digest
+        ranking_inputs.append(
+            InputDigest(
+                f"source.activation.{index:064x}",
+                digest.sha256,
+                digest.size_bytes,
+            )
+        )
+    ranking_manifest = new_manifest(
+        command="rank-condition-shift",
+        model_family=parent.model_family,
+        model_revision=parent.model_revision,
+        training_code_sha=parent.training_code_sha,
+        model_code_sha=parent.model_code_sha,
+        analysis_code_sha=fixture.head,
+        configuration=FileDigest("7" * 64, 1),
+        checkpoint=parent.checkpoint,
+        dataset_manifest=parent.dataset_manifest,
+        inputs=tuple(sorted(ranking_inputs, key=lambda item: item.role)),
+        condition=parent.condition,
+        sites=parent.sites,
+        seed=parent.seed,
+        artifacts=(
+            ArtifactDigest(
+                "selection.json",
+                selection_digest.sha256,
+                selection_digest.size_bytes,
+            ),
+        ),
+        created_at_utc="2026-08-09T20:00:00Z",
+    )
+    ranking_manifest_path = ranking_dir / "manifest.json"
+    ranking_manifest_path.write_text(
+        json.dumps(ranking_manifest.to_dict(), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    ranking_manifest_digest = verify_file(ranking_manifest_path).digest
+
+    checkpoint_sha256 = verify_file(fixture.reference_checkpoint).digest.sha256
+    attestation = tmp_path / "ranking-paired-source-attestation.json"
+    attestation.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "evidence_kind": "clean-git-checkout",
+                "source_condition": "rope",
+                "model_code_sha": fixture.head,
+                "checkpoint_sha256": checkpoint_sha256,
+                "inference_contract_sha256": source_lineage[
+                    "inference_contract_sha256"
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    config = json.loads(fixture.config.read_text(encoding="utf-8"))
+    config["provenance"]["condition"] = "none"
+    config["checkpoint_study"] = {
+        "scope": "exploratory_pilot",
+        "recipient_chain": None,
+        "source_chain": None,
+    }
+    config["dataset"].update(
+        {
+            "dataset_id": "pilot-dataset",
+            "roster_split": "discovery",
+            "evaluation_split": "val",
+            "sample_roster_path": str(roster),
+            "expected_sample_roster_sha256": roster_digest.sha256,
+        }
+    )
+    config["intervention"].update(
+        {
+            "target_features": [0],
+            "control_features": [1],
+            "latent_baseline": 0.0,
+            "freeze_artifact_path": None,
+        }
+    )
+    config["paired_reverse_patch"] = {
+        "source_condition": "rope",
+        "source_checkpoint_path": str(fixture.reference_checkpoint),
+        "expected_source_checkpoint_sha256": checkpoint_sha256,
+        "source_model_code_root": str(fixture.repository),
+        "expected_source_model_code_sha": fixture.head,
+        "source_code_attestation_path": str(attestation),
+        "expected_source_code_attestation_sha256": verify_file(
+            attestation
+        ).digest.sha256,
+        "maximum_symmetric_donor_shift_rms_ratio": 1.25,
+    }
+    config["ranking_parent"] = {
+        "run_dir": str(ranking_dir),
+        "expected_manifest_sha256": ranking_manifest_digest.sha256,
+        "expected_selection_sha256": selection_digest.sha256,
+        "split_protocol_path": str(split_protocol),
+        "expected_split_protocol_sha256": split_digest.sha256,
+        "directions": ["rope_to_none", "none_to_rope"],
+    }
+    fixture.config.write_text(
+        json.dumps(config, sort_keys=True), encoding="utf-8"
+    )
+    return SimpleNamespace(
+        ranking_dir=ranking_dir,
+        selection_path=selection_path,
+        split_protocol=split_protocol,
+        roster=roster,
+        attestation=attestation,
+    )
+
+
+def _reseal_ranking_selection_and_split(
+    fixture: SimpleNamespace, ranking: SimpleNamespace
+) -> None:
+    split_digest = verify_file(ranking.split_protocol).digest
+    selection = json.loads(ranking.selection_path.read_text(encoding="utf-8"))
+    selection["split_protocol_sha256"] = split_digest.sha256
+    selection["ranking_protocol_sha256"] = official_causal._canonical_sha256(
+        selection["ranking_protocol"]
+    )
+    ranking.selection_path.write_text(
+        json.dumps(selection, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    selection_digest = verify_file(ranking.selection_path).digest
+
+    manifest_path = ranking.ranking_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selection_artifact = next(
+        item for item in manifest["artifacts"] if item["name"] == "selection.json"
+    )
+    selection_artifact.update(
+        {
+            "sha256": selection_digest.sha256,
+            "size_bytes": selection_digest.size_bytes,
+        }
+    )
+    split_input = next(
+        item
+        for item in manifest["inputs"]
+        if item["role"] == "ranking.split_protocol"
+    )
+    split_input.update(
+        {"sha256": split_digest.sha256, "size_bytes": split_digest.size_bytes}
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    config = json.loads(fixture.config.read_text(encoding="utf-8"))
+    config["ranking_parent"].update(
+        {
+            "expected_manifest_sha256": verify_file(manifest_path).digest.sha256,
+            "expected_selection_sha256": selection_digest.sha256,
+            "expected_split_protocol_sha256": split_digest.sha256,
+        }
+    )
+    fixture.config.write_text(
+        json.dumps(config, sort_keys=True), encoding="utf-8"
+    )
 
 
 def _enable_heldout_select_features(
@@ -2053,6 +2457,213 @@ def test_model_causal_workflow_runs_independent_paired_reverse_patch(
     assert paired["ablation_displacement_balance"]["passed"] is True
     assert paired["donor_displacement_balance"]["passed"] is True
     assert summary["mechanistic_rescue"]["passed"] is False
+
+
+def test_exploratory_paired_workflow_binds_completed_ranking_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    ranking = _enable_exploratory_ranking_paired(fixture, tmp_path)
+    _install_workflow_fakes(fixture, monkeypatch, driver_temporary=False)
+
+    assert official_causal.run(
+        SimpleNamespace(config=fixture.config, output_dir=fixture.output)
+    ) == 0
+
+    manifest = verify_run_directory(fixture.output)
+    roles = {item.role: item.sha256 for item in manifest.inputs}
+    assert roles["ranking.parent_manifest"] == verify_file(
+        ranking.ranking_dir / "manifest.json"
+    ).digest.sha256
+    assert roles["ranking.selection"] == verify_file(
+        ranking.selection_path
+    ).digest.sha256
+    assert roles["ranking.split_protocol"] == verify_file(
+        ranking.split_protocol
+    ).digest.sha256
+    summary = json.loads(
+        (fixture.output / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["ranking_parent"] == {
+        "manifest_sha256": roles["ranking.parent_manifest"],
+        "selection_sha256": roles["ranking.selection"],
+        "split_protocol_sha256": roles["ranking.split_protocol"],
+        "split_protocol_id": "toy-whole-row-split",
+        "target_features": [0],
+        "control_features": [1],
+        "directions": ["rope_to_none", "none_to_rope"],
+        "effective_direction": "rope_to_none",
+        "evidence_scope": "exploratory-pilot",
+        "formal_claim": "forbidden",
+    }
+    assert summary["paired_reverse_patch"]["status"] == (
+        "measured_exploratory_diagnostic_only"
+    )
+    assert summary["checkpoint_study"]["formal_trust_verified"] is False
+
+
+def test_exploratory_paired_workflow_requires_ranking_parent(
+    tmp_path: Path
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    _enable_exploratory_ranking_paired(fixture, tmp_path)
+    config = json.loads(fixture.config.read_text(encoding="utf-8"))
+    config.pop("ranking_parent")
+    fixture.config.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="requires a strict ranking_parent"):
+        official_causal.run(
+            SimpleNamespace(config=fixture.config, output_dir=fixture.output)
+        )
+    assert not fixture.output.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("target_features", [2], "target_features differ"),
+        ("control_features", [2], "control_features differ"),
+    ],
+)
+def test_exploratory_paired_workflow_rejects_config_selection_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: list[int],
+    message: str,
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    _enable_exploratory_ranking_paired(fixture, tmp_path)
+    config = json.loads(fixture.config.read_text(encoding="utf-8"))
+    config["intervention"][field] = value
+    fixture.config.write_text(json.dumps(config), encoding="utf-8")
+    _install_workflow_fakes(fixture, monkeypatch, driver_temporary=False)
+
+    with pytest.raises(ValueError, match=message):
+        official_causal.run(
+            SimpleNamespace(config=fixture.config, output_dir=fixture.output)
+        )
+    assert not fixture.output.exists()
+
+
+def test_exploratory_paired_workflow_rejects_direction_order_drift(
+    tmp_path: Path
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    _enable_exploratory_ranking_paired(fixture, tmp_path)
+    config = json.loads(fixture.config.read_text(encoding="utf-8"))
+    config["ranking_parent"]["directions"] = [
+        "none_to_rope",
+        "rope_to_none",
+    ]
+    fixture.config.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="frozen bidirectional ordering"):
+        official_causal.run(
+            SimpleNamespace(config=fixture.config, output_dir=fixture.output)
+        )
+    assert not fixture.output.exists()
+
+
+def test_exploratory_ranking_requires_expected_sample_roster_digest(
+    tmp_path: Path
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    _enable_exploratory_ranking_paired(fixture, tmp_path)
+    config = json.loads(fixture.config.read_text(encoding="utf-8"))
+    config["dataset"].pop("expected_sample_roster_sha256")
+    fixture.config.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="expected_sample_roster_sha256"):
+        official_causal.run(
+            SimpleNamespace(config=fixture.config, output_dir=fixture.output)
+        )
+    assert not fixture.output.exists()
+
+
+def test_exploratory_ranking_rejects_sample_roster_outside_frozen_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    ranking = _enable_exploratory_ranking_paired(fixture, tmp_path)
+    ranking.roster.write_text(
+        ranking.roster.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    config = json.loads(fixture.config.read_text(encoding="utf-8"))
+    config["dataset"]["expected_sample_roster_sha256"] = verify_file(
+        ranking.roster
+    ).digest.sha256
+    fixture.config.write_text(json.dumps(config), encoding="utf-8")
+    _install_workflow_fakes(fixture, monkeypatch, driver_temporary=False)
+
+    with pytest.raises(ValueError, match="frozen split protocol"):
+        official_causal.run(
+            SimpleNamespace(config=fixture.config, output_dir=fixture.output)
+        )
+    assert not fixture.output.exists()
+
+
+def test_exploratory_ranking_rejects_truncated_control_candidate_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    ranking = _enable_exploratory_ranking_paired(fixture, tmp_path)
+    selection = json.loads(ranking.selection_path.read_text(encoding="utf-8"))
+    selection["ranking_protocol"]["random_candidate_pool_size"] = 3
+    ranking.selection_path.write_text(
+        json.dumps(selection, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    split = json.loads(ranking.split_protocol.read_text(encoding="utf-8"))
+    split["feature_protocol"]["matched_control"] = (
+        "activation-frequency and log-decoder-norm nearest-neighbour pool of "
+        "size 3, sampled once with seed 42 without replacement"
+    )
+    ranking.split_protocol.write_text(
+        json.dumps(split, sort_keys=True), encoding="utf-8"
+    )
+    _reseal_ranking_selection_and_split(fixture, ranking)
+    _install_workflow_fakes(fixture, monkeypatch, driver_temporary=False)
+
+    with pytest.raises(ValueError, match="would be truncated"):
+        official_causal.run(
+            SimpleNamespace(config=fixture.config, output_dir=fixture.output)
+        )
+    assert not fixture.output.exists()
+
+
+def test_exploratory_ranking_rejects_outcome_or_unknown_parent_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _workflow_fixture(tmp_path)
+    ranking = _enable_exploratory_ranking_paired(fixture, tmp_path)
+    manifest_path = ranking.ranking_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["inputs"].append(
+        {
+            "role": "outcome.predictions",
+            "sha256": "9" * 64,
+            "size_bytes": 1,
+        }
+    )
+    manifest["inputs"].sort(key=lambda item: item["role"])
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    config = json.loads(fixture.config.read_text(encoding="utf-8"))
+    config["ranking_parent"]["expected_manifest_sha256"] = verify_file(
+        manifest_path
+    ).digest.sha256
+    fixture.config.write_text(json.dumps(config), encoding="utf-8")
+    _install_workflow_fakes(fixture, monkeypatch, driver_temporary=False)
+
+    with pytest.raises(ValueError, match="unknown input roles"):
+        official_causal.run(
+            SimpleNamespace(config=fixture.config, output_dir=fixture.output)
+        )
+    assert not fixture.output.exists()
 
 
 def test_model_causal_paired_reverse_patch_rejects_resealed_bad_attestation(

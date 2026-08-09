@@ -20,6 +20,7 @@ _COMMAND_MODULES = {
     "localize": "localization",
     "tabpfn-localize": "tabpfn_localization",
     "train-repr": "representation",
+    "rank-condition-shift": "condition_shift_ranking",
     "reconstruction-sensitivity": "causal",
     "model-causal": "official_causal",
     "select-features": "feature_selection",
@@ -56,6 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Run official TabPFN v2.6 fixed-weight position localization."
         ),
         "train-repr": "Train dense or sparse representation models.",
+        "rank-condition-shift": (
+            "Rank discovery-only RoPE/No-PE representation shifts."
+        ),
         "reconstruction-sensitivity": (
             "Run reconstruction-space sensitivity diagnostics; this is not a model causal test."
         ),

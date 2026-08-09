@@ -12,15 +12,18 @@ import pytest
 import torch
 from pe_mechanism.causal import (
     activation_frequency,
+    decoder_feature_norms,
     intervene_latents,
     matched_random_control_features,
     no_op_reconstruction,
     paired_effect_records,
+    raw_space_decoder_feature_norms,
     run,
     summarize_effect_records,
 )
 from pe_mechanism.manifest import ArtifactDigest, FileDigest, new_manifest
 from pe_mechanism.representation import (
+    MeanRMSNormalizer,
     save_representation_checkpoint,
     train_autoencoder,
 )
@@ -150,6 +153,28 @@ def test_frequency_and_norm_matched_control_is_deterministic_and_excludes_target
 def test_activation_frequency_counts_nonzero_rows() -> None:
     latents = torch.tensor([[0.0, 1.0], [2.0, 0.0], [3.0, 4.0]])
     assert torch.allclose(activation_frequency(latents), torch.tensor([2 / 3, 2 / 3]))
+
+
+def test_raw_space_decoder_norms_use_one_canonical_precision_path() -> None:
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(3, 2, bias=False)
+    with torch.no_grad():
+        model.decoder.weight.copy_(
+            torch.tensor([[0.12345679, -0.75, 2.0], [1.25, 0.33333334, -0.5]])
+        )
+    normalizer = MeanRMSNormalizer(
+        torch.zeros(2), torch.tensor([0.9876543, 3.1415927])
+    )
+
+    raw_directions = (
+        model.decoder.weight.detach().to(torch.float64)
+        * normalizer.rms.detach().to(torch.float64)[:, None]
+    )
+    expected = decoder_feature_norms(raw_directions).to(torch.float64)
+
+    assert torch.equal(
+        raw_space_decoder_feature_norms(model, normalizer), expected
+    )
 
 
 def test_paired_effect_records_and_summary_preserve_pairing() -> None:

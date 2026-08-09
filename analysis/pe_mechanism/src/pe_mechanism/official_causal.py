@@ -30,6 +30,7 @@ from .causal import (
     intervene_latents,
     matched_random_control_features,
     model_decoder_feature_norms,
+    raw_space_decoder_feature_norms,
 )
 from .identifiers import require_portable_identifier, require_public_label
 from .manifest import RunManifest
@@ -1467,11 +1468,81 @@ _MODEL_CAUSAL_TOP_LEVEL = {
     "checkpoint_study",
     "representation_run_dir",
     "expected_parent_manifest_sha256",
+    "ranking_parent",
     "dataset",
     "intervention",
     "official_classifier",
     "paired_reverse_patch",
 }
+_RANKING_PARENT_FIELDS = {
+    "run_dir",
+    "expected_manifest_sha256",
+    "expected_selection_sha256",
+    "split_protocol_path",
+    "expected_split_protocol_sha256",
+    "directions",
+}
+_RANKING_SELECTION_FIELDS = {
+    "schema_version",
+    "analysis",
+    "evidence_scope",
+    "formal_claim",
+    "site",
+    "conditions",
+    "directions",
+    "maximum_symmetric_donor_shift_rms_ratio",
+    "score_definition",
+    "decoder_norm_space",
+    "raw_activation_rms_definition",
+    "representation_parent_manifest_sha256",
+    "representation_model_sha256",
+    "representation_source_lineage_sha256",
+    "ranking_source_lineage_sha256",
+    "split_protocol_id",
+    "split_protocol_sha256",
+    "ranking_dataset_roster_sha256",
+    "activation_sha256_by_condition",
+    "activation_binding_sha256",
+    "inference_contract_sha256",
+    "condition_checkpoints_sha256",
+    "ranking_protocol",
+    "ranking_protocol_sha256",
+    "dataset_score_sha256",
+    "raw_activation_rms_by_dataset",
+    "median_scores",
+    "median_scores_sha256",
+    "nonzero_dataset_counts",
+    "nonzero_dataset_counts_sha256",
+    "activation_frequencies",
+    "activation_frequencies_sha256",
+    "decoder_norms",
+    "decoder_norms_sha256",
+    "top_features",
+    "target_features",
+    "control_features",
+    "latent_baseline",
+    "parent_seed",
+}
+_RANKING_PROTOCOL_FIELDS = {
+    "dataset_ids",
+    "minimum_nonzero_datasets",
+    "target_count",
+    "random_candidate_pool_size",
+    "random_seed",
+    "activation_frequency_threshold",
+    "decoder_norm_space",
+    "latent_baseline",
+    "same_features_both_directions",
+}
+_RANKING_DIRECTIONS = ("rope_to_none", "none_to_rope")
+_RANKING_CONDITIONS = ("rope", "none")
+_RANKING_SCORE_ID = (
+    "median_dataset_rms_latent_rope_minus_none_times_decoder_norm_"
+    "divided_by_pooled_raw_activation_rms"
+)
+_RANKING_RAW_RMS_DEFINITION = (
+    "root_mean_square_of_pooled_aligned_none_and_rope_raw_values"
+)
 _CHECKPOINT_STUDY_TRUST_FIELDS = {
     "checkpoint_path",
     "expected_checkpoint_sha256",
@@ -1548,8 +1619,16 @@ def run(args: Any) -> int:
         configuration.data,
         label="model-causal config",
         required=_MODEL_CAUSAL_TOP_LEVEL
-        - {"expected_parent_manifest_sha256", "paired_reverse_patch"},
-        optional={"expected_parent_manifest_sha256", "paired_reverse_patch"},
+        - {
+            "expected_parent_manifest_sha256",
+            "ranking_parent",
+            "paired_reverse_patch",
+        },
+        optional={
+            "expected_parent_manifest_sha256",
+            "ranking_parent",
+            "paired_reverse_patch",
+        },
     )
     dataset_config = _exact_object(
         config["dataset"],
@@ -1589,6 +1668,16 @@ def run(args: Any) -> int:
         config["official_classifier"],
         label="official_classifier",
         required={"device", "estimator_options"},
+    )
+    raw_ranking_config = config.get("ranking_parent")
+    ranking_config = (
+        None
+        if raw_ranking_config is None
+        else _exact_object(
+            raw_ranking_config,
+            label="ranking_parent",
+            required=_RANKING_PARENT_FIELDS,
+        )
     )
     raw_paired_config = config.get("paired_reverse_patch")
     paired_config = (
@@ -1640,6 +1729,26 @@ def run(args: Any) -> int:
                 "validation and held_out evidence require formal checkpoint trust"
             )
         evidence_scope = "exploratory-pilot"
+    if ranking_config is not None and (
+        checkpoint_study["scope"] != "exploratory_pilot"
+        or roster_split != "discovery"
+    ):
+        raise ValueError(
+            "ranking_parent is restricted to exploratory_pilot discovery runs"
+        )
+    if (
+        checkpoint_study["scope"] == "exploratory_pilot"
+        and paired_config is not None
+        and ranking_config is None
+    ):
+        raise ValueError(
+            "exploratory paired reverse patch requires a strict ranking_parent"
+        )
+    expected_sample_roster_sha256 = (
+        _required_sha256(dataset_config, "expected_sample_roster_sha256")
+        if ranking_config is not None
+        else _optional_sha256(dataset_config, "expected_sample_roster_sha256")
+    )
     trusted_pickle = dataset_config["trusted_pickle"]
     if not isinstance(trusted_pickle, bool):
         raise TypeError("trusted_pickle must be a JSON boolean")
@@ -1869,13 +1978,60 @@ def run(args: Any) -> int:
     if representation_file.digest.size_bytes != model_artifact.size_bytes:
         raise ValueError("train-repr model.pt size differs from its manifest")
 
+    ranking_parent: RunManifest | None = None
+    ranking_manifest_file = None
+    ranking_selection_file = None
+    ranking_split_protocol_file = None
+    configured_ranking_directions: tuple[str, ...] | None = None
+    if ranking_config is not None:
+        configured_ranking_directions = _ranking_directions(
+            ranking_config["directions"], name="ranking_parent.directions"
+        )
+        ranking_dir = _absolute_directory(
+            ranking_config["run_dir"], name="ranking_parent.run_dir"
+        )
+        ranking_parent = verify_run_directory(ranking_dir)
+        ranking_manifest_file = verify_file(
+            ranking_dir / "manifest.json",
+            expected_sha256=_required_sha256(
+                ranking_config, "expected_manifest_sha256"
+            ),
+        )
+        if _manifest_from_verified_bytes(ranking_manifest_file) != ranking_parent:
+            raise RuntimeError(
+                "ranking parent manifest changed during directory verification"
+            )
+        _validate_ranking_parent_manifest(ranking_parent)
+        ranking_artifact = ranking_parent.artifacts[0]
+        ranking_selection_file = verify_file(
+            ranking_dir / "selection.json",
+            expected_sha256=_required_sha256(
+                ranking_config, "expected_selection_sha256"
+            ),
+        )
+        if (
+            ranking_selection_file.digest.sha256 != ranking_artifact.sha256
+            or ranking_selection_file.digest.size_bytes
+            != ranking_artifact.size_bytes
+        ):
+            raise ValueError(
+                "ranking selection artifact differs from its completed manifest"
+            )
+        ranking_split_protocol_file = verify_file(
+            _absolute_file(
+                ranking_config["split_protocol_path"],
+                name="ranking_parent.split_protocol_path",
+            ),
+            expected_sha256=_required_sha256(
+                ranking_config, "expected_split_protocol_sha256"
+            ),
+        )
+
     sample_roster_file = verify_file(
         _absolute_file(
             dataset_config["sample_roster_path"], name="sample_roster_path"
         ),
-        expected_sha256=_optional_sha256(
-            dataset_config, "expected_sample_roster_sha256"
-        ),
+        expected_sha256=expected_sample_roster_sha256,
     )
     sample_roster = _load_sample_roster(
         sample_roster_file,
@@ -1939,6 +2095,27 @@ def run(args: Any) -> int:
         "representation.model": representation_file.digest.sha256,
         "samples.roster": sample_roster_file.digest.sha256,
     }
+    if ranking_manifest_file is not None:
+        assert ranking_selection_file is not None
+        assert ranking_split_protocol_file is not None
+        additional_paths.update(
+            {
+                "ranking.parent_manifest": ranking_manifest_file.path,
+                "ranking.selection": ranking_selection_file.path,
+                "ranking.split_protocol": ranking_split_protocol_file.path,
+            }
+        )
+        expected_additional.update(
+            {
+                "ranking.parent_manifest": (
+                    ranking_manifest_file.digest.sha256
+                ),
+                "ranking.selection": ranking_selection_file.digest.sha256,
+                "ranking.split_protocol": (
+                    ranking_split_protocol_file.digest.sha256
+                ),
+            }
+        )
     if checkpoint_study["scope"] == "formal":
         common_ledger = checkpoint_study["recipient_chain"][0][
             "transaction_ledger_file"
@@ -2118,6 +2295,40 @@ def run(args: Any) -> int:
                 paired_shift_ratio_limit
             ),
         }
+    ranking_parent_binding = None
+    if ranking_parent is not None:
+        assert ranking_selection_file is not None
+        assert ranking_split_protocol_file is not None
+        assert configured_ranking_directions is not None
+        ranking_parent_binding = _validate_ranking_parent(
+            ranking_parent,
+            context.additional_file("ranking.selection"),
+            context.additional_file("ranking.split_protocol"),
+            context=context,
+            ranking_parent_manifest_sha256=context.additional_file(
+                "ranking.parent_manifest"
+            ).digest.sha256,
+            representation_parent=parent,
+            representation_parent_manifest_sha256=context.additional_file(
+                "representation.parent_manifest"
+            ).digest.sha256,
+            representation_model_sha256=bound_representation.digest.sha256,
+            representation_model=autoencoder,
+            representation_normalizer=normalizer,
+            source_lineage=source_lineage,
+            inference_contract_sha256=inference_contract_sha256,
+            dataset_id=dataset_id,
+            target_features=target_features,
+            control_features=configured_controls,
+            latent_baseline=latent_baseline,
+            configured_directions=configured_ranking_directions,
+            paired_source_binding=paired_source_binding,
+            sample_roster_sha256=context.additional_file(
+                "samples.roster"
+            ).digest.sha256,
+            sample_count=len(sample_roster["row_indices"]),
+            evaluation_split=evaluation_split,
+        )
     checkpoint_study_binding = _validated_checkpoint_study(
         checkpoint_study,
         context=context,
@@ -2341,6 +2552,7 @@ def run(args: Any) -> int:
             "max_no_op_accuracy_difference": accuracy_limit,
         },
         paired_source_binding=paired_source_binding,
+        ranking_parent_binding=ranking_parent_binding,
         checkpoint_study=checkpoint_study_binding,
     )
 
@@ -3134,6 +3346,824 @@ def _manifest_from_verified_bytes(verified: Any) -> RunManifest:
     if not isinstance(payload, Mapping):
         raise ValueError("parent manifest must contain a JSON object")
     return RunManifest.from_dict(payload)
+
+
+def _validate_ranking_parent_manifest(parent: RunManifest) -> None:
+    if parent.command != "rank-condition-shift":
+        raise ValueError(
+            "ranking parent command must be rank-condition-shift"
+        )
+    if parent.evidence_level != "strict" or parent.legacy_reasons:
+        raise ValueError("ranking parent must have strict evidence")
+    if parent.sites != ("row_interactor",):
+        raise ValueError("ranking parent must select row_interactor")
+    if tuple(artifact.name for artifact in parent.artifacts) != (
+        "selection.json",
+    ):
+        raise ValueError(
+            "ranking parent must declare exactly selection.json"
+        )
+
+
+def _ranking_directions(value: Any, *, name: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise TypeError(f"{name} must be a JSON list")
+    result = tuple(value)
+    if result != _RANKING_DIRECTIONS:
+        raise ValueError(
+            f"{name} must equal the frozen bidirectional ordering "
+            f"{list(_RANKING_DIRECTIONS)!r}"
+        )
+    return result
+
+
+def _validate_ranking_parent(
+    parent: RunManifest,
+    verified_selection: Any,
+    verified_split_protocol: Any,
+    *,
+    context: Any,
+    ranking_parent_manifest_sha256: str,
+    representation_parent: RunManifest,
+    representation_parent_manifest_sha256: str,
+    representation_model_sha256: str,
+    representation_model: nn.Module,
+    representation_normalizer: nn.Module,
+    source_lineage: Mapping[str, Any],
+    inference_contract_sha256: str,
+    dataset_id: str,
+    target_features: Sequence[int],
+    control_features: Sequence[int] | None,
+    latent_baseline: Any,
+    configured_directions: Sequence[str],
+    paired_source_binding: Mapping[str, Any] | None,
+    sample_roster_sha256: str,
+    sample_count: int,
+    evaluation_split: str,
+) -> dict[str, Any]:
+    """Bind an exploratory causal run to one immutable discovery ranking."""
+
+    _validate_ranking_parent_manifest(parent)
+    assert_git_commit_is_ancestor(
+        context.inputs.analysis_code, parent.analysis_code_sha
+    )
+    expected_parent_lineage = {
+        "model_family": representation_parent.model_family,
+        "model_revision": representation_parent.model_revision,
+        "training_code_sha": representation_parent.training_code_sha,
+        "model_code_sha": representation_parent.model_code_sha,
+        "checkpoint": representation_parent.checkpoint,
+        "dataset_manifest": representation_parent.dataset_manifest,
+        "condition": representation_parent.condition,
+        "sites": representation_parent.sites,
+        "seed": representation_parent.seed,
+    }
+    lineage_mismatches = {
+        name: (getattr(parent, name), expected)
+        for name, expected in expected_parent_lineage.items()
+        if getattr(parent, name) != expected
+    }
+    if lineage_mismatches:
+        raise ValueError(
+            "ranking parent lineage differs from its representation parent: "
+            f"{lineage_mismatches}"
+        )
+    current_lineage = {
+        "model_family": context.model_family,
+        "model_revision": context.model_revision,
+        "training_code_sha": context.inputs.training_code.head_sha,
+        "model_code_sha": context.inputs.model_code.head_sha,
+        "dataset_manifest": context.inputs.dataset_manifest.digest,
+        "sites": context.sites,
+        "seed": context.inputs.contract.seed,
+    }
+    current_mismatches = {
+        name: (getattr(parent, name), expected)
+        for name, expected in current_lineage.items()
+        if getattr(parent, name) != expected
+    }
+    if current_mismatches:
+        raise ValueError(
+            "ranking parent lineage differs from model-causal inputs: "
+            f"{current_mismatches}"
+        )
+
+    registered_inputs = {item.role: item.sha256 for item in parent.inputs}
+    required_registered = {
+        "representation.parent_manifest": (
+            representation_parent_manifest_sha256
+        ),
+        "representation.model": representation_model_sha256,
+        "ranking.split_protocol": verified_split_protocol.digest.sha256,
+    }
+    mismatched_inputs = {
+        role: (registered_inputs.get(role), expected)
+        for role, expected in required_registered.items()
+        if registered_inputs.get(role) != expected
+    }
+    if mismatched_inputs:
+        raise ValueError(
+            "ranking parent does not bind the active representation/split "
+            f"inputs: {mismatched_inputs}"
+        )
+
+    selection = _selection_json_object(
+        verified_selection, label="ranking selection.json"
+    )
+    selection = _exact_object(
+        selection,
+        label="ranking selection.json",
+        required=_RANKING_SELECTION_FIELDS,
+    )
+    split = _ranking_split_protocol(
+        verified_split_protocol,
+        dataset_id=dataset_id,
+        sample_roster_sha256=sample_roster_sha256,
+        sample_count=sample_count,
+        evaluation_split=evaluation_split,
+    )
+    _validate_ranking_parent_input_schema(
+        parent,
+        source_lineage=source_lineage,
+        ranking_dataset_count=len(split["feature_ranking_datasets"]),
+    )
+    common_expected = {
+        "schema_version": 1,
+        "analysis": "exploratory-condition-shift-ranking",
+        "evidence_scope": "exploratory-pilot",
+        "formal_claim": "forbidden",
+        "site": "row_interactor",
+        "conditions": list(_RANKING_CONDITIONS),
+        "directions": list(_RANKING_DIRECTIONS),
+        "maximum_symmetric_donor_shift_rms_ratio": split[
+            "maximum_symmetric_donor_shift_rms_ratio"
+        ],
+        "score_definition": _RANKING_SCORE_ID,
+        "decoder_norm_space": "raw_activation_after_denormalize",
+        "raw_activation_rms_definition": _RANKING_RAW_RMS_DEFINITION,
+        "representation_parent_manifest_sha256": (
+            representation_parent_manifest_sha256
+        ),
+        "representation_model_sha256": representation_model_sha256,
+        "representation_source_lineage_sha256": _canonical_sha256(
+            source_lineage
+        ),
+        "split_protocol_id": split["protocol_id"],
+        "split_protocol_sha256": verified_split_protocol.digest.sha256,
+        "inference_contract_sha256": inference_contract_sha256,
+        "condition_checkpoints_sha256": dict(
+            source_lineage["condition_checkpoints_sha256"]
+        ),
+        "parent_seed": parent.seed,
+    }
+    selection_mismatches = {
+        name: (selection.get(name), expected)
+        for name, expected in common_expected.items()
+        if selection.get(name) != expected
+    }
+    if selection_mismatches:
+        raise ValueError(
+            "ranking selection differs from verified model-causal lineage: "
+            f"{selection_mismatches}"
+        )
+    _required_sha256_value(
+        selection["ranking_source_lineage_sha256"],
+        name="ranking_source_lineage_sha256",
+    )
+    if tuple(configured_directions) != tuple(selection["directions"]):
+        raise ValueError(
+            "configured ranking directions differ from selection.json"
+        )
+    if paired_source_binding is None:
+        raise ValueError(
+            "ranking-bound causal execution requires a paired reverse patch"
+        )
+    effective_direction = (
+        f"{paired_source_binding['source_condition']}_to_{context.condition}"
+    )
+    if effective_direction not in configured_directions:
+        raise ValueError(
+            "paired source/recipient direction is absent from the ranking "
+            "selection"
+        )
+    frozen_shift_limit = _finite_number(
+        selection["maximum_symmetric_donor_shift_rms_ratio"],
+        name="ranking maximum_symmetric_donor_shift_rms_ratio",
+    )
+    if frozen_shift_limit != paired_source_binding.get(
+        "maximum_symmetric_donor_shift_rms_ratio"
+    ):
+        raise ValueError(
+            "paired donor-shift threshold differs from ranking selection"
+        )
+
+    selection_targets = _ranking_feature_list(
+        selection["target_features"], name="ranking target_features"
+    )
+    selection_controls = _ranking_feature_list(
+        selection["control_features"], name="ranking control_features"
+    )
+    if list(target_features) != list(selection_targets):
+        raise ValueError(
+            "configured target_features differ from ranking selection"
+        )
+    if control_features is None or list(control_features) != list(
+        selection_controls
+    ):
+        raise ValueError(
+            "configured control_features differ from ranking selection"
+        )
+    if _json_safe(latent_baseline) != selection["latent_baseline"]:
+        raise ValueError(
+            "configured latent_baseline differs from ranking selection"
+        )
+
+    ranking_protocol = _exact_object(
+        selection["ranking_protocol"],
+        label="ranking selection protocol",
+        required=_RANKING_PROTOCOL_FIELDS,
+    )
+    ranking_dataset_ids = tuple(split["feature_ranking_datasets"])
+    expected_protocol = {
+        "dataset_ids": list(ranking_dataset_ids),
+        "minimum_nonzero_datasets": ranking_protocol[
+            "minimum_nonzero_datasets"
+        ],
+        "target_count": len(selection_targets),
+        "random_candidate_pool_size": ranking_protocol[
+            "random_candidate_pool_size"
+        ],
+        "random_seed": parent.seed,
+        "activation_frequency_threshold": 1e-8,
+        "decoder_norm_space": "raw_activation_after_denormalize",
+        "latent_baseline": selection["latent_baseline"],
+        "same_features_both_directions": True,
+    }
+    if ranking_protocol != expected_protocol:
+        raise ValueError(
+            "ranking protocol differs from its frozen split/selection"
+        )
+    minimum_nonzero = _positive_integer(
+        ranking_protocol["minimum_nonzero_datasets"],
+        name="ranking minimum_nonzero_datasets",
+    )
+    if minimum_nonzero > len(ranking_dataset_ids):
+        raise ValueError(
+            "ranking minimum_nonzero_datasets exceeds its dataset roster"
+        )
+    candidate_pool_size = _positive_integer(
+        ranking_protocol["random_candidate_pool_size"],
+        name="ranking random_candidate_pool_size",
+    )
+    expected_feature_protocol = {
+        "target_count": len(selection_targets),
+        "score": (
+            "median across feature-ranking datasets of RMS RoPE-minus-No-PE "
+            "latent difference times decoder-direction norm divided by raw "
+            "activation RMS"
+        ),
+        "minimum_nonzero_ranking_datasets": minimum_nonzero,
+        "matched_control": (
+            "activation-frequency and log-decoder-norm nearest-neighbour pool "
+            f"of size {candidate_pool_size}, sampled once with seed "
+            f"{parent.seed} without replacement"
+        ),
+        "same_features_both_directions": True,
+    }
+    if split["feature_protocol"] != expected_feature_protocol:
+        raise ValueError(
+            "ranking selection parameters differ from the frozen split protocol"
+        )
+    if selection["ranking_protocol_sha256"] != _canonical_sha256(
+        ranking_protocol
+    ):
+        raise ValueError("ranking protocol digest is inconsistent")
+    if selection["ranking_dataset_roster_sha256"] != _canonical_sha256(
+        list(ranking_dataset_ids)
+    ):
+        raise ValueError("ranking dataset roster digest is inconsistent")
+
+    latent_dim = _positive_int_attribute(representation_model, "latent_dim")
+    if max((*selection_targets, *selection_controls)) >= latent_dim:
+        raise ValueError(
+            "ranking target/control features exceed representation latent_dim"
+        )
+    if set(selection_targets) & set(selection_controls) or len(
+        selection_targets
+    ) != len(selection_controls):
+        raise ValueError(
+            "ranking target/control features must be dose-matched and disjoint"
+        )
+    smallest_pool = latent_dim - 2 * len(selection_targets) + 1
+    if candidate_pool_size > smallest_pool:
+        raise ValueError(
+            "ranking random_candidate_pool_size would be truncated for a later "
+            "target"
+        )
+    median_scores = _ranking_float_array(
+        selection["median_scores"],
+        name="median_scores",
+        expected=latent_dim,
+        non_negative=True,
+    )
+    nonzero_counts = _ranking_integer_array(
+        selection["nonzero_dataset_counts"],
+        name="nonzero_dataset_counts",
+        expected=latent_dim,
+        maximum=len(ranking_dataset_ids),
+    )
+    activation_frequencies = _ranking_float_array(
+        selection["activation_frequencies"],
+        name="activation_frequencies",
+        expected=latent_dim,
+        non_negative=True,
+    )
+    decoder_norms = _ranking_float_array(
+        selection["decoder_norms"],
+        name="decoder_norms",
+        expected=latent_dim,
+        non_negative=True,
+    )
+    for name, values in (
+        ("median_scores", median_scores),
+        ("nonzero_dataset_counts", nonzero_counts),
+        ("activation_frequencies", activation_frequencies),
+        ("decoder_norms", decoder_norms),
+    ):
+        expected_digest = _ranking_numeric_array_sha256(values)
+        if selection[f"{name}_sha256"] != expected_digest:
+            raise ValueError(f"ranking {name} digest is inconsistent")
+    observed_decoder_norms = raw_space_decoder_feature_norms(
+        representation_model, representation_normalizer
+    ).cpu().numpy()
+    if not np.array_equal(decoder_norms, observed_decoder_norms):
+        raise ValueError(
+            "ranking decoder norms differ from the bound representation"
+        )
+
+    eligible = [
+        index
+        for index in range(latent_dim)
+        if int(nonzero_counts[index]) >= minimum_nonzero
+        and float(median_scores[index]) > 0.0
+    ]
+    eligible.sort(key=lambda index: (-float(median_scores[index]), index))
+    if tuple(eligible[: len(selection_targets)]) != selection_targets:
+        raise ValueError(
+            "ranking target features are not the frozen top eligible features"
+        )
+    recomputed_controls = tuple(
+        matched_random_control_features(
+            selection_targets,
+            activation_frequencies,
+            decoder_norms,
+            seed=parent.seed,
+            candidate_pool_size=candidate_pool_size,
+        )
+    )
+    if recomputed_controls != selection_controls:
+        raise ValueError(
+            "ranking matched controls are inconsistent with frozen statistics"
+        )
+    expected_top = [
+        {
+            "feature": index,
+            "score": float(median_scores[index]),
+            "nonzero_dataset_count": int(nonzero_counts[index]),
+        }
+        for index in sorted(
+            range(latent_dim),
+            key=lambda index: (-float(median_scores[index]), index),
+        )[: min(10, latent_dim)]
+    ]
+    if selection["top_features"] != expected_top:
+        raise ValueError("ranking top_features table is inconsistent")
+
+    activation_binding = _ranking_activation_binding(
+        selection["activation_sha256_by_condition"],
+        dataset_ids=ranking_dataset_ids,
+    )
+    if selection["activation_binding_sha256"] != _canonical_sha256(
+        activation_binding
+    ):
+        raise ValueError("ranking activation binding digest is inconsistent")
+    registered_activations = sorted(
+        digest
+        for role, digest in registered_inputs.items()
+        if role.startswith("source.activation.")
+    )
+    selected_activations = sorted(
+        digest
+        for condition in sorted(activation_binding)
+        for digest in activation_binding[condition].values()
+    )
+    if registered_activations != selected_activations:
+        raise ValueError(
+            "ranking selection activations differ from manifest-bound inputs"
+        )
+    _ranking_dataset_scalar_mapping(
+        selection["raw_activation_rms_by_dataset"],
+        dataset_ids=ranking_dataset_ids,
+        name="raw_activation_rms_by_dataset",
+    )
+    _ranking_dataset_digest_mapping(
+        selection["dataset_score_sha256"],
+        dataset_ids=ranking_dataset_ids,
+        name="dataset_score_sha256",
+    )
+
+    return {
+        "manifest_sha256": _required_sha256_value(
+            ranking_parent_manifest_sha256,
+            name="ranking parent manifest digest",
+        ),
+        "selection_sha256": verified_selection.digest.sha256,
+        "split_protocol_sha256": verified_split_protocol.digest.sha256,
+        "split_protocol_id": split["protocol_id"],
+        "target_features": list(selection_targets),
+        "control_features": list(selection_controls),
+        "directions": list(configured_directions),
+        "effective_direction": effective_direction,
+        "evidence_scope": "exploratory-pilot",
+        "formal_claim": "forbidden",
+    }
+
+
+def _ranking_split_protocol(
+    verified: Any,
+    *,
+    dataset_id: str,
+    sample_roster_sha256: str,
+    sample_count: int,
+    evaluation_split: str,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(verified.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("ranking split protocol is not valid JSON") from error
+    if not isinstance(payload, Mapping):
+        raise TypeError("ranking split protocol must contain one JSON object")
+    required = {
+        "schema_version",
+        "protocol_id",
+        "feature_ranking_datasets",
+        "causal_test_datasets",
+        "causal_sample_protocol",
+        "feature_protocol",
+        "causal_protocol",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise ValueError(
+            f"ranking split protocol missing required fields: {missing}"
+        )
+    if payload["schema_version"] != 1:
+        raise ValueError("ranking split protocol schema_version must be one")
+    protocol_id = require_public_label(
+        payload["protocol_id"], name="ranking split protocol_id"
+    )
+    ranking = _ranking_dataset_ids(
+        payload["feature_ranking_datasets"],
+        name="feature_ranking_datasets",
+    )
+    causal = _ranking_dataset_ids(
+        payload["causal_test_datasets"], name="causal_test_datasets"
+    )
+    if set(ranking) & set(causal):
+        raise ValueError(
+            "ranking and causal-test dataset rosters must be disjoint"
+        )
+    if dataset_id not in causal:
+        raise ValueError(
+            "model-causal dataset is absent from the frozen causal-test roster"
+        )
+    causal_samples = _exact_object(
+        payload["causal_sample_protocol"],
+        label="ranking causal_sample_protocol",
+        required={
+            "split",
+            "maximum_rows_per_dataset",
+            "selection",
+            "sample_roster_sha256_by_dataset",
+            "sample_count_by_dataset",
+        },
+    )
+    if causal_samples["split"] != "val" or evaluation_split != "val":
+        raise ValueError("ranking-bound causal samples must use the val split")
+    maximum_rows = _positive_integer(
+        causal_samples["maximum_rows_per_dataset"],
+        name="causal_sample_protocol.maximum_rows_per_dataset",
+    )
+    selection_rule = causal_samples["selection"]
+    if not isinstance(selection_rule, str) or not selection_rule:
+        raise TypeError("causal_sample_protocol.selection must be a non-empty string")
+    roster_digests = _ranking_causal_sample_digest_mapping(
+        causal_samples["sample_roster_sha256_by_dataset"],
+        dataset_ids=causal,
+    )
+    sample_counts = _ranking_causal_sample_count_mapping(
+        causal_samples["sample_count_by_dataset"],
+        dataset_ids=causal,
+        maximum=maximum_rows,
+    )
+    if roster_digests[dataset_id] != _required_sha256_value(
+        sample_roster_sha256, name="current sample roster digest"
+    ):
+        raise ValueError(
+            "current sample roster digest differs from the frozen split protocol"
+        )
+    if sample_counts[dataset_id] != sample_count:
+        raise ValueError(
+            "current sample roster count differs from the frozen split protocol"
+        )
+    feature = payload["feature_protocol"]
+    if not isinstance(feature, Mapping) or feature.get(
+        "same_features_both_directions"
+    ) is not True:
+        raise ValueError(
+            "ranking split protocol must freeze the same features both directions"
+        )
+    causal_protocol = payload["causal_protocol"]
+    if not isinstance(causal_protocol, Mapping):
+        raise TypeError("ranking causal_protocol must be a JSON object")
+    if (
+        causal_protocol.get("directions") != list(_RANKING_DIRECTIONS)
+        or causal_protocol.get("checkpoint_scope") != "exploratory_pilot"
+        or causal_protocol.get("formal_claim") != "forbidden"
+    ):
+        raise ValueError("ranking causal protocol is not the frozen pilot scope")
+    shift_limit = _finite_number(
+        causal_protocol.get("maximum_symmetric_donor_shift_rms_ratio"),
+        name="causal protocol maximum_symmetric_donor_shift_rms_ratio",
+    )
+    if not 1.0 <= shift_limit <= _MAX_FORMAL_SYMMETRIC_DONOR_SHIFT_RMS_RATIO:
+        raise ValueError("ranking causal protocol donor-shift limit is unsafe")
+    return {
+        "protocol_id": protocol_id,
+        "feature_ranking_datasets": list(ranking),
+        "causal_test_datasets": list(causal),
+        "causal_sample_protocol": {
+            "split": "val",
+            "maximum_rows_per_dataset": maximum_rows,
+            "selection": selection_rule,
+            "sample_roster_sha256_by_dataset": roster_digests,
+            "sample_count_by_dataset": sample_counts,
+        },
+        "feature_protocol": dict(feature),
+        "maximum_symmetric_donor_shift_rms_ratio": shift_limit,
+    }
+
+
+def _ranking_dataset_ids(value: Any, *, name: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{name} must be a non-empty JSON list")
+    result = tuple(
+        require_public_label(item, name=f"{name} item") for item in value
+    )
+    if result != tuple(sorted(set(result))):
+        raise ValueError(f"{name} must be sorted and unique")
+    return result
+
+
+def _ranking_causal_sample_digest_mapping(
+    value: Any, *, dataset_ids: Sequence[str]
+) -> dict[str, str]:
+    if not isinstance(value, Mapping) or tuple(sorted(value)) != tuple(dataset_ids):
+        raise ValueError(
+            "causal sample-roster digest mapping differs from the causal-test roster"
+        )
+    return {
+        dataset_id: _required_sha256_value(
+            value[dataset_id], name=f"causal sample roster {dataset_id}"
+        )
+        for dataset_id in dataset_ids
+    }
+
+
+def _ranking_causal_sample_count_mapping(
+    value: Any, *, dataset_ids: Sequence[str], maximum: int
+) -> dict[str, int]:
+    if not isinstance(value, Mapping) or tuple(sorted(value)) != tuple(dataset_ids):
+        raise ValueError(
+            "causal sample-count mapping differs from the causal-test roster"
+        )
+    result = {
+        dataset_id: _positive_integer(
+            value[dataset_id], name=f"causal sample count {dataset_id}"
+        )
+        for dataset_id in dataset_ids
+    }
+    if any(count > maximum for count in result.values()):
+        raise ValueError("causal sample count exceeds maximum_rows_per_dataset")
+    return result
+
+
+def _validate_ranking_parent_input_schema(
+    parent: RunManifest,
+    *,
+    source_lineage: Mapping[str, Any],
+    ranking_dataset_count: int,
+) -> None:
+    """Require the ranking producer's exact path-free input-role schema."""
+
+    singleton_roles = {
+        "ranking.split_protocol",
+        "representation.parent_manifest",
+        "representation.model",
+    }
+    prefixes = {
+        "collect_manifest": "source.collect_manifest.",
+        "collect_index": "source.collect_index.",
+        "activation": "source.activation.",
+    }
+    grouped: dict[str, dict[str, Any]] = {name: {} for name in prefixes}
+    unknown: list[str] = []
+    for item in parent.inputs:
+        if item.role in singleton_roles:
+            continue
+        matched = False
+        for name, prefix in prefixes.items():
+            if not item.role.startswith(prefix):
+                continue
+            suffix = item.role.removeprefix(prefix)
+            _required_sha256_value(suffix, name=f"ranking input role {item.role}")
+            grouped[name][suffix] = item
+            matched = True
+            break
+        if not matched:
+            unknown.append(item.role)
+    if unknown:
+        raise ValueError(f"ranking parent contains unknown input roles: {unknown}")
+    observed_singletons = {
+        item.role for item in parent.inputs if item.role in singleton_roles
+    }
+    if observed_singletons != singleton_roles:
+        raise ValueError("ranking parent singleton input roles are incomplete")
+
+    raw_collect_lineage = source_lineage.get("collect_parent_manifests_sha256")
+    if not isinstance(raw_collect_lineage, Mapping) or set(raw_collect_lineage) != {
+        "none",
+        "rope",
+    }:
+        raise ValueError("ranking source collect lineage must contain none and rope")
+    claimed_collect: list[str] = []
+    for condition in ("none", "rope"):
+        values = raw_collect_lineage[condition]
+        if not isinstance(values, (list, tuple)) or len(values) != 1:
+            raise ValueError(
+                "ranking requires exactly one collect parent per condition"
+            )
+        claimed_collect.append(
+            _required_sha256_value(
+                values[0], name=f"ranking {condition} collect parent"
+            )
+        )
+    if len(set(claimed_collect)) != 2:
+        raise ValueError("ranking collect parents must be distinct")
+    manifest_inputs = grouped["collect_manifest"]
+    if set(manifest_inputs) != set(claimed_collect):
+        raise ValueError(
+            "ranking collect-manifest roles differ from representation lineage"
+        )
+    if any(item.sha256 != suffix for suffix, item in manifest_inputs.items()):
+        raise ValueError(
+            "ranking collect-manifest role suffix differs from its file digest"
+        )
+    if set(grouped["collect_index"]) != set(manifest_inputs):
+        raise ValueError(
+            "ranking collect-index roles differ from collect-manifest parents"
+        )
+    expected_activation_count = 2 * ranking_dataset_count
+    if len(grouped["activation"]) != expected_activation_count:
+        raise ValueError(
+            "ranking activation input count differs from two conditions times the "
+            "feature-ranking roster"
+        )
+    expected_total = (
+        len(singleton_roles) + 4 + expected_activation_count
+    )
+    if len(parent.inputs) != expected_total:
+        raise ValueError("ranking parent input-role schema is not exact")
+
+
+def _ranking_feature_list(value: Any, *, name: str) -> tuple[int, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{name} must be a non-empty JSON list")
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        raise TypeError(f"{name} must contain integer indices")
+    result = tuple(value)
+    if len(set(result)) != len(result) or min(result) < 0:
+        raise ValueError(f"{name} must contain unique non-negative indices")
+    return result
+
+
+def _ranking_float_array(
+    value: Any,
+    *,
+    name: str,
+    expected: int,
+    non_negative: bool,
+) -> np.ndarray:
+    if not isinstance(value, list):
+        raise TypeError(f"ranking {name} must be a JSON list")
+    array = np.asarray(value, dtype=np.float64)
+    if array.shape != (expected,) or not np.isfinite(array).all():
+        raise ValueError(f"ranking {name} shape or finiteness is invalid")
+    if non_negative and (array < 0.0).any():
+        raise ValueError(f"ranking {name} must be non-negative")
+    return array
+
+
+def _ranking_integer_array(
+    value: Any,
+    *,
+    name: str,
+    expected: int,
+    maximum: int,
+) -> np.ndarray:
+    if (
+        not isinstance(value, list)
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+    ):
+        raise TypeError(f"ranking {name} must contain JSON integers")
+    array = np.asarray(value, dtype=np.int64)
+    if (
+        array.shape != (expected,)
+        or (array < 0).any()
+        or (array > maximum).any()
+    ):
+        raise ValueError(f"ranking {name} values are outside their roster")
+    return array
+
+
+def _ranking_numeric_array_sha256(value: np.ndarray) -> str:
+    array = np.asarray(value)
+    if array.dtype.kind == "f":
+        canonical = np.asarray(array, dtype="<f8", order="C")
+    elif array.dtype.kind in {"i", "u"}:
+        canonical = np.asarray(array, dtype="<i8", order="C")
+    else:
+        raise TypeError("ranking numeric digest requires floats or integers")
+    header = json.dumps(
+        {"dtype": canonical.dtype.str, "shape": list(canonical.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(
+        header + b"\0" + canonical.tobytes(order="C")
+    ).hexdigest()
+
+
+def _ranking_activation_binding(
+    value: Any, *, dataset_ids: Sequence[str]
+) -> dict[str, dict[str, str]]:
+    if not isinstance(value, Mapping) or set(value) != {"none", "rope"}:
+        raise ValueError(
+            "ranking activation binding must contain exactly none and rope"
+        )
+    result: dict[str, dict[str, str]] = {}
+    for condition in sorted(value):
+        datasets = value[condition]
+        if not isinstance(datasets, Mapping) or tuple(sorted(datasets)) != tuple(
+            dataset_ids
+        ):
+            raise ValueError(
+                "ranking activation dataset roster differs from the split"
+            )
+        result[condition] = {
+            dataset_id: _required_sha256_value(
+                datasets[dataset_id], name="ranking activation digest"
+            )
+            for dataset_id in dataset_ids
+        }
+    return result
+
+
+def _ranking_dataset_scalar_mapping(
+    value: Any, *, dataset_ids: Sequence[str], name: str
+) -> dict[str, float]:
+    if not isinstance(value, Mapping) or tuple(sorted(value)) != tuple(dataset_ids):
+        raise ValueError(f"ranking {name} roster differs from the split")
+    result = {
+        dataset_id: _finite_number(value[dataset_id], name=f"{name} value")
+        for dataset_id in dataset_ids
+    }
+    if any(item <= 0.0 for item in result.values()):
+        raise ValueError(f"ranking {name} values must be positive")
+    return result
+
+
+def _ranking_dataset_digest_mapping(
+    value: Any, *, dataset_ids: Sequence[str], name: str
+) -> dict[str, str]:
+    if not isinstance(value, Mapping) or tuple(sorted(value)) != tuple(dataset_ids):
+        raise ValueError(f"ranking {name} roster differs from the split")
+    return {
+        dataset_id: _required_sha256_value(
+            value[dataset_id], name=f"{name} value"
+        )
+        for dataset_id in dataset_ids
+    }
 
 
 def _validate_parent_manifest(parent: RunManifest, *, site: str) -> None:
@@ -5317,6 +6347,7 @@ def _summary_payload(
     random_seed: int,
     thresholds: Mapping[str, float],
     paired_source_binding: Mapping[str, Any] | None,
+    ranking_parent_binding: Mapping[str, Any] | None,
     checkpoint_study: Mapping[str, Any],
 ) -> dict[str, Any]:
     condition_metrics = {
@@ -5542,6 +6573,7 @@ def _summary_payload(
                 "roundtrip_restore_control_passed": True,
             },
             "paired_reverse_patch": paired_summary,
+            "ranking_parent": ranking_parent_binding,
             "checkpoint_study": checkpoint_study,
             "no_op_gates": {
                 "passed": True,
@@ -5577,6 +6609,21 @@ def _summary_payload(
                 "freeze_artifact_sha256": freeze_artifact_sha256,
                 "selection_parent_manifest_sha256": (
                     selection_parent_manifest_sha256
+                ),
+                "ranking_parent_manifest_sha256": (
+                    None
+                    if ranking_parent_binding is None
+                    else ranking_parent_binding["manifest_sha256"]
+                ),
+                "ranking_selection_sha256": (
+                    None
+                    if ranking_parent_binding is None
+                    else ranking_parent_binding["selection_sha256"]
+                ),
+                "ranking_split_protocol_sha256": (
+                    None
+                    if ranking_parent_binding is None
+                    else ranking_parent_binding["split_protocol_sha256"]
                 ),
                 "checkpoint_study_sha256": checkpoint_study[
                     "binding_sha256"

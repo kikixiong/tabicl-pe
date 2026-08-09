@@ -1399,6 +1399,7 @@ def _condition_input_specs(
     paths: dict[str, Path],
     expected_hashes: dict[str, str],
     collect_runs: dict[Path, "_CollectRunSource"],
+    verify_complete_runs: bool = True,
 ) -> dict[str, dict[str, "_CollectActivationReference"]]:
     if not values:
         raise ValueError(f"{split}_by_condition must not be empty")
@@ -1423,7 +1424,11 @@ def _condition_input_specs(
             )
             source = collect_runs.get(run_dir)
             if source is None:
-                source = _verify_collect_run_source(run_dir)
+                source = (
+                    _verify_collect_run_source(run_dir)
+                    if verify_complete_runs
+                    else _verify_parent_bound_collect_run_source(run_dir)
+                )
                 collect_runs[run_dir] = source
                 _register_additional_input(
                     paths,
@@ -1616,6 +1621,59 @@ def _verify_collect_run_source(run_dir: Path) -> _CollectRunSource:
     return _CollectRunSource(
         directory=run_dir,
         manifest=exact_manifest,
+        manifest_file=manifest_file,
+        manifest_role=f"source.collect_manifest.{parent_token}",
+        index_file=index_file,
+        index_role=f"source.collect_index.{parent_token}",
+        index=index,
+    )
+
+
+def _verify_parent_bound_collect_run_source(run_dir: Path) -> _CollectRunSource:
+    """Verify collect metadata without opening unselected activation artifacts.
+
+    This narrow loader is only for a descendant workflow that subsequently
+    proves the manifest, index, and selected artifact roles are already bound
+    by a completed strict parent.  Unlike :func:`_verify_collect_run_source`, it
+    intentionally inventories but does not hash unrelated activation shards.
+    """
+
+    manifest_file = verify_file(run_dir / "manifest.json")
+    manifest = load_verified_run_manifest(manifest_file)
+    if not isinstance(manifest, RunManifest) or manifest.command != "collect":
+        raise ValueError("parent-bound sources must come from a collect run")
+    if manifest.evidence_level != "strict" or manifest.legacy_reasons:
+        raise ValueError("parent-bound sources require strict collect evidence")
+    parent_token = manifest_file.digest.sha256
+    index_artifact = _declared_artifact(manifest, "activation-index.json")
+    index_file = verify_file(
+        run_dir / index_artifact.name,
+        expected_sha256=index_artifact.sha256,
+    )
+    if index_file.digest.size_bytes != index_artifact.size_bytes:
+        raise ValueError("collect activation index size does not match its manifest")
+    index = _parse_collect_activation_index(index_file.read_bytes())
+    indexed_artifacts = {"activation-index.json"} | {
+        entry.artifact_name for entry in index.entries
+    }
+    declared_artifacts = {artifact.name for artifact in manifest.artifacts}
+    if indexed_artifacts != declared_artifacts:
+        raise ValueError(
+            "collect manifest artifacts do not match its path-free activation index"
+        )
+    expected_names = {"manifest.json", *declared_artifacts}
+    observed_names: set[str] = set()
+    for entry in run_dir.iterdir():
+        if entry.is_symlink() or not entry.is_file():
+            raise ValueError("collect run must contain only flat regular files")
+        observed_names.add(entry.name)
+    if observed_names != expected_names:
+        raise ValueError("collect run inventory differs from its manifest")
+    manifest_file.assert_unchanged()
+    index_file.assert_unchanged()
+    return _CollectRunSource(
+        directory=run_dir,
+        manifest=manifest,
         manifest_file=manifest_file,
         manifest_role=f"source.collect_manifest.{parent_token}",
         index_file=index_file,

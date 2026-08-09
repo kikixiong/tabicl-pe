@@ -18,6 +18,7 @@ from pe_mechanism.localization import (
     _ensemble_schedule_sha256,
     _portable_summary,
     _validate_configuration,
+    _validate_matched_checkpoint_pair_schema,
     _verify_snapshot_pair,
     evaluate_official_tabicl_rope_conditions,
     run_localization,
@@ -267,7 +268,7 @@ def test_localization_config_requires_noop_global_and_layer_conditions(tmp_path:
 def _checkpoint(path: Path, *, mode: str, step: int) -> None:
     state_dict = {"weight": torch.ones(1)}
     if mode == "rope":
-        state_dict["row_interactor.tf_row.rope.freqs"] = torch.ones(1)
+        state_dict["row_interactor.tf_row.rope.freqs"] = torch.ones(2)
     torch.save(
         {
             "config": {
@@ -281,6 +282,94 @@ def _checkpoint(path: Path, *, mode: str, step: int) -> None:
         },
         path,
     )
+
+
+def _matched_checkpoint_schema():
+    common_config = {
+        "row_num_blocks": 3,
+        "row_nhead": 8,
+        "embed_dim": 128,
+    }
+    common_state = {"weight": ((128, 128), "torch.float32")}
+    return {
+        "rope_config": {"row_identity_mode": "rope", **common_config},
+        "none_config": {"row_identity_mode": "none", **common_config},
+        "rope_schema": {
+            **common_state,
+            "row_interactor.tf_row.rope.freqs": ((8,), "torch.float32"),
+        },
+        "none_schema": common_state,
+    }
+
+
+def test_matched_checkpoint_schema_accepts_only_derived_rope_frequency_state() -> None:
+    _validate_matched_checkpoint_pair_schema(**_matched_checkpoint_schema())
+
+
+def test_matched_checkpoint_schema_rejects_rope_frequency_on_none_arm() -> None:
+    inputs = _matched_checkpoint_schema()
+    frequency = inputs["rope_schema"].pop("row_interactor.tf_row.rope.freqs")
+    inputs["none_schema"]["row_interactor.tf_row.rope.freqs"] = frequency
+
+    with pytest.raises(ValueError, match="state-schema difference"):
+        _validate_matched_checkpoint_pair_schema(**inputs)
+
+
+@pytest.mark.parametrize("arm", ["rope", "none"])
+def test_matched_checkpoint_schema_rejects_unknown_arm_only_state(arm: str) -> None:
+    inputs = _matched_checkpoint_schema()
+    inputs[f"{arm}_schema"]["unexpected.state"] = ((1,), "torch.float32")
+
+    with pytest.raises(ValueError, match="state-schema difference"):
+        _validate_matched_checkpoint_pair_schema(**inputs)
+
+
+@pytest.mark.parametrize(
+    ("signature", "expected_error"),
+    [
+        (((127, 128), "torch.float32"), "tensor schemas differ"),
+        (((128, 128), "torch.float64"), "tensor schemas differ"),
+    ],
+)
+def test_matched_checkpoint_schema_rejects_common_tensor_drift(
+    signature: tuple[tuple[int, ...], str], expected_error: str
+) -> None:
+    inputs = _matched_checkpoint_schema()
+    inputs["rope_schema"]["weight"] = signature
+
+    with pytest.raises(ValueError, match=expected_error):
+        _validate_matched_checkpoint_pair_schema(**inputs)
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [((7,), "torch.float32"), ((8,), "torch.float64")],
+)
+def test_matched_checkpoint_schema_rejects_wrong_rope_frequency_signature(
+    signature: tuple[tuple[int, ...], str],
+) -> None:
+    inputs = _matched_checkpoint_schema()
+    inputs["rope_schema"]["row_interactor.tf_row.rope.freqs"] = signature
+
+    with pytest.raises(ValueError, match="does not match the checkpoint config"):
+        _validate_matched_checkpoint_pair_schema(**inputs)
+
+
+def test_matched_checkpoint_schema_rejects_odd_head_dimension() -> None:
+    inputs = _matched_checkpoint_schema()
+    inputs["rope_config"]["row_nhead"] = 128
+    inputs["none_config"]["row_nhead"] = 128
+
+    with pytest.raises(ValueError, match="cannot derive the RoPE frequency shape"):
+        _validate_matched_checkpoint_pair_schema(**inputs)
+
+
+def test_matched_checkpoint_schema_rejects_config_drift() -> None:
+    inputs = _matched_checkpoint_schema()
+    inputs["rope_config"]["row_num_blocks"] = 4
+
+    with pytest.raises(ValueError, match="outside row_identity_mode"):
+        _validate_matched_checkpoint_pair_schema(**inputs)
 
 
 def _snapshot_context(tmp_path: Path, *, mutate: str | None = None):

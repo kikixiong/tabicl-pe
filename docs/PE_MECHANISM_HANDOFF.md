@@ -43,6 +43,15 @@ and sampling choices were frozen in
 TabPFN v2.6 checkpoint is still unavailable, so real-model TabPFN experiments
 remain gated on official license/access and content verification.
 
+The four whole-row collection transactions and all three pre-registered
+representation fits have completed and independently verified.  The discovery
+pair contains 111,616 aligned finite vectors per condition.  PCA-512 passed
+with validation explained variance 1.0 and dense AE-384 passed with 0.9773
+pooled, 0.9740 No-PE and 0.9727 RoPE.  The Top-K SAE failed decisively at
+0.6034 pooled validation explained variance despite 0.9906 training fidelity;
+do not tune it on the fixed fidelity roster or carry it into causal edits.
+Neither qualifying representation has yet passed its live model no-op gate.
+
 The analysis package is a descendant workstream. It must never be imported by
 or copied into a running exploratory training job. Every evidence run uses a
 clean, detached checkout of the exact training/model SHA and records the exact
@@ -109,22 +118,18 @@ study caps private activations at 30 GiB and stops new generation below a
 
 ## Ordered continuation
 
-1. Complete and independently verify the two 109-dataset whole-row discovery
-   collections and the two fixed eight-dataset fidelity collections under exact
-   commit `b2db351...`. Require matching rosters, raw-call schedules,
-   normalization views, feature/class shuffles, coordinates, axes and alignment
-   hashes. Never manually reorder an index.
-2. Train exactly the three models frozen in
-   `whole-row-representation-v2.json`. Use deterministic equal-per-dataset
-   sampling. Reject a model if pooled or either-condition validation explained
-   variance is below 95%; do not tune on the eight fidelity datasets.
-3. For every qualifying model, run live no-op reconstruction first. Then split
+1. Preserve the verified whole-row artifacts and the representation decision:
+   PCA and dense AE qualify for live no-op testing; Top-K SAE is rejected.
+2. For every qualifying model, run live no-op reconstruction first. Then split
    discovery datasets exactly as frozen in
    `whole-row-causal-split-v1.json`: 73 for feature ranking and 36 only for
    causal testing. Choose target and matched random features without using the
    causal-test outcomes, then run target deletion plus RoPE-to-No-PE and
    No-PE-to-RoPE independently sourced patches on the pre-hashed sample
    rosters. Keep the pilot scope discovery-only.
+3. Treat the 36-table result as exploratory because the unsupervised
+   representation dictionary was trained across all 109 discovery datasets;
+   it is outcome-disjoint, not representation-level untouched.
 4. Do not resume broad block-0/1 collection over large tables until capture
    metadata explicitly represents repeated internal chunk invocations. The
    completed small-roster block-level PCA negative remains valid.

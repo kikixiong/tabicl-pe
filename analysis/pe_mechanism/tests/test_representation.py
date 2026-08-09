@@ -213,13 +213,22 @@ def _strict_official_collect_run(
     artifact_name = f"activation-{condition}-{split}.npz"
     rows = int(values.shape[0])
     call_index = np.zeros(rows, dtype=np.int32)
-    coordinates = np.column_stack(
-        (
-            np.zeros(rows, dtype=np.int64),
-            np.arange(rows, dtype=np.int64),
-            np.full(rows, coordinate_token, dtype=np.int64),
+    site = str(provenance["sites"][0])  # type: ignore[index]
+    if site == "row_interactor":
+        coordinates = np.column_stack(
+            (
+                np.zeros(rows, dtype=np.int64),
+                np.arange(rows, dtype=np.int64),
+            )
         )
-    )
+    else:
+        coordinates = np.column_stack(
+            (
+                np.zeros(rows, dtype=np.int64),
+                np.arange(rows, dtype=np.int64),
+                np.full(rows, coordinate_token, dtype=np.int64),
+            )
+        )
     with (run_dir / artifact_name).open("wb") as handle:
         np.savez_compressed(
             handle,
@@ -259,7 +268,6 @@ def _strict_official_collect_run(
         )
         for item in inputs
     )
-    site = str(provenance["sites"][0])  # type: ignore[index]
     local_group_map = [
         [(index + coordinate_variant) % raw_feature_count]
         for index in range(raw_feature_count)
@@ -309,21 +317,34 @@ def _strict_official_collect_run(
         "local_feature_group_map": local_group_map,
         "official_forward_calls": forward_calls,
     }
-    axis_names = ["table", "row", "feature_group_or_cls", "embedding"]
+    if site == "row_interactor":
+        axis_names = ["table", "row", "row_representation"]
+        vector_axis_name = "row_representation"
+        activation_shapes = [[1, rows, int(values.shape[1])]]
+        feature_group_token_offset = None
+        registered_cls_token_count = None
+        seen_vectors = rows
+    else:
+        axis_names = ["table", "row", "feature_group_or_cls", "embedding"]
+        vector_axis_name = "embedding"
+        activation_shapes = [
+            [1, rows, activation_token_count, int(values.shape[1])]
+        ]
+        feature_group_token_offset = cls_token_count
+        registered_cls_token_count = cls_token_count
+        seen_vectors = rows * activation_token_count
     site_entry = {
         "dataset_id": dataset_id,
         "file": artifact_name,
         "axis_names": axis_names,
-        "activation_shapes": [
-            [1, rows, activation_token_count, int(values.shape[1])]
-        ],
+        "activation_shapes": activation_shapes,
         "coordinate_axis_names": axis_names[:-1],
-        "vector_axis_name": "embedding",
-        "feature_group_token_offset": cls_token_count,
-        "cls_token_count": cls_token_count,
+        "vector_axis_name": vector_axis_name,
+        "feature_group_token_offset": feature_group_token_offset,
+        "cls_token_count": registered_cls_token_count,
         "feature_dim": int(values.shape[1]),
         "dtype": str(values.dtype),
-        "seen_vectors": rows * activation_token_count,
+        "seen_vectors": seen_vectors,
         "retained_vectors": rows,
         "preprocessing_trace_sha256": trace_sha,
     }
@@ -400,8 +421,21 @@ def _strict_lineage_config(
     raw_feature_count: int = 2,
     activation_token_count: int = 2,
     coordinate_token: int = 0,
+    site: str = "row_block_0",
+    extra_dataset_assignments: tuple[tuple[str, str], ...] = (),
 ) -> tuple[dict[str, object], dict[str, tuple[Path, dict[str, str]]]]:
     provenance = _provenance(tmp_path, monkeypatch)
+    provenance["sites"] = [site]
+    if extra_dataset_assignments:
+        dataset_manifest = Path(str(provenance["dataset_manifest_path"]))
+        manifest_payload = json.loads(dataset_manifest.read_text(encoding="utf-8"))
+        manifest_payload["assignments"].extend(
+            {"name": name, "split": split}
+            for name, split in extra_dataset_assignments
+        )
+        dataset_manifest.write_text(
+            json.dumps(manifest_payload, sort_keys=True), encoding="utf-8"
+        )
     activations = np.random.default_rng(4).normal(size=(32, 4)).astype(np.float32)
     rope_checkpoint = tmp_path / "raw-model-rope.ckpt"
     rope_checkpoint.write_bytes(b"distinct rope model checkpoint")

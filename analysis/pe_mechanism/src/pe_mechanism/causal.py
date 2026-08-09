@@ -48,6 +48,42 @@ def decoder_feature_norms(decoder: nn.Linear | Tensor) -> Tensor:
     return weight.detach().to(dtype=torch.float32, device="cpu").norm(dim=0)
 
 
+def raw_space_decoder_feature_norms(
+    model: nn.Module, normalizer: nn.Module
+) -> Tensor:
+    """Return decoder norms after mapping directions to raw activation units.
+
+    The float64 scaling followed by the canonical float32 norm is intentional.
+    Ranking producers and causal consumers must use these exact operations so an
+    immutable ranking can be compared bit-for-bit with its bound representation.
+    """
+
+    decoder = getattr(model, "decoder", None)
+    if isinstance(decoder, nn.Linear):
+        normalized_directions = decoder.weight.detach().to(
+            dtype=torch.float64, device="cpu"
+        )
+    else:
+        components = getattr(model, "components", None)
+        if not isinstance(components, Tensor) or components.ndim != 2:
+            raise TypeError(
+                "representation model does not expose linear decoder directions"
+            )
+        normalized_directions = (
+            components.detach()
+            .to(dtype=torch.float64, device="cpu")
+            .transpose(0, 1)
+        )
+    rms = getattr(normalizer, "rms", None)
+    if not isinstance(rms, Tensor) or rms.ndim != 1:
+        raise TypeError("representation normalizer must expose one-dimensional rms")
+    raw_scale = rms.detach().to(dtype=torch.float64, device="cpu")
+    if normalized_directions.shape[0] != raw_scale.numel():
+        raise ValueError("decoder output dimension differs from normalizer rms")
+    raw_directions = normalized_directions * raw_scale[:, None]
+    return decoder_feature_norms(raw_directions).to(dtype=torch.float64)
+
+
 def matched_random_control_features(
     target_features: Sequence[int],
     frequencies: Tensor | np.ndarray,
@@ -690,6 +726,7 @@ __all__ = [
     "model_decoder_feature_norms",
     "no_op_reconstruction",
     "paired_effect_records",
+    "raw_space_decoder_feature_norms",
     "run",
     "select_matched_random_features",
     "summarize_effect_records",

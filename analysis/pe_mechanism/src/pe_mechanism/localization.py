@@ -106,6 +106,7 @@ _REQUIRED_ESTIMATOR_OPTIONS = {
     "use_fa3",
     "random_state",
 }
+_ROPE_FREQUENCY_STATE_KEY = "row_interactor.tf_row.rope.freqs"
 
 
 def evaluate_official_tabicl_rope_conditions(
@@ -272,6 +273,57 @@ def _raise_condition_type() -> RopeCondition:
     raise TypeError("each rope_conditions entry must be an object")
 
 
+def _validate_matched_checkpoint_pair_schema(
+    *,
+    rope_config: Mapping[str, Any],
+    none_config: Mapping[str, Any],
+    rope_schema: Mapping[str, tuple[tuple[int, ...], str]],
+    none_schema: Mapping[str, tuple[tuple[int, ...], str]],
+) -> None:
+    """Validate a path-free Stable-RoPE/No-PE checkpoint schema contract."""
+
+    if rope_config.get("row_identity_mode") != "rope":
+        raise ValueError("RoPE checkpoint config has an unexpected row_identity_mode")
+    if none_config.get("row_identity_mode") != "none":
+        raise ValueError("No-PE checkpoint config has an unexpected row_identity_mode")
+
+    rope_common = {
+        key: value for key, value in rope_config.items() if key != "row_identity_mode"
+    }
+    none_common = {
+        key: value for key, value in none_config.items() if key != "row_identity_mode"
+    }
+    if rope_common != none_common:
+        raise ValueError("matched checkpoints differ outside row_identity_mode")
+
+    expected_rope_only = {_ROPE_FREQUENCY_STATE_KEY}
+    if set(rope_schema) - set(none_schema) != expected_rope_only:
+        raise ValueError("RoPE checkpoint has an unexpected state-schema difference")
+    if set(none_schema) - set(rope_schema):
+        raise ValueError("No-PE checkpoint has an unexpected state-schema difference")
+    for key in none_schema:
+        if rope_schema[key] != none_schema[key]:
+            raise ValueError("matched checkpoint tensor schemas differ")
+
+    embed_dim = rope_common.get("embed_dim")
+    row_nhead = rope_common.get("row_nhead")
+    if (
+        type(embed_dim) is not int
+        or type(row_nhead) is not int
+        or embed_dim <= 0
+        or row_nhead <= 0
+        or embed_dim % row_nhead != 0
+        or (embed_dim // row_nhead) % 2 != 0
+    ):
+        raise ValueError("checkpoint config cannot derive the RoPE frequency shape")
+    expected_frequency_schema = (
+        (embed_dim // row_nhead // 2,),
+        "torch.float32",
+    )
+    if rope_schema[_ROPE_FREQUENCY_STATE_KEY] != expected_frequency_schema:
+        raise ValueError("RoPE frequency state does not match the checkpoint config")
+
+
 def _verify_snapshot_pair(
     context: VerifiedRunContext,
     *,
@@ -362,18 +414,12 @@ def _verify_snapshot_pair(
 
     rope_config, rope_schema = identities["rope"]
     none_config, none_schema = identities["none"]
-    rope_common = {key: value for key, value in rope_config.items() if key != "row_identity_mode"}
-    none_common = {key: value for key, value in none_config.items() if key != "row_identity_mode"}
-    if rope_common != none_common:
-        raise ValueError("matched checkpoints differ outside row_identity_mode")
-    expected_rope_only = {"row_interactor.tf_row.rope.freqs"}
-    if set(rope_schema) - set(none_schema) != expected_rope_only:
-        raise ValueError("RoPE checkpoint has an unexpected state-schema difference")
-    if set(none_schema) - set(rope_schema):
-        raise ValueError("No-PE checkpoint has an unexpected state-schema difference")
-    for key in none_schema:
-        if rope_schema[key] != none_schema[key]:
-            raise ValueError("matched checkpoint tensor schemas differ")
+    _validate_matched_checkpoint_pair_schema(
+        rope_config=rope_config,
+        none_config=none_config,
+        rope_schema=rope_schema,
+        none_schema=none_schema,
+    )
     return rope_config
 
 

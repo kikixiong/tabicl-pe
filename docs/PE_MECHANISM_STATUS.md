@@ -124,6 +124,30 @@ outcomes, but target/control features may use only the 73-table ranking subset;
 causal effects are measured only on the 36-table test subset with pre-hashed
 sample rosters.
 
+The whole-row collection and representation runs have now completed.  Strict
+verification found 111,616 finite 512-dimensional vectors per condition across
+all 109 discovery datasets.  RoPE and No-PE use the same dataset roster, raw
+inference schedule, retained-vector count, call indices and sampled row
+coordinates, while every dataset has non-identical condition activations.  The
+separate eight-dataset fidelity collections are also finite and coordinate
+aligned; representation training selected 10,816 equal-weight validation rows
+per condition from them.
+
+Full-rank PCA-512 reconstructed both conditions with explained variance 1.0,
+as expected for a non-compressing coordinate baseline.  Dense AE-384 retained
+0.9941 training explained variance and passed the frozen validation gate:
+0.9773 pooled, 0.9740 for No-PE and 0.9727 for RoPE.  The 8x Top-K SAE with
+`k=64` retained 0.9906 on its training activations but collapsed to 0.6034 on
+the disjoint fidelity roster (0.6000 No-PE and 0.6173 RoPE), so it is rejected
+without validation-driven retuning.  PCA and dense AE still require live
+model no-op checks before causal use.  These are reconstruction results, not
+evidence of a positional mechanism or downstream improvement.
+
+Because the unsupervised representation dictionary used all 109 discovery
+datasets, the 36 causal-test datasets are disjoint from feature ranking and
+model outcomes but are not representation-level untouched holdouts.  Results
+from the legacy step-250000 pair therefore remain explicitly exploratory.
+
 A real released TabPFN v2.6 checkpoint is not locally available to this
 workstream. The mutable descendant tree now contains an offline official
 fixed-weight TALENT runner for `Wp+b`, `Wp`, `b`, and zero-position conditions,
@@ -133,10 +157,8 @@ and a clean TabPFN v7.1.1 checkout.
 
 Still required before a mechanistic claim:
 
-- verify every 109-dataset whole-row collection artifact and exact
-  cross-condition schedule, view, shuffle and sampled-coordinate alignment;
-- train the pre-registered whole-row representations and admit only models that
-  pass pooled and per-condition fidelity plus live no-op gates;
+- pass live model no-op gates for the qualifying PCA and dense-AE
+  representations; the failed Top-K SAE is ineligible;
 - run discovery-only target deletion, matched random controls and independently
   sourced patches in both RoPE/No-PE directions. Restoring the same latent is
   only a round-trip plumbing control;

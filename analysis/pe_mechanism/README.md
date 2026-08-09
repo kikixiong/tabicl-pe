@@ -4,7 +4,7 @@ This is an independent analysis package for studying how positional encodings
 affect TabICLv2 and TabPFN v2.6. It is deliberately separate from the immutable
 formal-training candidate and does not change the public `tabicl` API.
 
-The command-line interface exposes ten workflows:
+The command-line interface exposes eleven workflows:
 
 ```text
 pe-mechanism collect          --config CONFIG.json --output-dir /absolute/external/run
@@ -13,6 +13,7 @@ pe-mechanism ablate           --config CONFIG.json --output-dir /absolute/extern
 pe-mechanism localize         --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism tabpfn-localize  --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism train-repr       --config CONFIG.json --output-dir /absolute/external/run
+pe-mechanism rank-condition-shift --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism reconstruction-sensitivity --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism model-causal     --config CONFIG.json --output-dir /absolute/external/run
 pe-mechanism select-features  --config CONFIG.json --output-dir /absolute/external/run
@@ -170,6 +171,23 @@ Dense autoencoders, exact PCA, and top-k sparse autoencoders are available.
 Representation fidelity is measured on datasets excluded from representation
 training. Passing reconstruction is necessary but does not establish a
 mechanism.
+
+`rank-condition-shift` is the exploratory feature-freezing step after a
+qualified shared representation has completed. It accepts only the configured
+feature-ranking roster from the content-bound RoPE and No-PE official
+collection parents already registered by `train-repr`. For each dataset it
+computes the RMS aligned latent difference, scales every coordinate by its
+decoder-direction norm after mapping that direction back through the
+normalizer into raw activation units, divides by the pooled raw-activation RMS,
+then takes the median score across datasets. It selects one target set and one
+activation-frequency/raw-decoder-norm matched random-control set for both donor
+directions. The config explicitly names the parent run, its manifest digest,
+the frozen split-protocol digest, the exact ranking dataset roster and both
+conditions' collect references. The command reads no model-causal predictions
+or outcomes and publishes only a path-free
+`selection.json` plus its manifest in one atomic directory transaction. This
+legacy checkpoint workflow remains discovery-only and cannot establish a
+formal mechanism or downstream improvement.
 
 ## Official model-causal runs
 

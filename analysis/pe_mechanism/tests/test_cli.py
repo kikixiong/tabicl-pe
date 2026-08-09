@@ -18,6 +18,7 @@ from pe_mechanism import cli
         ("localize", ".localization"),
         ("tabpfn-localize", ".tabpfn_localization"),
         ("train-repr", ".representation"),
+        ("rank-condition-shift", ".condition_shift_ranking"),
         ("reconstruction-sensitivity", ".causal"),
         ("model-causal", ".official_causal"),
         ("select-features", ".feature_selection"),
