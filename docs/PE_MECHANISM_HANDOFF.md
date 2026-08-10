@@ -95,15 +95,31 @@ exact result (`p=0.1433`) does not establish a reliable advantage. This run is
 explicitly `formal_eligible=false` and is not a leaderboard reproduction. Do
 not promote it to formal evidence or rerun it merely to search for significance.
 
-The descendant package now also contains a separate formal three-arm
-checkpoint-intake validator and a complete Stage-3 example contract. It checks
-the canonical RoPE/Temporary/No-PE chains, exact checkpoint and finalization
-bytes, the shared transaction ledger, exact training checkout, cross-arm
-cohort provenance, and path-free reporting. It intentionally stops before
-benchmark execution and reports campaign acceptance, terminal scheduler
-evidence, and benchmark readiness as false. Do not turn those fields true from
-the checkpoint ledger alone; they require independently verified production
-acceptance artifacts.
+The descendant package now also contains a separate formal three-arm TabArena
+executor and a complete Stage-3 example contract. Its fail-closed readiness
+step checks the canonical RoPE/Temporary/No-PE chains, exact checkpoint and
+finalization bytes, the shared transaction ledger, the exact training
+checkout, campaign authorization, terminal scheduler evidence and cross-arm
+cohort provenance. The evaluation step is fixed to all 38 datasets and all
+three Stage-3 arms. It stores private per-sample float32 probabilities plus a
+prediction manifest, and proves that training data, test features and labels,
+row order and class order match across arms for every dataset.
+
+Temporary sampling is table-specific rather than globally repeated: its local
+seed is derived from the formal seed and canonical training-table content, and
+the resulting identity is reused for that table's complete prediction
+lifecycle. The runner requires one exact A10 environment, operates offline
+with network access failing closed, isolates runtime and outputs from all
+protected inputs, fixes bootstrap resampling at 10,000 and alpha at 0.05, and
+treats the overall scale-free pairwise Holm family as primary. Metric-group
+families are secondary.
+
+No formal benchmark run exists yet because the matched formal Stage-3 weights,
+especially Temporary, do not exist. Do not turn a successful evaluation into
+campaign acceptance directly. First build a post-evaluation receipt that binds
+the private prediction manifest, matched-dataset digest, evaluation protocol,
+training commit, evaluation commit, campaign and terminal evidence; then have
+the exact training candidate independently validate and publish it.
 
 The offline TabPFN v2.6 positional-decomposition wrapper has passed its
 software tests. No real v2.6 run exists because the official weight is not
@@ -201,9 +217,12 @@ study caps private activations at 30 GiB and stops new generation below a
    validation dataset, including dose-matched controls and the independently
    bound paired reverse patch. Do not use the word rescue unless all
    source-native/source-no-op and dose gates pass.
-9. First pass the formal checkpoint-intake validator, then independently bind
-   campaign acceptance and terminal scheduler evidence before any formal
-   TALENT/TabArena execution.
+9. Once matched formal Stage-3 weights exist, run the formal executor only on
+   one exact A10 environment. Its readiness step must independently pass exact
+   campaign authorization, terminal evidence and three-arm lineage before any
+   dataset loads. Preserve the private prediction archive and manifest, then
+   generate and independently validate the post-evaluation receipt before
+   publishing seed acceptance. No such executor run or receipt exists today.
 10. Acquire and content-bind the released TabPFN v2.6 checkpoint, then run the
    registered `W p + b`, `W p`-only, `b`-only, and neither decomposition.
 11. Hash and externally pre-register the selected intervention, baseline,

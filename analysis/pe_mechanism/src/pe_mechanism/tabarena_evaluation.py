@@ -962,7 +962,22 @@ def _normalize_results(
     roster: tuple[str, ...],
     expected_count: int,
     expected_tasks: Mapping[str, Mapping[str, Any]],
+    arm_order: Sequence[str] = _ARM_ORDER,
 ) -> list[dict[str, Any]]:
+    arms = tuple(arm_order)
+    if (
+        len(arms) < 2
+        or len(set(arms)) != len(arms)
+        or not all(isinstance(arm, str) and arm for arm in arms)
+    ):
+        raise ValueError("TabArena arm order must contain distinct non-empty labels")
+    if (
+        len(framework_to_arm) != len(arms)
+        or set(framework_to_arm.values()) != set(arms)
+    ):
+        raise ValueError("TabArena framework mapping differs from the arm order")
+    if expected_count != len(roster) * len(arms):
+        raise ValueError("TabArena expected result count differs from its arm grid")
     normalized = [
         _normalize_result(result, framework_to_arm=framework_to_arm)
         for result in results
@@ -974,7 +989,7 @@ def _normalize_results(
     keys = [(item["arm"], item["dataset"]) for item in normalized]
     if len(keys) != len(set(keys)):
         raise ValueError("TabArena results contain duplicate arm/dataset pairs")
-    expected_keys = {(arm, dataset) for arm in _ARM_ORDER for dataset in roster}
+    expected_keys = {(arm, dataset) for arm in arms for dataset in roster}
     missing = sorted(expected_keys - set(keys))
     extra = sorted(set(keys) - expected_keys)
     if missing or extra:
@@ -1123,11 +1138,19 @@ def _mean_ranks(
     rows: Mapping[tuple[str, str], Mapping[str, Any]],
     *,
     roster: tuple[str, ...],
+    arm_order: Sequence[str] = _ARM_ORDER,
 ) -> dict[str, float]:
-    ranks = {arm: [] for arm in _ARM_ORDER}
+    arms = tuple(arm_order)
+    if (
+        len(arms) < 2
+        or len(set(arms)) != len(arms)
+        or not all(isinstance(arm, str) and arm for arm in arms)
+    ):
+        raise ValueError("TabArena arm order must contain distinct non-empty labels")
+    ranks = {arm: [] for arm in arms}
     for dataset in roster:
         ordered = sorted(
-            ((float(rows[(arm, dataset)]["metric_error"]), arm) for arm in _ARM_ORDER),
+            ((float(rows[(arm, dataset)]["metric_error"]), arm) for arm in arms),
             key=lambda item: (item[0], item[1]),
         )
         start = 0

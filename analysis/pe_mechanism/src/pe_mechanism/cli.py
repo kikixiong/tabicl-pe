@@ -26,6 +26,7 @@ _COMMAND_MODULES = {
     "select-features": "feature_selection",
     "confirm-features": "confirmation",
     "tabarena-evaluate": "tabarena_evaluation",
+    "tabarena-formal-evaluate": "tabarena_formal_runner",
 }
 
 
@@ -75,6 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         "tabarena-evaluate": (
             "Evaluate a same-step TabICL pair and released reference on TabArena."
+        ),
+        "tabarena-formal-evaluate": (
+            "Evaluate one accepted Stage-3 formal three-arm cohort on TabArena."
         ),
     }
     for command in _COMMAND_MODULES:

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "kind": "formal_tabarena_a10_environment",
+  "python_executable_sha256": "daea5fef2d0b27d3283ee0233bf09c13d6d10f24b550726aada5a3214d470aa5",
+  "python": "3.11.6",
+  "numpy": "2.4.6",
+  "pandas": "2.3.3",
+  "scikit_learn": "1.8.0",
+  "openml": "0.15.1",
+  "autogluon_core": "1.5.1b20260730",
+  "torch": "2.11.0+cu128",
+  "cuda_runtime": "12.8",
+  "cudnn": 91900,
+  "cuda_device_count": 1,
+  "cuda_device_name": "NVIDIA A10",
+  "cuda_device_capability": [
+    8,
+    6
+  ],
+  "nvidia_driver": "580.173.02"
+}

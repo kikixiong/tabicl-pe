@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 import pe_mechanism.tabarena_formal_evaluation as formal
+import pe_mechanism.tabarena_evaluation as tabarena
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -366,6 +367,47 @@ def test_public_validator_has_no_module_injection_seam() -> None:
     assert tuple(inspect.signature(formal.validate_formal_tabarena_inputs).parameters) == (
         "spec",
     )
+
+
+def test_shared_result_normalizer_supports_the_formal_arm_order() -> None:
+    frameworks = {"r": "rope", "t": "temporary", "n": "none"}
+    results = []
+    for framework, error in (("r", 0.3), ("t", 0.2), ("n", 0.1)):
+        results.append(
+            {
+                "experiment_metadata": {},
+                "framework": framework,
+                "memory_usage": {},
+                "metric": "roc_auc",
+                "metric_error": error,
+                "problem_type": "binary",
+                "simulation_artifacts": None,
+                "task_metadata": {
+                    "tid": 7,
+                    "name": "task",
+                    "fold": 0,
+                    "repeat": 0,
+                    "sample": 0,
+                    "split_idx": 0,
+                },
+                "time_infer_s": 0.2,
+                "time_train_s": 0.1,
+            }
+        )
+    normalized = tabarena._normalize_results(
+        results,
+        framework_to_arm=frameworks,
+        roster=("task",),
+        expected_count=3,
+        expected_tasks={
+            "task": {"task_id": 7, "problem_type": "binary", "metric": "roc_auc"}
+        },
+        arm_order=formal.FORMAL_ARMS,
+    )
+    rows = {(row["arm"], row["dataset"]): row for row in normalized}
+    assert tabarena._mean_ranks(
+        rows, roster=("task",), arm_order=formal.FORMAL_ARMS
+    ) == {"rope": 3.0, "temporary": 2.0, "none": 1.0}
 
 
 def test_exact_t_loader_uses_private_module_name_without_importing_tabicl(

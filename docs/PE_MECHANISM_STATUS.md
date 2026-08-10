@@ -32,6 +32,11 @@ Implemented and regression tested:
   lineage from Stage 1 through the evaluated stage;
 - deterministic TALENT/TabArena dataset manifests, paired statistics, atomic
   outputs, storage gates, and public-safe provenance;
+- a fail-closed formal TabArena executor for canonical Stage-3 RoPE,
+  Temporary, and No-PE checkpoints over the fixed 38-dataset roster, with
+  exact-training-candidate campaign and terminal-readiness revalidation,
+  private per-sample float32 predictions, dataset-content fingerprints, fixed
+  paired statistics, and isolated atomic outputs;
 - version-specific TabICLv2 and TabPFN v2.6 instrumentation tests.
 - a strict matched-step TabICLv2 localization runner that binds both step-250000
   pilot checkpoints, their common architecture/state schema, every TALENT input,
@@ -210,16 +215,32 @@ advantage. The run is explicitly `formal_eligible=false`, uses a single lite
 evaluation configuration, and is not a leaderboard reproduction. It cannot be
 used as formal three-arm evidence.
 
-An independent formal three-arm checkpoint-intake contract is now implemented
-without changing the frozen exploratory runner. It requires exactly RoPE,
-Temporary, and No-PE from one seed and one canonical stage; verifies every
-finalized ancestor from Stage 1 through the requested stage against the same
-raw- and logical-digest-bound transaction ledger; delegates checkpoint and
-cohort validation to the exact clean training checkout; and returns only
-path-free evidence. This is deliberately a checkpoint-lineage gate, not a
-completed benchmark runner: it records campaign acceptance, terminal scheduler
-evidence, and benchmark readiness as false until those independent artifacts
-and the real matched checkpoints exist.
+An independent formal three-arm TabArena executor is now implemented without
+changing the frozen exploratory runner. Before evaluation it loads the exact
+clean training candidate, revalidates campaign authorization and terminal
+scheduler evidence, and requires the canonical finalized Stage-3 RoPE,
+Temporary, and No-PE chains from one seed. It then runs the fixed 38 datasets
+for all three arms, stores private per-sample float32 probabilities and a
+content-bound prediction manifest, and verifies that the three arms used the
+  same training data, test features and labels, row order, and class order for
+  every dataset.
+
+Temporary identities are table-specific: the local sampler seed is derived
+from the formal seed and a canonical fingerprint of the training table. The
+same identity is reused throughout one table's prediction lifecycle, while
+different table contents produce different identities. Execution is restricted
+to one exact A10 environment, network access fails closed, and all runtime and
+output locations must be isolated from source, campaign, checkpoint, and data
+inputs. Statistical choices are frozen at 10,000 bootstrap resamples and
+family-wise alpha 0.05; the overall scale-free pairwise comparison is the
+primary Holm-corrected family, while metric-group analyses remain secondary.
+
+The executor has not been run. Matched formal Stage-3 checkpoints do not yet
+exist, and in particular there is no formal Temporary checkpoint. Even after
+a successful benchmark transaction, campaign acceptance remains false until a
+separate post-evaluation receipt binds the prediction manifest, matched-dataset
+digest, evaluation protocol and both training/evaluation commits, and the
+exact training candidate independently validates and publishes that receipt.
 
 A real released TabPFN v2.6 checkpoint is not locally available to this
 workstream. The offline official fixed-weight TALENT wrapper for `Wp+b`, `Wp`,
@@ -238,9 +259,10 @@ Still required before a mechanistic claim:
 - obtain matched formal RoPE, Temporary and No-PE checkpoints before any
   validation selection or held-out TALENT/TabArena confirmation. The legacy
   pair cannot be promoted into that workflow.
-- after the checkpoint-lineage gate passes, independently verify campaign
-  acceptance and terminal scheduler evidence before enabling formal benchmark
-  execution.
+- run the formal executor only after exact-candidate campaign authorization,
+  terminal evidence and all three Stage-3 chains pass its fail-closed readiness
+  gate; then generate, independently validate and publish the post-evaluation
+  receipt before calling the seed accepted.
 
 No supported sparse feature, downstream improvement, or efficiency gain is
 claimed at this stage. Whole-row AE/SAE/causal exploration is complete and
@@ -261,3 +283,8 @@ strictly matched formal RoPE, Temporary, and No-PE checkpoints.
 - A paired rescue uses an independently bound source; a same-pass round trip
   does not satisfy this gate.
 - Public-history and artifact hygiene tests pass before every push.
+- Formal TabArena execution covers all 38 datasets for all three Stage-3 arms,
+  preserves private per-sample predictions, and proves identical dataset,
+  row, and class fingerprints across arms.
+- A successful benchmark directory alone is not campaign acceptance; the
+  independently validated post-evaluation receipt is mandatory.

@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "study": {
+    "seed": 42,
+    "temporary_identity_seed": 42,
+    "stage": "stage3",
+    "terminal_step": 10000,
+    "task_subset": "lite",
+    "problem_types": [
+      "binary",
+      "multiclass"
+    ],
+    "device": "cuda",
+    "n_estimators": 1,
+    "augmentation": "none",
+    "ensemble_size": 1,
+    "cache_mode": "ignore",
+    "debug_mode": true,
+    "bootstrap_resamples": 10000,
+    "familywise_alpha": 0.05,
+    "classifier_options": {
+      "norm_methods": [
+        "none",
+        "power"
+      ],
+      "feat_shuffle_method": "latin",
+      "class_shuffle_method": "shift",
+      "outlier_threshold": 4.0,
+      "softmax_temperature": 0.9,
+      "average_logits": true,
+      "support_many_classes": true,
+      "batch_size": 8,
+      "kv_cache": false,
+      "use_amp": "auto",
+      "use_fa3": false,
+      "offload_mode": "auto",
+      "verbose": false
+    }
+  },
+  "formal_inputs": {
+    "config_path": "/absolute/private/tabarena-formal-inputs.json",
+    "expected_config_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "readiness": {
+    "campaign_path": "/absolute/private/formal-campaign/campaign.json",
+    "expected_campaign_file_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "expected_campaign_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "acceptance_registry": "/absolute/private/formal-campaign/acceptances",
+    "terminal_attestation_path": "/absolute/private/formal-campaign-seed42/terminal-scheduler-logs.json",
+    "expected_terminal_file_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "expected_terminal_manifest_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "submission_receipt_path": "/absolute/private/formal-campaign-seed42/submission-receipt.json",
+    "expected_submission_receipt_file_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_submission_receipt_manifest_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+    "protocol_metadata_allowance_bytes": 134217728
+  },
+  "benchmark": {
+    "tabarena_code_root": "/absolute/clean/tabarena",
+    "expected_tabarena_code_sha": "2222222222222222222222222222222222222222",
+    "openml_cache_root": "/absolute/private/openml-cache",
+    "environment_manifest_path": "/absolute/private/tabarena-a10-environment.json",
+    "expected_environment_manifest_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+    "suite_version": "v0.1",
+    "expected_task_count": 38,
+    "expected_result_count": 114
+  },
+  "provenance": {
+    "model_family": "tabicl-v2",
+    "model_revision": "formal-stage3-step-10000",
+    "condition": "tabarena-formal-rope-temporary-none",
+    "sites": [
+      "tabarena-v0.1-classification"
+    ],
+    "checkpoint_path": "/absolute/private/formal-campaign-seed42/arms/rope/stage3/step-10000.ckpt",
+    "dataset_manifest_path": "/absolute/clean/analysis/pe_mechanism/manifests/tabarena-v0.1-classification-roster.json",
+    "training_code_root": "/absolute/clean/formal-training-checkout",
+    "model_code_root": "/absolute/clean/formal-training-checkout",
+    "analysis_code_root": "/absolute/clean/analysis",
+    "expected_checkpoint_sha256": "4133333333333333333333333333333333333333333333333333333333333333",
+    "expected_dataset_manifest_sha256": "3c26133c8b986aba530624b5c7a5dee42e4b29938bc09afa04f76b6462c4adf1",
+    "expected_training_code_sha": "1111111111111111111111111111111111111111",
+    "expected_model_code_sha": "1111111111111111111111111111111111111111",
+    "expected_analysis_code_sha": "3333333333333333333333333333333333333333",
+    "allow_exploratory_legacy": false
+  }
+}
