@@ -1,5 +1,7 @@
 # PE mechanism analysis handoff
 
+**As of:** 2026-08-10 (`Europe/London`)
+
 ## Stable contract
 
 This workstream is a descendant of the immutable formal training candidate at
@@ -33,7 +35,7 @@ consistently more damaging than matched random components, and condition
 specificity was unstable. Preserve this as a credible exploratory negative
 result; do not promote it to a held-out mechanism or enhancement claim.
 
-New whole-row execution uses pushed commit
+The completed whole-row execution used pushed commit
 `b2db3517e3dbc9d224daa1651a5ee4e56d430e14`. It captures the complete
 512-dimensional `row_interactor` output after internal batching has been
 reassembled, which is the supported independently sourced donor boundary.
@@ -84,6 +86,29 @@ positive; descriptive `p=0.5547`). Preserve the sanitized finding at
 `analysis/pe_mechanism/findings/whole-row-pca-dose-matched-exploratory-negative-v1.json`.
 Do not run the reverse direction or dense AE merely to search for a positive
 result; the stopping rule has fired.
+
+The same legacy matched-step pair has completed a TabArena 38-task lite
+evaluation against the released reference model. Mean rank (lower is better)
+was `1.342` for released, `2.184` for No-PE, and `2.474` for RoPE, with 28, 6,
+and 4 task wins respectively. No-PE beat RoPE on 24/38 tasks, but the paired
+exact result (`p=0.1433`) does not establish a reliable advantage. This run is
+explicitly `formal_eligible=false` and is not a leaderboard reproduction. Do
+not promote it to formal evidence or rerun it merely to search for significance.
+
+The descendant package now also contains a separate formal three-arm
+checkpoint-intake validator and a complete Stage-3 example contract. It checks
+the canonical RoPE/Temporary/No-PE chains, exact checkpoint and finalization
+bytes, the shared transaction ledger, exact training checkout, cross-arm
+cohort provenance, and path-free reporting. It intentionally stops before
+benchmark execution and reports campaign acceptance, terminal scheduler
+evidence, and benchmark readiness as false. Do not turn those fields true from
+the checkpoint ledger alone; they require independently verified production
+acceptance artifacts.
+
+The offline TabPFN v2.6 positional-decomposition wrapper has passed its
+software tests. No real v2.6 run exists because the official weight is not
+available to this workstream; license acceptance, authenticated access, and
+content verification remain required.
 
 The analysis package is a descendant workstream. It must never be imported by
 or copied into a running exploratory training job. Every evidence run uses a
@@ -166,17 +191,23 @@ study caps private activations at 30 GiB and stops new generation below a
 5. Treat the 36-table result as exploratory because the unsupervised
    representation dictionary was trained across all 109 discovery datasets;
    it is outcome-disjoint, not representation-level untouched.
-6. Do not resume broad block-0/1 collection over large tables until capture
+6. Preserve the completed 38-task lite TabArena aggregate as exploratory only;
+   it is neither formal-eligible nor a leaderboard reproduction and must not be
+   used as a substitute for matched three-arm confirmation.
+7. Do not resume broad block-0/1 collection over large tables until capture
    metadata explicitly represents repeated internal chunk invocations. The
    completed small-roster block-level PCA negative remains valid.
-7. With matched formal checkpoints, run model interventions on every frozen
+8. With matched formal checkpoints, run model interventions on every frozen
    validation dataset, including dose-matched controls and the independently
    bound paired reverse patch. Do not use the word rescue unless all
    source-native/source-no-op and dose gates pass.
-8. Acquire and content-bind the released TabPFN v2.6 checkpoint, then run the
+9. First pass the formal checkpoint-intake validator, then independently bind
+   campaign acceptance and terminal scheduler evidence before any formal
+   TALENT/TabArena execution.
+10. Acquire and content-bind the released TabPFN v2.6 checkpoint, then run the
    registered `W p + b`, `W p`-only, `b`-only, and neither decomposition.
-9. Hash and externally pre-register the selected intervention, baseline,
+11. Hash and externally pre-register the selected intervention, baseline,
    controls, validation fingerprints, and held-out sample rosters. Then run the
    complete candidate-by-held-out-dataset Cartesian set and apply the frozen
    six-component intersection-union plus Holm confirmation rule.
-10. Publish only sanitized code, protocol, aggregate statistics, and provenance.
+12. Publish only sanitized code, protocol, aggregate statistics, and provenance.

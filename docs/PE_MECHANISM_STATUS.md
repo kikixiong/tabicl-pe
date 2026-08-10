@@ -1,6 +1,6 @@
 # PE mechanism analysis status
 
-**As of:** 2026-08-09 (`Europe/London`)
+**As of:** 2026-08-10 (`Europe/London`)
 
 ## Current phase
 
@@ -107,9 +107,9 @@ was also unstable. This is a credible exploratory negative result for those
 block-level PCA directions, not held-out confirmation and not evidence that
 positional encoding is irrelevant.
 
-The next execution phase uses the complete 512-dimensional output of
+The completed whole-row phase used the complete 512-dimensional output of
 `row_interactor`, the only supported boundary for independently sourced
-RoPE-to-No-PE and No-PE-to-RoPE patches. Collection covers 109 eligible
+RoPE-to-No-PE and No-PE-to-RoPE patches. Collection covered 109 eligible
 discovery datasets and the fixed eight-dataset fidelity roster. Before any
 collection transaction published output, the representation choices were
 frozen in
@@ -201,12 +201,31 @@ indistinguishable from matched-control donor patches: mean log-loss improvement
 search for a positive result. The sanitized finding is recorded in
 `analysis/pe_mechanism/findings/whole-row-pca-dose-matched-exploratory-negative-v1.json`.
 
+The legacy matched-step pair has also completed one TabArena 38-task lite
+evaluation against the released reference model. Mean rank (lower is better)
+was `1.342` for released, `2.184` for No-PE, and `2.474` for RoPE; task wins
+were 28, 6, and 4 respectively. No-PE beat RoPE on 24/38 tasks, with paired
+exact `p=0.1433`, so this is a directional observation rather than a reliable
+advantage. The run is explicitly `formal_eligible=false`, uses a single lite
+evaluation configuration, and is not a leaderboard reproduction. It cannot be
+used as formal three-arm evidence.
+
+An independent formal three-arm checkpoint-intake contract is now implemented
+without changing the frozen exploratory runner. It requires exactly RoPE,
+Temporary, and No-PE from one seed and one canonical stage; verifies every
+finalized ancestor from Stage 1 through the requested stage against the same
+raw- and logical-digest-bound transaction ledger; delegates checkpoint and
+cohort validation to the exact clean training checkout; and returns only
+path-free evidence. This is deliberately a checkpoint-lineage gate, not a
+completed benchmark runner: it records campaign acceptance, terminal scheduler
+evidence, and benchmark readiness as false until those independent artifacts
+and the real matched checkpoints exist.
+
 A real released TabPFN v2.6 checkpoint is not locally available to this
-workstream. The mutable descendant tree now contains an offline official
-fixed-weight TALENT runner for `Wp+b`, `Wp`, `b`, and zero-position conditions,
-but its real-model run remains gated on official license acceptance, token-based
-checkpoint access, content verification, a new clean pushed analysis commit,
-and a clean TabPFN v7.1.1 checkout.
+workstream. The offline official fixed-weight TALENT wrapper for `Wp+b`, `Wp`,
+`b`, and zero-position conditions has passed its software tests, but its
+real-model run remains gated on official license acceptance, authenticated
+checkpoint access, and content verification.
 
 Still required before a mechanistic claim:
 
@@ -219,11 +238,15 @@ Still required before a mechanistic claim:
 - obtain matched formal RoPE, Temporary and No-PE checkpoints before any
   validation selection or held-out TALENT/TabArena confirmation. The legacy
   pair cannot be promoted into that workflow.
+- after the checkpoint-lineage gate passes, independently verify campaign
+  acceptance and terminal scheduler evidence before enabling formal benchmark
+  execution.
 
 No supported sparse feature, downstream improvement, or efficiency gain is
-claimed at this stage. The negative mechanism result is exploratory; existing
-pilot checkpoints remain diagnostic and cannot be promoted to confirmatory
-three-arm evidence.
+claimed at this stage. Whole-row AE/SAE/causal exploration is complete and
+stopped under its pre-declared decision rules. The negative mechanism and lite
+TabArena results are exploratory; confirmatory evaluation still requires
+strictly matched formal RoPE, Temporary, and No-PE checkpoints.
 
 ## Acceptance gates
 

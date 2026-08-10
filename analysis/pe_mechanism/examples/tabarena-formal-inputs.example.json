@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "seed": 42,
+  "stage": "stage3",
+  "terminal_step": 10000,
+  "training_code_root": "/absolute/clean/formal-training-checkout",
+  "expected_training_code_sha": "1111111111111111111111111111111111111111",
+  "artifact_root": "/absolute/private/formal-campaign-seed42",
+  "transaction_ledger_path": "/absolute/private/formal-campaign-seed42/transaction-ledger.json",
+  "expected_transaction_ledger_file_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "expected_transaction_ledger_manifest_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+  "arms": {
+    "rope": {
+      "stage1": {
+        "checkpoint_path": "/absolute/private/formal-campaign-seed42/arms/rope/stage1/step-500000.ckpt",
+        "expected_checkpoint_sha256": "4111111111111111111111111111111111111111111111111111111111111111",
+        "finalized_manifest_path": "/absolute/private/formal-campaign-seed42/arms/rope/stage1/finalized-checkpoint.json",
+        "expected_finalized_manifest_file_sha256": "4211111111111111111111111111111111111111111111111111111111111111",
+        "expected_finalized_manifest_sha256": "4311111111111111111111111111111111111111111111111111111111111111"
+      },
+      "stage2": {
+        "checkpoint_path": "/absolute/private/formal-campaign-seed42/arms/rope/stage2/step-40000.ckpt",
+        "expected_checkpoint_sha256": "4122222222222222222222222222222222222222222222222222222222222222",
+        "finalized_manifest_path": "/absolute/private/formal-campaign-seed42/arms/rope/stage2/finalized-checkpoint.json",
+        "expected_finalized_manifest_file_sha256": "4222222222222222222222222222222222222222222222222222222222222222",
+        "expected_finalized_manifest_sha256": "4322222222222222222222222222222222222222222222222222222222222222"
+      },
+      "stage3": {
+        "checkpoint_path": "/absolute/private/formal-campaign-seed42/arms/rope/stage3/step-10000.ckpt",
+        "expected_checkpoint_sha256": "4133333333333333333333333333333333333333333333333333333333333333",
+        "finalized_manifest_path": "/absolute/private/formal-campaign-seed42/arms/rope/stage3/finalized-checkpoint.json",
+        "expected_finalized_manifest_file_sha256": "4233333333333333333333333333333333333333333333333333333333333333",
+        "expected_finalized_manifest_sha256": "4333333333333333333333333333333333333333333333333333333333333333"
+      }
+    },
+    "temporary": {
+      "stage1": {
+        "checkpoint_path": "/absolute/private/formal-campaign-seed42/arms/temporary/stage1/step-500000.ckpt",
+        "expected_checkpoint_sha256": "5111111111111111111111111111111111111111111111111111111111111111",
+        "finalized_manifest_path": "/absolute/private/formal-campaign-seed42/arms/temporary/stage1/finalized-checkpoint.json",
+        "expected_finalized_manifest_file_sha256": "5211111111111111111111111111111111111111111111111111111111111111",
+        "expected_finalized_manifest_sha256": "5311111111111111111111111111111111111111111111111111111111111111"
+      },
+      "stage2": {
+        "checkpoint_path": "/absolute/private/formal-campaign-seed42/arms/temporary/stage2/step-40000.ckpt",
+        "expected_checkpoint_sha256": "5122222222222222222222222222222222222222222222222222222222222222",
+        "finalized_manifest_path": "/absolute/private/formal-campaign-seed42/arms/temporary/stage2/finalized-checkpoint.json",
+        "expected_finalized_manifest_file_sha256": "5222222222222222222222222222222222222222222222222222222222222222",
+        "expected_finalized_manifest_sha256": "5322222222222222222222222222222222222222222222222222222222222222"
+      },
+      "stage3": {
+        "checkpoint_path": "/absolute/private/formal-campaign-seed42/arms/temporary/stage3/step-10000.ckpt",
+        "expected_checkpoint_sha256": "5133333333333333333333333333333333333333333333333333333333333333",
+        "finalized_manifest_path": "/absolute/private/formal-campaign-seed42/arms/temporary/stage3/finalized-checkpoint.json",
+        "expected_finalized_manifest_file_sha256": "5233333333333333333333333333333333333333333333333333333333333333",
+        "expected_finalized_manifest_sha256": "5333333333333333333333333333333333333333333333333333333333333333"
+      }
+    },
+    "none": {
+      "stage1": {
+        "checkpoint_path": "/absolute/private/formal-campaign-seed42/arms/none/stage1/step-500000.ckpt",
+        "expected_checkpoint_sha256": "6111111111111111111111111111111111111111111111111111111111111111",
+        "finalized_manifest_path": "/absolute/private/formal-campaign-seed42/arms/none/stage1/finalized-checkpoint.json",
+        "expected_finalized_manifest_file_sha256": "6211111111111111111111111111111111111111111111111111111111111111",
+        "expected_finalized_manifest_sha256": "6311111111111111111111111111111111111111111111111111111111111111"
+      },
+      "stage2": {
+        "checkpoint_path": "/absolute/private/formal-campaign-seed42/arms/none/stage2/step-40000.ckpt",
+        "expected_checkpoint_sha256": "6122222222222222222222222222222222222222222222222222222222222222",
+        "finalized_manifest_path": "/absolute/private/formal-campaign-seed42/arms/none/stage2/finalized-checkpoint.json",
+        "expected_finalized_manifest_file_sha256": "6222222222222222222222222222222222222222222222222222222222222222",
+        "expected_finalized_manifest_sha256": "6322222222222222222222222222222222222222222222222222222222222222"
+      },
+      "stage3": {
+        "checkpoint_path": "/absolute/private/formal-campaign-seed42/arms/none/stage3/step-10000.ckpt",
+        "expected_checkpoint_sha256": "6133333333333333333333333333333333333333333333333333333333333333",
+        "finalized_manifest_path": "/absolute/private/formal-campaign-seed42/arms/none/stage3/finalized-checkpoint.json",
+        "expected_finalized_manifest_file_sha256": "6233333333333333333333333333333333333333333333333333333333333333",
+        "expected_finalized_manifest_sha256": "6333333333333333333333333333333333333333333333333333333333333333"
+      }
+    }
+  }
+}
