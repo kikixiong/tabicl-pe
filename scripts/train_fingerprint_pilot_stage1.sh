@@ -31,8 +31,8 @@ MAX_STEPS="${MAX_STEPS:-50000}"
 # This is an exploratory H100 pilot, not the formal protocol.  The effective
 # batch is intentionally larger while the per-microbatch memory stays bounded.
 BATCH_SIZE="${BATCH_SIZE:-256}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-16}"
-N_JOBS="${N_JOBS:-48}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-32}"
+N_JOBS="${N_JOBS:-8}"
 SEED="${SEED:-42}"
 CKPT_DIR="$PILOT_ARTIFACT_ROOT/arms/$ARM/seed-$SEED/checkpoints"
 WANDB_DIR="$PILOT_ARTIFACT_ROOT/arms/$ARM/seed-$SEED/wandb"
