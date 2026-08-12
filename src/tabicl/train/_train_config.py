@@ -83,6 +83,18 @@ def build_parser():
     parser.add_argument(
         "--micro_batch_size", type=int, default=8, help="Size of micro-batches for gradient accumulation"
     )
+    parser.add_argument(
+        "--fail_on_oom",
+        default=False,
+        type=str2bool,
+        help="If True, abort immediately on any CUDA OOM instead of skipping the affected micro-batch.",
+    )
+    parser.add_argument(
+        "--fail_on_nonfinite",
+        default=False,
+        type=str2bool,
+        help="If True, abort before backward when a micro-batch loss is NaN or infinite.",
+    )
 
     # Optimization Config
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -309,6 +321,18 @@ def build_parser():
         choices=["rope", "temporary", "none"],
         default="rope",
         help="Feature identity signal in the row transformer: ordered RoPE, freshly randomized temporary RoPE identity, or no RoPE.",
+    )
+    parser.add_argument(
+        "--row_fingerprint",
+        default=False,
+        type=str2bool,
+        help="Experimental training-only column-summary identity injected into row-attention Q/K. Requires --row_identity_mode none.",
+    )
+    parser.add_argument(
+        "--row_fingerprint_dim",
+        default=16,
+        type=int,
+        help="Low-rank Q/K projection bottleneck for the experimental row fingerprint.",
     )
     parser.add_argument("--freeze_row", default=False, type=str2bool, help="Whether to freeze the row interactor")
 

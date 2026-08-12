@@ -222,6 +222,11 @@ class TabICLCache:
     num_classes : Optional[int]
         Number of classes in classification tasks (0 for regression).
         Stored when caching to ensure consistent output shape during cache use.
+
+    row_fingerprint : Optional[Tensor]
+        Training-only feature summary aligned with row-interaction tokens. It
+        is stored once with the training context and reused unchanged for each
+        cached test batch by experimental fingerprint models.
     """
 
     col_cache: Optional[KVCache] = None
@@ -230,6 +235,7 @@ class TabICLCache:
     train_shape: Tuple[int, int, int] = (0, 0, 0)
     num_classes: Optional[int] = None
     row_identity_permutation: Optional[Tensor] = None
+    row_fingerprint: Optional[Tensor] = None
 
     def __post_init__(self):
         """Initialize sub-caches if not provided."""
@@ -267,6 +273,8 @@ class TabICLCache:
                 self.row_identity_permutation.numel()
                 * self.row_identity_permutation.element_size()
             )
+        if self.row_fingerprint is not None:
+            total += self.row_fingerprint.numel() * self.row_fingerprint.element_size()
         # Count memory from ICLearning
         if self.icl_cache:
             for kv in self.icl_cache.kv.values():
@@ -281,9 +289,10 @@ class TabICLCache:
         """Check if the cache is empty."""
         col_empty = self.col_cache is None or not self.col_cache.kv
         row_empty = self.row_repr is None
+        fingerprint_empty = self.row_fingerprint is None
         icl_empty = self.icl_cache is None or not self.icl_cache.kv
 
-        return col_empty and row_empty and icl_empty
+        return col_empty and row_empty and fingerprint_empty and icl_empty
 
     def slice_batch(self, start: int, end: int) -> TabICLCache:
         """Slice this cache along the batch dimension (dim 0).
@@ -311,6 +320,11 @@ class TabICLCache:
             row_identity_permutation=(
                 self.row_identity_permutation[indices]
                 if self.row_identity_permutation is not None
+                else None
+            ),
+            row_fingerprint=(
+                self.row_fingerprint[indices]
+                if self.row_fingerprint is not None
                 else None
             ),
         )
@@ -342,6 +356,11 @@ class TabICLCache:
                 if self.row_identity_permutation is not None
                 else None
             ),
+            row_fingerprint=(
+                self.row_fingerprint.to(device=device, dtype=dtype)
+                if self.row_fingerprint is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -366,6 +385,24 @@ class TabICLCache:
             raise ValueError(
                 "cannot concat caches with partial row_identity_permutation state"
             )
+        fingerprint_presence = [c.row_fingerprint is not None for c in caches]
+        if any(fingerprint_presence) and not all(fingerprint_presence):
+            raise ValueError("cannot concat caches with partial row_fingerprint state")
+        if all(fingerprint_presence):
+            reference = caches[0].row_fingerprint
+            assert reference is not None
+            for cache in caches[1:]:
+                candidate = cache.row_fingerprint
+                assert candidate is not None
+                if candidate.shape[1:] != reference.shape[1:]:
+                    raise ValueError(
+                        "cannot concat row_fingerprint tensors with different "
+                        "non-batch shapes"
+                    )
+                if candidate.dtype != reference.dtype:
+                    raise ValueError(
+                        "cannot concat row_fingerprint tensors with different dtypes"
+                    )
 
         col_caches = [c.col_cache for c in caches if c.col_cache is not None]
         row_reprs = [c.row_repr for c in caches if c.row_repr is not None]
@@ -374,6 +411,9 @@ class TabICLCache:
             c.row_identity_permutation
             for c in caches
             if c.row_identity_permutation is not None
+        ]
+        row_fingerprints = [
+            c.row_fingerprint for c in caches if c.row_fingerprint is not None
         ]
 
         total_batch = sum(c.train_shape[0] for c in caches)
@@ -390,5 +430,8 @@ class TabICLCache:
                 torch.cat(identity_permutations, dim=dim)
                 if identity_permutations
                 else None
+            ),
+            row_fingerprint=(
+                torch.cat(row_fingerprints, dim=dim) if row_fingerprints else None
             ),
         )

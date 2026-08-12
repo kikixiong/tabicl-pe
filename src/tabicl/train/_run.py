@@ -223,6 +223,9 @@ class Trainer:
     def build_model(self):
         """Build and initialize the TabICL model."""
 
+        row_fingerprint = getattr(self.config, "row_fingerprint", False)
+        row_fingerprint_dim = getattr(self.config, "row_fingerprint_dim", 16)
+
         # Determine the task type. regression_method=None trains for classification;
         # "quantile" trains for quantile regression (max_classes=0) with a pinball loss.
         self.regression = self.config.regression_method is not None
@@ -268,6 +271,8 @@ class Trainer:
             "row_rope_base": self.config.row_rope_base,
             "row_rope_interleaved": self.config.row_rope_interleaved,
             "row_identity_mode": self.config.row_identity_mode,
+            "row_fingerprint": row_fingerprint,
+            "row_fingerprint_dim": row_fingerprint_dim,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
             "icl_ssmax": self.config.ssmax_type if self.config.icl_ssmax else False,
@@ -580,6 +585,10 @@ class Trainer:
         if not getattr(self.config, "formal_training", False):
             self.formal_provenance = None
             return
+        if getattr(self.config, "row_fingerprint", False):
+            raise ValueError(
+                "row_fingerprint is exploratory and cannot be used by the locked formal protocol"
+            )
         max_checkpoint_bytes = getattr(self.config, "max_checkpoint_bytes", None)
         if (
             isinstance(max_checkpoint_bytes, bool)
@@ -1196,6 +1205,11 @@ class Trainer:
                 loss = F.cross_entropy(pred, true)
 
         # Scale loss for gradient accumulation and backpropagate
+        if getattr(self.config, "fail_on_nonfinite", False) and not torch.isfinite(loss).item():
+            raise FloatingPointError(
+                f"non-finite loss in micro-batch {micro_batch_idx + 1}/"
+                f"{num_micro_batches} at step {self.curr_step}"
+            )
         scaled_loss = loss / num_micro_batches
         self.scaler.scale(scaled_loss).backward()
 
@@ -1260,6 +1274,8 @@ class Trainer:
                 for k, v in micro_results.items():
                     results[k] += v
             except torch.cuda.OutOfMemoryError:
+                if getattr(self.config, "fail_on_oom", False):
+                    raise
                 print(
                     f"Warning: OOM error in micro-batch {idx+1}/{num_micro_batches} at step {self.curr_step}. Skipping."
                 )

@@ -366,6 +366,8 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         q: Tensor,
         k: Optional[Tensor] = None,
         v: Optional[Tensor] = None,
+        q_identity: Optional[Tensor] = None,
+        k_identity: Optional[Tensor] = None,
         cached_kv: Optional[KVCacheEntry] = None,
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
@@ -429,6 +431,9 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
                 - v: shape (..., num_heads, src_len, head_dim)
         """
 
+        if cached_kv is not None and k_identity is not None:
+            raise ValueError("k_identity cannot be applied to an already projected KV cache")
+
         if train_size is None:
             k = q if k is None else k
             v = q if v is None else v
@@ -442,9 +447,10 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         if self.norm_first:
             # Pre-norm: normalize first, then apply attention
             q_normed = self.norm1(q)
+            q_attn = q_normed if q_identity is None else q_normed + q_identity
             if use_cache:
                 attn = self._attn_block(
-                    q_normed, cached_kv=cached_kv, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=rope
+                    q_attn, cached_kv=cached_kv, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=rope
                 )
             else:
                 if train_size is None:
@@ -453,9 +459,16 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
                 else:
                     k_normed = v_normed = q_normed[..., :train_size, :]
 
+                if k_identity is not None:
+                    if train_size is not None:
+                        k_identity = k_identity[..., :train_size, :]
+                    k_attn = k_normed + k_identity
+                else:
+                    k_attn = k_normed
+
                 attn_result = self._attn_block(
-                    q_normed,
-                    k_normed,
+                    q_attn,
+                    k_attn,
                     v_normed,
                     key_padding_mask=key_padding_mask,
                     attn_mask=attn_mask,
@@ -472,13 +485,26 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
             x = x + self._ff_block(self.norm2(x))
         else:
             # Post-norm: attention first, then normalize
+            q_attn = q if q_identity is None else q + q_identity
             if use_cache:
                 attn = self._attn_block(
-                    q, cached_kv=cached_kv, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=rope
+                    q_attn, cached_kv=cached_kv, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=rope
                 )
             else:
+                if k_identity is not None:
+                    if train_size is not None:
+                        k_identity = k_identity[..., :train_size, :]
+                    k_attn = k + k_identity
+                else:
+                    k_attn = k
                 attn_result = self._attn_block(
-                    q, k, v, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=rope, need_kv=need_kv
+                    q_attn,
+                    k_attn,
+                    v,
+                    key_padding_mask=key_padding_mask,
+                    attn_mask=attn_mask,
+                    rope=rope,
+                    need_kv=need_kv,
                 )
 
                 if need_kv and isinstance(attn_result, tuple):

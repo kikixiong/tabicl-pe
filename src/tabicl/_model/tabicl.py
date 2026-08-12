@@ -111,6 +111,17 @@ class TabICL(nn.Module):
         randomly reassigns RoPE positions per table and forward pass, while
         preserving the assignment across all rows in that table.
 
+    row_fingerprint : bool, default=False
+        Experimental content-derived feature identity. When enabled, the
+        column embeddings are averaged over training rows only and supplied to
+        the row transformer as a table-level Q/K fingerprint. This treatment
+        is intentionally separate from ``row_identity_mode`` and requires
+        ``row_identity_mode="none"``.
+
+    row_fingerprint_dim : int, default=16
+        Low-rank bottleneck dimension used by each row-attention block to
+        project the training-only feature fingerprint into its Q/K streams.
+
     icl_num_blocks : int, default=12
         Number of transformer blocks in the in-context learning transformer.
 
@@ -185,6 +196,8 @@ class TabICL(nn.Module):
         row_rope_base: float = 100000,
         row_rope_interleaved: bool = True,
         row_identity_mode: Literal["rope", "temporary", "none"] = "rope",
+        row_fingerprint: bool = False,
+        row_fingerprint_dim: int = 16,
         icl_num_blocks: int = 12,
         icl_nhead: int = 8,
         icl_ssmax: Union[
@@ -207,6 +220,22 @@ class TabICL(nn.Module):
         recompute: bool = False,
     ):
         super().__init__()
+        if row_fingerprint and row_identity_mode != "none":
+            raise ValueError(
+                "row_fingerprint is an independent No-PE treatment and requires "
+                "row_identity_mode='none'"
+            )
+        if row_fingerprint and not col_target_aware:
+            raise ValueError(
+                "row_fingerprint requires col_target_aware=True so its training-only "
+                "summary is task-conditioned"
+            )
+        if (
+            isinstance(row_fingerprint_dim, bool)
+            or not isinstance(row_fingerprint_dim, int)
+            or row_fingerprint_dim < 1
+        ):
+            raise ValueError("row_fingerprint_dim must be a positive integer")
         icl_dim = embed_dim * row_num_cls  # CLS tokens are concatenated for ICL
 
         # Determine task type
@@ -235,6 +264,8 @@ class TabICL(nn.Module):
         self.row_rope_base = row_rope_base
         self.row_rope_interleaved = row_rope_interleaved
         self.row_identity_mode = row_identity_mode
+        self.row_fingerprint = row_fingerprint
+        self.row_fingerprint_dim = row_fingerprint_dim
         self.icl_num_blocks = icl_num_blocks
         self.icl_nhead = icl_nhead
         self.icl_ssmax = icl_ssmax
@@ -275,6 +306,7 @@ class TabICL(nn.Module):
             rope_base=row_rope_base,
             rope_interleaved=row_rope_interleaved,
             identity_mode=row_identity_mode,
+            fingerprint_dim=row_fingerprint_dim if row_fingerprint else None,
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,
@@ -318,6 +350,31 @@ class TabICL(nn.Module):
             return math.ceil(num_input_features / self.col_feature_group_size)
         return num_input_features
 
+    def _compute_row_fingerprint(
+        self, col_embeddings: Tensor, train_size: int
+    ) -> Optional[Tensor]:
+        """Summarize each feature token using training rows only.
+
+        The returned tensor has shape ``(B, G+C, E)`` and is aligned with the
+        row transformer's token axis. Reserved CLS slots are exactly zero, so
+        only feature/group tokens carry a fingerprint. Keeping this summary in
+        the original embedding space lets RowInteraction own all learned
+        low-rank Q/K projections.
+        """
+        if not self.row_fingerprint:
+            return None
+        if train_size < 1 or train_size > col_embeddings.shape[1]:
+            raise ValueError(
+                "row fingerprint requires a non-empty training prefix contained "
+                "in the column embeddings"
+            )
+        if col_embeddings.shape[2] < self.row_num_cls:
+            raise ValueError("column embeddings are missing reserved CLS slots")
+
+        train_mean = col_embeddings[:, :train_size].mean(dim=1)
+        cls_zeros = torch.zeros_like(train_mean[:, : self.row_num_cls])
+        return torch.cat([cls_zeros, train_mean[:, self.row_num_cls :]], dim=1)
+
     def _train_forward(
         self,
         X: Tensor,
@@ -325,6 +382,9 @@ class TabICL(nn.Module):
         d: Optional[Tensor] = None,
         embed_with_test: bool = False,
         row_identity_permutation: Optional[Tensor] = None,
+        fingerprint_intervention: Literal["correct", "zero", "permuted", "collapsed"] = "correct",
+        fingerprint_permutation: Optional[Tensor] = None,
+        fingerprint_layer_gates: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning for training.
 
@@ -360,21 +420,32 @@ class TabICL(nn.Module):
         B, T, H = X.shape
         train_size = y_train.shape[1]
         assert train_size <= T, "Number of training samples exceeds total samples"
+        if self.row_fingerprint and embed_with_test:
+            raise ValueError(
+                "row_fingerprint forbids embed_with_test=True because the column "
+                "embeddings could contain test-row information"
+            )
 
         # Check if d is provided and has the same length as the number of features
         if d is not None and len(d.unique()) == 1 and d[0] == H:
             d = None
 
         # Column-wise embedding -> Row-wise interaction
+        col_embeddings = self.col_embedder(
+            X,
+            y_train=y_train,
+            d=d,
+            embed_with_test=embed_with_test,
+        )
+        row_fingerprint = self._compute_row_fingerprint(col_embeddings, train_size)
         representations = self.row_interactor(
-            self.col_embedder(
-                X,
-                y_train=y_train,
-                d=d,
-                embed_with_test=embed_with_test,
-            ),
+            col_embeddings,
             d=d,
             row_identity_permutation=row_identity_permutation,
+            row_fingerprint=row_fingerprint,
+            fingerprint_intervention=fingerprint_intervention,
+            fingerprint_permutation=fingerprint_permutation,
+            fingerprint_layer_gates=fingerprint_layer_gates,
         )
 
         # Dataset-wise in-context learning
@@ -390,6 +461,9 @@ class TabICL(nn.Module):
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
         row_identity_permutation: Optional[Tensor] = None,
+        fingerprint_intervention: Literal["correct", "zero", "permuted", "collapsed"] = "correct",
+        fingerprint_permutation: Optional[Tensor] = None,
+        fingerprint_layer_gates: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -437,21 +511,32 @@ class TabICL(nn.Module):
 
         train_size = y_train.shape[1]
         assert train_size <= X.shape[1], "Number of training samples exceeds total samples"
+        if self.row_fingerprint and embed_with_test:
+            raise ValueError(
+                "row_fingerprint forbids embed_with_test=True because the column "
+                "embeddings could contain test-row information"
+            )
 
         if inference_config is None:
             inference_config = InferenceConfig()
 
         # Column-wise embedding -> Row-wise interaction
+        col_embeddings = self.col_embedder(
+            X,
+            y_train=y_train,
+            embed_with_test=embed_with_test,
+            feature_shuffles=feature_shuffles,
+            mgr_config=inference_config.COL_CONFIG,
+        )
+        row_fingerprint = self._compute_row_fingerprint(col_embeddings, train_size)
         representations = self.row_interactor(
-            self.col_embedder(
-                X,
-                y_train=y_train,
-                embed_with_test=embed_with_test,
-                feature_shuffles=feature_shuffles,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
+            col_embeddings,
             mgr_config=inference_config.ROW_CONFIG,
             row_identity_permutation=row_identity_permutation,
+            row_fingerprint=row_fingerprint,
+            fingerprint_intervention=fingerprint_intervention,
+            fingerprint_permutation=fingerprint_permutation,
+            fingerprint_layer_gates=fingerprint_layer_gates,
         )
 
         # Dataset-wise in-context learning
@@ -476,6 +561,9 @@ class TabICL(nn.Module):
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
         row_identity_permutation: Optional[Tensor] = None,
+        fingerprint_intervention: Literal["correct", "zero", "permuted", "collapsed"] = "correct",
+        fingerprint_permutation: Optional[Tensor] = None,
+        fingerprint_layer_gates: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -538,6 +626,9 @@ class TabICL(nn.Module):
                 d=d,
                 embed_with_test=embed_with_test,
                 row_identity_permutation=row_identity_permutation,
+                fingerprint_intervention=fingerprint_intervention,
+                fingerprint_permutation=fingerprint_permutation,
+                fingerprint_layer_gates=fingerprint_layer_gates,
             )
         else:
             out = self._inference_forward(
@@ -549,6 +640,9 @@ class TabICL(nn.Module):
                 softmax_temperature=softmax_temperature,
                 inference_config=inference_config,
                 row_identity_permutation=row_identity_permutation,
+                fingerprint_intervention=fingerprint_intervention,
+                fingerprint_permutation=fingerprint_permutation,
+                fingerprint_layer_gates=fingerprint_layer_gates,
             )
 
         return out
@@ -656,6 +750,9 @@ class TabICL(nn.Module):
         cache: Optional[TabICLCache] = None,
         cache_mode: str = "kv",
         inference_config: Optional[InferenceConfig] = None,
+        fingerprint_intervention: Literal["correct", "zero", "permuted", "collapsed"] = "correct",
+        fingerprint_permutation: Optional[Tensor] = None,
+        fingerprint_layer_gates: Optional[Tensor] = None,
     ) -> Optional[Tensor]:
         """Forward pass with caching support for efficient inference.
 
@@ -769,6 +866,14 @@ class TabICL(nn.Module):
 
             if self._cache is None or self._cache.is_empty():
                 raise ValueError("No cache available. Call with store_cache=True first.")
+            if self.row_fingerprint and self._cache.row_fingerprint is None:
+                raise ValueError(
+                    "row_fingerprint cache is missing its training-only summary"
+                )
+            if not self.row_fingerprint and self._cache.row_fingerprint is not None:
+                raise ValueError(
+                    "cache contains row_fingerprint state but this model has it disabled"
+                )
 
             X = X_test
             y_train = None
@@ -782,6 +887,21 @@ class TabICL(nn.Module):
             store_cache=store_cache,
             mgr_config=inference_config.COL_CONFIG,
         )
+        if self.row_fingerprint:
+            if store_cache:
+                train_size = y_train.shape[1]
+                row_fingerprint = self._compute_row_fingerprint(
+                    col_embeddings, train_size
+                )
+                self._cache.row_fingerprint = row_fingerprint.detach().clone()
+            else:
+                row_fingerprint = self._cache.row_fingerprint
+                assert row_fingerprint is not None
+                row_fingerprint = row_fingerprint.to(
+                    device=col_embeddings.device, dtype=col_embeddings.dtype
+                )
+        else:
+            row_fingerprint = None
         row_identity_permutation = None
         if self.row_identity_mode == "temporary":
             if store_cache:
@@ -800,6 +920,10 @@ class TabICL(nn.Module):
             col_embeddings,
             mgr_config=inference_config.ROW_CONFIG,
             row_identity_permutation=row_identity_permutation,
+            row_fingerprint=row_fingerprint,
+            fingerprint_intervention=fingerprint_intervention,
+            fingerprint_permutation=fingerprint_permutation,
+            fingerprint_layer_gates=fingerprint_layer_gates,
         )
 
         # Dataset-wise in-context learning

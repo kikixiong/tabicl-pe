@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Literal
 from functools import partial
 from collections import OrderedDict
 
@@ -81,6 +81,7 @@ class RowInteraction(nn.Module):
         rope_base: float = 100000,
         rope_interleaved: bool = True,
         identity_mode: str = "rope",
+        fingerprint_dim: Optional[int] = None,
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
@@ -94,6 +95,16 @@ class RowInteraction(nn.Module):
         self.num_cls = num_cls
         self.norm_first = norm_first
         self.recompute = recompute
+
+        if fingerprint_dim is not None and (
+            isinstance(fingerprint_dim, bool)
+            or not isinstance(fingerprint_dim, int)
+            or fingerprint_dim < 1
+        ):
+            raise ValueError("fingerprint_dim must be a positive integer or None")
+        if fingerprint_dim is not None and identity_mode != "none":
+            raise ValueError("row fingerprint requires identity_mode='none'")
+        self.fingerprint_dim = fingerprint_dim
 
         if identity_mode not in {"rope", "temporary", "none"}:
             raise ValueError(
@@ -122,10 +133,118 @@ class RowInteraction(nn.Module):
 
         self.out_ln = nn.LayerNorm(embed_dim, bias=not bias_free_ln) if norm_first else nn.Identity()
         self.inference_mgr = InferenceManager(enc_name="tf_row", out_dim=embed_dim * self.num_cls, out_no_seq=True)
+
+        # The fingerprint arm has extra parameters, but constructing them must not
+        # advance the global RNG and thereby change the shared ICL initialization.
+        if fingerprint_dim is None:
+            self.fingerprint_q_projections = None
+            self.fingerprint_k_projections = None
+            self.register_parameter("fingerprint_q_gates", None)
+            self.register_parameter("fingerprint_k_gates", None)
+        else:
+            with torch.random.fork_rng(devices=[]):
+                self.fingerprint_q_projections = nn.ModuleList(
+                    [self._make_fingerprint_projection(fingerprint_dim) for _ in range(num_blocks)]
+                )
+                self.fingerprint_k_projections = nn.ModuleList(
+                    [self._make_fingerprint_projection(fingerprint_dim) for _ in range(num_blocks)]
+                )
+            self.fingerprint_q_gates = nn.Parameter(torch.full((num_blocks,), 0.1))
+            self.fingerprint_k_gates = nn.Parameter(torch.full((num_blocks,), 0.1))
         # This fallback exists for direct model use outside Trainer. Formal
         # training injects permutations from TrainerIdentityRNG explicitly.
         self._identity_generator = torch.Generator(device="cpu")
         self._identity_generator.manual_seed(torch.initial_seed())
+
+    def _make_fingerprint_projection(self, fingerprint_dim: int) -> nn.Module:
+        """Build a low-rank, bias-free identity projection."""
+        return nn.Sequential(
+            # No affine term: an all-zero CLS fingerprint must remain exactly
+            # zero, even after the fingerprint projections have been trained.
+            nn.LayerNorm(self.embed_dim, elementwise_affine=False),
+            nn.Linear(self.embed_dim, fingerprint_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(fingerprint_dim, self.embed_dim, bias=False),
+        )
+
+    def _prepare_row_fingerprint(
+        self,
+        row_fingerprint: Optional[Tensor],
+        *,
+        embeddings: Tensor,
+        intervention: Literal["correct", "zero", "permuted", "collapsed"],
+        permutation: Optional[Tensor],
+    ) -> Optional[Tensor]:
+        if self.fingerprint_dim is None:
+            if row_fingerprint is not None:
+                raise ValueError("row_fingerprint was supplied to a model with fingerprint disabled")
+            return None
+        if row_fingerprint is None:
+            raise ValueError("fingerprint-enabled RowInteraction requires row_fingerprint")
+
+        expected = (embeddings.shape[0], embeddings.shape[2], embeddings.shape[3])
+        if tuple(row_fingerprint.shape) != expected:
+            raise ValueError(
+                f"row_fingerprint must have shape {expected}, got {tuple(row_fingerprint.shape)}"
+            )
+        if intervention not in {"correct", "zero", "permuted", "collapsed"}:
+            raise ValueError(f"unknown fingerprint intervention: {intervention!r}")
+
+        fingerprint = row_fingerprint.to(device=embeddings.device, dtype=embeddings.dtype)
+        cls = fingerprint[:, : self.num_cls]
+        if torch.count_nonzero(cls.detach()).item() != 0:
+            raise ValueError("CLS fingerprint slots must be exactly zero")
+        features = fingerprint[:, self.num_cls :]
+
+        if intervention == "zero":
+            features = torch.zeros_like(features)
+        elif intervention == "collapsed":
+            features = features.mean(dim=1, keepdim=True).expand_as(features)
+        elif intervention == "permuted":
+            batch_size, num_features = features.shape[:2]
+            if permutation is None:
+                raise ValueError("permuted fingerprint intervention requires a permutation")
+            if tuple(permutation.shape) != (batch_size, num_features):
+                raise ValueError(
+                    "fingerprint_permutation must have shape "
+                    f"{(batch_size, num_features)}, got {tuple(permutation.shape)}"
+                )
+            permutation = permutation.to(device=features.device, dtype=torch.long)
+            expected_indices = torch.arange(num_features, device=features.device).expand(batch_size, -1)
+            if not torch.equal(permutation.sort(dim=-1).values, expected_indices):
+                raise ValueError("fingerprint_permutation rows must be feature permutations")
+            gather_index = permutation[..., None].expand_as(features)
+            features = features.gather(1, gather_index)
+
+        cls_zeros = torch.zeros_like(cls)
+        return torch.cat((cls_zeros, features), dim=1)
+
+    def _fingerprint_identities(
+        self,
+        fingerprint: Optional[Tensor],
+        layer_idx: int,
+        layer_gates: Optional[Tensor],
+    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+        if fingerprint is None:
+            return None, None
+        q_gate = self.fingerprint_q_gates[layer_idx]
+        k_gate = self.fingerprint_k_gates[layer_idx]
+        if layer_gates is not None:
+            gates = torch.as_tensor(layer_gates, device=fingerprint.device, dtype=fingerprint.dtype)
+            if tuple(gates.shape) == (self.num_blocks,):
+                q_gate = q_gate * gates[layer_idx]
+                k_gate = k_gate * gates[layer_idx]
+            elif tuple(gates.shape) == (self.num_blocks, 2):
+                q_gate = q_gate * gates[layer_idx, 0]
+                k_gate = k_gate * gates[layer_idx, 1]
+            else:
+                raise ValueError(
+                    "fingerprint_layer_gates must have shape "
+                    f"{(self.num_blocks,)} or {(self.num_blocks, 2)}"
+                )
+        q_identity = self.fingerprint_q_projections[layer_idx](fingerprint) * q_gate
+        k_identity = self.fingerprint_k_projections[layer_idx](fingerprint) * k_gate
+        return q_identity, k_identity
 
     def sample_row_identity_permutation(
         self, *, batch_size: int, num_features: int, device: torch.device | str
@@ -191,7 +310,13 @@ class RowInteraction(nn.Module):
 
         return embeddings, key_mask
 
-    def _aggregate_embeddings(self, embeddings: Tensor, key_mask: Optional[Tensor] = None) -> Tensor:
+    def _aggregate_embeddings(
+        self,
+        embeddings: Tensor,
+        key_mask: Optional[Tensor] = None,
+        row_fingerprint: Optional[Tensor] = None,
+        fingerprint_layer_gates: Optional[Tensor] = None,
+    ) -> Tensor:
         """Process a batch of rows through a transformer encoder.
 
         This method:
@@ -223,27 +348,64 @@ class RowInteraction(nn.Module):
 
         # Process all blocks except the last
         if self.recompute:
-            for block in self.tf_row.blocks[:-1]:
+            for layer_idx, block in enumerate(self.tf_row.blocks[:-1]):
+                q_identity, k_identity = self._fingerprint_identities(
+                    row_fingerprint, layer_idx, fingerprint_layer_gates
+                )
                 embeddings = checkpoint(
-                    partial(block, key_padding_mask=key_mask, rope=rope), embeddings, use_reentrant=False
+                    partial(
+                        block,
+                        key_padding_mask=key_mask,
+                        rope=rope,
+                        q_identity=q_identity,
+                        k_identity=k_identity,
+                    ),
+                    embeddings,
+                    use_reentrant=False,
                 )
         else:
-            for block in self.tf_row.blocks[:-1]:
-                embeddings = block(embeddings, key_padding_mask=key_mask, rope=rope)
+            for layer_idx, block in enumerate(self.tf_row.blocks[:-1]):
+                q_identity, k_identity = self._fingerprint_identities(
+                    row_fingerprint, layer_idx, fingerprint_layer_gates
+                )
+                embeddings = block(
+                    embeddings,
+                    key_padding_mask=key_mask,
+                    rope=rope,
+                    q_identity=q_identity,
+                    k_identity=k_identity,
+                )
 
         # Last block: q = CLS tokens, k/v = full sequence
         last_block = self.tf_row.blocks[-1]
+        last_idx = self.num_blocks - 1
+        q_identity, k_identity = self._fingerprint_identities(
+            row_fingerprint, last_idx, fingerprint_layer_gates
+        )
+        cls_q_identity = None if q_identity is None else q_identity[..., : self.num_cls, :]
         if self.recompute:
             cls_outputs = checkpoint(
                 lambda emb: last_block(
-                    q=emb[..., : self.num_cls, :], k=emb, v=emb, key_padding_mask=key_mask, rope=rope
+                    q=emb[..., : self.num_cls, :],
+                    k=emb,
+                    v=emb,
+                    q_identity=cls_q_identity,
+                    k_identity=k_identity,
+                    key_padding_mask=key_mask,
+                    rope=rope,
                 ),
                 embeddings,
                 use_reentrant=False,
             )
         else:
             cls_outputs = last_block(
-                q=embeddings[..., : self.num_cls, :], k=embeddings, v=embeddings, key_padding_mask=key_mask, rope=rope
+                q=embeddings[..., : self.num_cls, :],
+                k=embeddings,
+                v=embeddings,
+                q_identity=cls_q_identity,
+                k_identity=k_identity,
+                key_padding_mask=key_mask,
+                rope=rope,
             )
         del embeddings
         cls_outputs = self.out_ln(cls_outputs)
@@ -255,6 +417,10 @@ class RowInteraction(nn.Module):
         embeddings: Tensor,
         d: Optional[Tensor] = None,
         row_identity_permutation: Optional[Tensor] = None,
+        row_fingerprint: Optional[Tensor] = None,
+        fingerprint_intervention: Literal["correct", "zero", "permuted", "collapsed"] = "correct",
+        fingerprint_permutation: Optional[Tensor] = None,
+        fingerprint_layer_gates: Optional[Tensor] = None,
     ) -> Tensor:
         """Transform feature embeddings into row representations for training.
 
@@ -294,7 +460,17 @@ class RowInteraction(nn.Module):
         embeddings, key_mask = self._apply_temporary_feature_identity(
             embeddings, key_mask, row_identity_permutation
         )
-        representations = self._aggregate_embeddings(embeddings, key_mask)  # (B, T, C*E)
+        row_fingerprint = self._prepare_row_fingerprint(
+            row_fingerprint,
+            embeddings=embeddings,
+            intervention=fingerprint_intervention,
+            permutation=fingerprint_permutation,
+        )
+        if row_fingerprint is not None:
+            row_fingerprint = row_fingerprint[:, None].expand(B, T, HC, E)
+        representations = self._aggregate_embeddings(
+            embeddings, key_mask, row_fingerprint, fingerprint_layer_gates
+        )  # (B, T, C*E)
 
         return representations  # (B, T, C*E)
 
@@ -303,6 +479,10 @@ class RowInteraction(nn.Module):
         embeddings: Tensor,
         mgr_config: MgrConfig = None,
         row_identity_permutation: Optional[Tensor] = None,
+        row_fingerprint: Optional[Tensor] = None,
+        fingerprint_intervention: Literal["correct", "zero", "permuted", "collapsed"] = "correct",
+        fingerprint_permutation: Optional[Tensor] = None,
+        fingerprint_layer_gates: Optional[Tensor] = None,
     ) -> Tensor:
         """Transform feature embeddings into row representations for inference.
 
@@ -335,8 +515,25 @@ class RowInteraction(nn.Module):
         embeddings, _ = self._apply_temporary_feature_identity(
             embeddings, row_identity_permutation=row_identity_permutation
         )
+        row_fingerprint = self._prepare_row_fingerprint(
+            row_fingerprint,
+            embeddings=embeddings,
+            intervention=fingerprint_intervention,
+            permutation=fingerprint_permutation,
+        )
+        if row_fingerprint is not None:
+            row_fingerprint = row_fingerprint[:, None].expand(
+                B, T, embeddings.shape[2], embeddings.shape[3]
+            )
+        aggregate = partial(
+            self._aggregate_embeddings,
+            fingerprint_layer_gates=fingerprint_layer_gates,
+        )
+        inputs = OrderedDict([("embeddings", embeddings)])
+        if row_fingerprint is not None:
+            inputs["row_fingerprint"] = row_fingerprint
         representations = self.inference_mgr(
-            self._aggregate_embeddings, inputs=OrderedDict([("embeddings", embeddings)])
+            aggregate, inputs=inputs
         )
 
         return representations  # (B, T, C*E)
@@ -347,6 +544,10 @@ class RowInteraction(nn.Module):
         d: Optional[Tensor] = None,
         mgr_config: MgrConfig = None,
         row_identity_permutation: Optional[Tensor] = None,
+        row_fingerprint: Optional[Tensor] = None,
+        fingerprint_intervention: Literal["correct", "zero", "permuted", "collapsed"] = "correct",
+        fingerprint_permutation: Optional[Tensor] = None,
+        fingerprint_layer_gates: Optional[Tensor] = None,
     ) -> Tensor:
         """Transform feature embeddings into row representations.
 
@@ -373,10 +574,44 @@ class RowInteraction(nn.Module):
         """
 
         if self.training:
-            representations = self._train_forward(embeddings, d, row_identity_permutation)
+            if (
+                self.fingerprint_dim is None
+                and row_fingerprint is None
+                and fingerprint_intervention == "correct"
+                and fingerprint_permutation is None
+                and fingerprint_layer_gates is None
+            ):
+                representations = self._train_forward(embeddings, d, row_identity_permutation)
+            else:
+                representations = self._train_forward(
+                    embeddings,
+                    d,
+                    row_identity_permutation,
+                    row_fingerprint,
+                    fingerprint_intervention,
+                    fingerprint_permutation,
+                    fingerprint_layer_gates,
+                )
         else:
-            representations = self._inference_forward(
-                embeddings, mgr_config, row_identity_permutation
-            )
+            if (
+                self.fingerprint_dim is None
+                and row_fingerprint is None
+                and fingerprint_intervention == "correct"
+                and fingerprint_permutation is None
+                and fingerprint_layer_gates is None
+            ):
+                representations = self._inference_forward(
+                    embeddings, mgr_config, row_identity_permutation
+                )
+            else:
+                representations = self._inference_forward(
+                    embeddings,
+                    mgr_config,
+                    row_identity_permutation,
+                    row_fingerprint,
+                    fingerprint_intervention,
+                    fingerprint_permutation,
+                    fingerprint_layer_gates,
+                )
 
         return representations  # (B, T, C*E)
