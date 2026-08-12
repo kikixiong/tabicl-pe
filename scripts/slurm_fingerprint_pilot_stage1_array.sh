@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tabicl-fingerprint-pilot
-#SBATCH --partition=h100
-#SBATCH --qos=long
-#SBATCH --time=7-00:00:00
+#SBATCH --partition=normal
+#SBATCH --qos=medium
+#SBATCH --time=1-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --array=0-1
+#SBATCH --array=0-2
 #SBATCH --no-requeue
 
 set -euo pipefail
@@ -34,15 +34,15 @@ ACTUAL_SHA="$(git -C "$SOURCE_ROOT" rev-parse HEAD)"
   exit 1
 }
 
-ARMS=(rope fingerprint)
+ARMS=(rope none fingerprint)
 ARM="${ARMS[$SLURM_ARRAY_TASK_ID]}"
 RUN_ROOT="$PILOT_ARTIFACT_ROOT/arms/$ARM/seed-${SEED:-42}"
 mkdir -p "$RUN_ROOT/resource"
 
 mapfile -t GPU_NAMES < <(nvidia-smi --query-gpu=name --format=csv,noheader)
 [[ "${#GPU_NAMES[@]}" -eq 1 ]] || { echo "expected exactly one visible GPU" >&2; exit 1; }
-[[ "${GPU_NAMES[0]}" == *"NVIDIA H100"* ]] || {
-  echo "pilot requires NVIDIA H100, got ${GPU_NAMES[0]}" >&2
+[[ "${GPU_NAMES[0]}" == *"NVIDIA A10"* ]] || {
+  echo "pilot requires NVIDIA A10, got ${GPU_NAMES[0]}" >&2
   exit 1
 }
 

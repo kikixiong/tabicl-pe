@@ -18,7 +18,7 @@ position to a tabular feature?
 
 All three arms start from scratch with seed 42 and share the same synthetic
 prior, data order, small architecture, optimizer, schedule, batch budget, and
-50,000 Stage-1 optimizer steps. Each array task requests exactly one A10; Slurm
+10,000 Stage-1 optimizer steps. Each array task requests exactly one A10; Slurm
 decides when each independent arm starts according to cluster availability.
 The screening run uses the same FP16 automatic-mixed-precision setting for all
 three arms; it is not a replacement for the release-scale FP32 protocol.
