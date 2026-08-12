@@ -30,9 +30,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 MAX_STEPS="${MAX_STEPS:-50000}"
 # This is an exploratory H100 pilot, not the formal protocol.  The effective
 # batch is intentionally larger while the per-microbatch memory stays bounded.
-BATCH_SIZE="${BATCH_SIZE:-256}"
+BATCH_SIZE="${BATCH_SIZE:-128}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-32}"
-N_JOBS="${N_JOBS:-8}"
+N_JOBS="${N_JOBS:-4}"
 SEED="${SEED:-42}"
 CKPT_DIR="$PILOT_ARTIFACT_ROOT/arms/$ARM/seed-$SEED/checkpoints"
 WANDB_DIR="$PILOT_ARTIFACT_ROOT/arms/$ARM/seed-$SEED/wandb"
@@ -66,8 +66,8 @@ exec "$PYTHON" -m tabicl.train \
   --scheduler cosine_warmup --warmup_proportion -1 --warmup_steps 500 \
   --gradient_clipping 10 --fail_on_oom True --fail_on_nonfinite True \
   --prior_type graph_scm --prior_device cpu --n_jobs "$N_JOBS" \
-  --batch_size_per_gp "${BATCH_SIZE_PER_GP:-16}" \
-  --min_features 1 --max_features 100 --max_classes 10 --max_seq_len 1024 \
+  --batch_size_per_gp "${BATCH_SIZE_PER_GP:-8}" \
+  --min_features 1 --max_features 100 --max_classes 10 --max_seq_len 512 \
   --min_train_size 0.3 --max_train_size 0.9 --seq_len_per_gp True \
   --graph_noise False --filter_unpredictable_graphs True \
   --filter_unpredictable_datasets True --allow_act_warping False \
