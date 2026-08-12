@@ -28,9 +28,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 [[ "$PILOT_ARTIFACT_ROOT" == /* ]] || { echo "PILOT_ARTIFACT_ROOT must be absolute" >&2; exit 2; }
 
 MAX_STEPS="${MAX_STEPS:-50000}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
-N_JOBS="${N_JOBS:-8}"
+# This is an exploratory H100 pilot, not the formal protocol.  The effective
+# batch is intentionally larger while the per-microbatch memory stays bounded.
+BATCH_SIZE="${BATCH_SIZE:-256}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-16}"
+N_JOBS="${N_JOBS:-48}"
 SEED="${SEED:-42}"
 CKPT_DIR="$PILOT_ARTIFACT_ROOT/arms/$ARM/seed-$SEED/checkpoints"
 WANDB_DIR="$PILOT_ARTIFACT_ROOT/arms/$ARM/seed-$SEED/wandb"
@@ -64,20 +66,20 @@ exec "$PYTHON" -m tabicl.train \
   --scheduler cosine_warmup --warmup_proportion -1 --warmup_steps 500 \
   --gradient_clipping 10 --fail_on_oom True --fail_on_nonfinite True \
   --prior_type graph_scm --prior_device cpu --n_jobs "$N_JOBS" \
-  --batch_size_per_gp 4 \
+  --batch_size_per_gp "${BATCH_SIZE_PER_GP:-16}" \
   --min_features 1 --max_features 100 --max_classes 10 --max_seq_len 1024 \
   --min_train_size 0.3 --max_train_size 0.9 --seq_len_per_gp True \
   --graph_noise False --filter_unpredictable_graphs True \
   --filter_unpredictable_datasets True --allow_act_warping False \
   --min_n_nodes 2 --max_n_nodes 32 --cauchy_dag_offset 0 \
-  --embed_dim 96 --col_num_blocks 2 --col_nhead 6 --col_num_inds 64 \
+  --embed_dim 64 --col_num_blocks 1 --col_nhead 4 --col_num_inds 32 \
   --col_affine False --col_feature_group same --col_feature_group_size 3 \
   --col_target_aware True --col_ssmax True \
-  --row_num_blocks 3 --row_nhead 6 --row_num_cls 4 \
+  --row_num_blocks 2 --row_nhead 4 --row_num_cls 4 \
   --row_rope_base 100000 --row_rope_interleaved False \
   --row_identity_mode "$ROW_IDENTITY_MODE" \
   --row_fingerprint "$ROW_FINGERPRINT" --row_fingerprint_dim 16 \
-  --icl_num_blocks 6 --icl_nhead 6 --icl_ssmax True \
+  --icl_num_blocks 3 --icl_nhead 4 --icl_ssmax True \
   --ssmax_type qassmax-mlp-elementwise --ff_factor 2 \
   --norm_first True --zero_init False --use_flash_attn3 False \
   --checkpoint_dir "$CKPT_DIR" \
