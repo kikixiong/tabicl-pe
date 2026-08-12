@@ -54,6 +54,7 @@ if actual != expected:
 print(f"tabicl_source={actual}", flush=True)
 PY
 
+# Keep one prior group per micro-batch so seq_len_per_gp training sizes do not mix.
 exec "$PYTHON" -m tabicl.train \
   --wandb_log "${WANDB_LOG:-False}" \
   --wandb_project "${WANDB_PROJECT:-TabICLv2-Fingerprint-Pilot}" \
@@ -66,7 +67,7 @@ exec "$PYTHON" -m tabicl.train \
   --scheduler cosine_warmup --warmup_proportion -1 --warmup_steps 500 \
   --gradient_clipping 10 --fail_on_oom True --fail_on_nonfinite True \
   --prior_type graph_scm --prior_device cpu --n_jobs "$N_JOBS" \
-  --batch_size_per_gp "${BATCH_SIZE_PER_GP:-8}" \
+  --batch_size_per_gp "${BATCH_SIZE_PER_GP:-32}" \
   --min_features 1 --max_features 100 --max_classes 10 --max_seq_len 512 \
   --min_train_size 0.3 --max_train_size 0.9 --seq_len_per_gp True \
   --graph_noise False --filter_unpredictable_graphs True \
