@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tabicl-fingerprint-h100-5k
+#SBATCH --job-name=tabicl-fingerprint-h100-3k
 #SBATCH --partition=h100
 #SBATCH --qos=medium
 #SBATCH --time=1-00:00:00
@@ -36,11 +36,13 @@ ACTUAL_SHA="$(git -C "$SOURCE_ROOT" rev-parse HEAD)"
 
 ARMS=(rope fingerprint)
 ARM="${ARMS[$SLURM_ARRAY_TASK_ID]}"
-MAX_STEPS=5000
+MAX_STEPS=3000
 N_JOBS=48
-BATCH_SIZE=128
-MICRO_BATCH_SIZE=4
-BATCH_SIZE_PER_GP=4
+BATCH_SIZE=64
+MICRO_BATCH_SIZE=8
+BATCH_SIZE_PER_GP=8
+SAVE_TEMP_EVERY=3000
+SAVE_PERM_EVERY=3000
 SEED="${SEED:-42}"
 RUN_ROOT="$PILOT_ARTIFACT_ROOT/arms/$ARM/seed-$SEED"
 mkdir -p "$RUN_ROOT/resource"
@@ -53,7 +55,8 @@ mapfile -t GPU_NAMES < <(nvidia-smi --query-gpu=name --format=csv,noheader)
 }
 
 export ARM EXPECTED_SOURCE_SHA ACTUAL_SHA RUN_ROOT MAX_STEPS N_JOBS
-export BATCH_SIZE MICRO_BATCH_SIZE BATCH_SIZE_PER_GP SEED
+export BATCH_SIZE MICRO_BATCH_SIZE BATCH_SIZE_PER_GP
+export SAVE_TEMP_EVERY SAVE_PERM_EVERY SEED
 "$PYTHON" - <<'PY'
 import json
 import os
@@ -63,7 +66,7 @@ import torch
 
 record = {
     "schema_version": 1,
-    "study": "tabiclv2-fingerprint-h100-5k-pilot-v1",
+    "study": "tabiclv2-fingerprint-h100-3k-pilot-v1",
     "formal_evidence": False,
     "arm": os.environ["ARM"],
     "source_commit": os.environ["ACTUAL_SHA"],
@@ -73,6 +76,8 @@ record = {
     "micro_batch_size": int(os.environ["MICRO_BATCH_SIZE"]),
     "batch_size_per_gp": int(os.environ["BATCH_SIZE_PER_GP"]),
     "n_jobs": int(os.environ["N_JOBS"]),
+    "save_temp_every": int(os.environ["SAVE_TEMP_EVERY"]),
+    "save_perm_every": int(os.environ["SAVE_PERM_EVERY"]),
     "python": platform.python_version(),
     "torch": torch.__version__,
     "cuda_build": torch.version.cuda,

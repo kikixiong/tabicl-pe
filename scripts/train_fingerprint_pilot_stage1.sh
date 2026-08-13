@@ -84,5 +84,6 @@ exec "$PYTHON" -m tabicl.train \
   --ssmax_type qassmax-mlp-elementwise --ff_factor 2 \
   --norm_first True --zero_init False --use_flash_attn3 False \
   --checkpoint_dir "$CKPT_DIR" \
-  --save_temp_every 5000 --save_perm_every 5000 --max_checkpoints 0 \
+  --save_temp_every "${SAVE_TEMP_EVERY:-5000}" \
+  --save_perm_every "${SAVE_PERM_EVERY:-5000}" --max_checkpoints 0 \
   --empty_cache_every 0 --progress_refresh_seconds 10
