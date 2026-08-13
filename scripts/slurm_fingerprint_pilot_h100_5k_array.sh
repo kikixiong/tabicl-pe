@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=tabicl-fingerprint-h100-3k
+#SBATCH --job-name=tabicl-fingerprint-h100-2k
 #SBATCH --partition=h100
 #SBATCH --qos=medium
 #SBATCH --time=1-00:00:00
@@ -36,13 +36,13 @@ ACTUAL_SHA="$(git -C "$SOURCE_ROOT" rev-parse HEAD)"
 
 ARMS=(rope fingerprint)
 ARM="${ARMS[$SLURM_ARRAY_TASK_ID]}"
-MAX_STEPS=3000
+MAX_STEPS=2000
 N_JOBS=48
 BATCH_SIZE=64
 MICRO_BATCH_SIZE=8
 BATCH_SIZE_PER_GP=8
-SAVE_TEMP_EVERY=3000
-SAVE_PERM_EVERY=3000
+SAVE_TEMP_EVERY=2000
+SAVE_PERM_EVERY=2000
 SEED="${SEED:-42}"
 RUN_ROOT="$PILOT_ARTIFACT_ROOT/arms/$ARM/seed-$SEED"
 mkdir -p "$RUN_ROOT/resource"
@@ -66,7 +66,7 @@ import torch
 
 record = {
     "schema_version": 1,
-    "study": "tabiclv2-fingerprint-h100-3k-pilot-v1",
+    "study": "tabiclv2-fingerprint-h100-2k-pilot-v1",
     "formal_evidence": False,
     "arm": os.environ["ARM"],
     "source_commit": os.environ["ACTUAL_SHA"],
