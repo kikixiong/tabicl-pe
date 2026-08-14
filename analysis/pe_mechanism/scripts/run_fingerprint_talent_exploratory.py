@@ -57,7 +57,10 @@ ESTIMATOR_OPTIONS: Mapping[str, Any] = {
     "n_jobs": 16,
     "use_amp": False,
     "use_fa3": False,
-    "offload_mode": "auto",
+    # The official AUTO threshold keeps the largest TALENT column-embedding
+    # tensor on a 22 GiB A10.  Explicit CPU storage changes only where the
+    # FP32 layer output lives between components, not the computation itself.
+    "offload_mode": "cpu",
     "verbose": False,
 }
 DATASET_ARTIFACTS = frozenset({"manifest.json", "predictions.npz", "result.json"})
@@ -72,7 +75,7 @@ LINEAGE_ARCHITECTURE = {
     "icl_num_blocks": 12,
     "icl_nhead": 8,
 }
-PREDICTION_CHUNK_ROWS = 8_192
+PREDICTION_CHUNK_ROWS = 65_536
 
 
 def _parser() -> argparse.ArgumentParser:
