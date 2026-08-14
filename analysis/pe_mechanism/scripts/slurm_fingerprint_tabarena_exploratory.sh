@@ -13,6 +13,8 @@ required=(
   PE_ANALYSIS_ROOT PE_MODEL_ROOT PE_TABARENA_ROOT PE_OPENML_CACHE
   PE_ROPE_CHECKPOINT PE_ROPE_SHA256 PE_FINGERPRINT_CHECKPOINT
   PE_FINGERPRINT_SHA256 PE_RELEASED_CHECKPOINT PE_OUTPUT_DIR PE_PYTHON
+  PE_COMPARISON_STEP PE_MODEL_SCALE PE_EXPECTED_MODEL_SHA
+  PE_EXPECTED_TABARENA_SHA
 )
 for name in "${required[@]}"; do
   [[ -n "${!name:-}" ]] || { echo "missing $name" >&2; exit 2; }
@@ -32,4 +34,8 @@ exec "$PE_PYTHON" \
   --fingerprint-checkpoint "$PE_FINGERPRINT_CHECKPOINT" \
   --fingerprint-sha256 "$PE_FINGERPRINT_SHA256" \
   --released-checkpoint "$PE_RELEASED_CHECKPOINT" \
+  --comparison-step "$PE_COMPARISON_STEP" \
+  --model-scale "$PE_MODEL_SCALE" \
+  --expected-model-sha "$PE_EXPECTED_MODEL_SHA" \
+  --expected-tabarena-sha "$PE_EXPECTED_TABARENA_SHA" \
   --output-dir "$PE_OUTPUT_DIR"

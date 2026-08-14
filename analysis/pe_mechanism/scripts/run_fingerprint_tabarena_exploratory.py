@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fixed TabArena-lite roster for compact RoPE/Fingerprint checkpoints.
+"""Run the fixed TabArena-lite roster for matched RoPE/Fingerprint checkpoints.
 
 This is deliberately exploratory.  It reuses the frozen single-estimator
 inference budget and official 38-dataset roster from ``tabarena-evaluate`` but
@@ -30,8 +30,10 @@ def _absolute(value: str, *, name: str, directory: bool = False) -> Path:
     if not path.is_absolute():
         raise ValueError(f"{name} must be absolute")
     resolved = path.resolve(strict=True)
-    if path.is_symlink() or (directory and not resolved.is_dir()) or (
-        not directory and not resolved.is_file()
+    if (
+        path.is_symlink()
+        or (directory and not resolved.is_dir())
+        or (not directory and not resolved.is_file())
     ):
         raise ValueError(f"{name} has the wrong file type")
     return resolved
@@ -64,31 +66,80 @@ def _git_head(root: Path) -> str:
     ).stdout.strip()
 
 
-def _checkpoint_contract(rope: Path, fingerprint: Path) -> dict[str, Any]:
+def _checkpoint_contract(
+    rope: Path,
+    fingerprint: Path,
+    *,
+    comparison_step: int,
+    model_scale: str,
+) -> dict[str, Any]:
     import torch
 
+    expected_architectures = {
+        "compact": {
+            "embed_dim": 64,
+            "col_num_blocks": 1,
+            "col_nhead": 4,
+            "col_num_inds": 32,
+            "row_num_blocks": 2,
+            "row_nhead": 4,
+            "icl_num_blocks": 3,
+            "icl_nhead": 4,
+        },
+        "fullsize": {
+            "embed_dim": 128,
+            "col_num_blocks": 3,
+            "col_nhead": 8,
+            "col_num_inds": 128,
+            "row_num_blocks": 3,
+            "row_nhead": 8,
+            "icl_num_blocks": 12,
+            "icl_nhead": 8,
+        },
+    }
+    if comparison_step <= 0 or model_scale not in expected_architectures:
+        raise ValueError("invalid comparison step or model scale")
     payloads = {
-        arm: torch.load(path, map_location="cpu", weights_only=False)
+        arm: torch.load(path, map_location="cpu", weights_only=True)
         for arm, path in (("rope", rope), ("fingerprint", fingerprint))
     }
     for arm, payload in payloads.items():
-        if payload.get("curr_step") != 2000:
-            raise ValueError(f"{arm} checkpoint is not at step 2000")
+        if payload.get("curr_step") != comparison_step:
+            raise ValueError(f"{arm} checkpoint is not at step {comparison_step}")
         if not isinstance(payload.get("config"), dict) or not isinstance(
             payload.get("state_dict"), dict
         ):
             raise ValueError(f"{arm} checkpoint lacks model config/state")
+        prior_stream = payload.get("prior_stream")
+        if not isinstance(prior_stream, dict) or (
+            prior_stream.get("cursor") != comparison_step
+            or prior_stream.get("experiment_seed") != 42
+            or prior_stream.get("ddp_rank") != 0
+            or prior_stream.get("world_size") != 1
+        ):
+            raise ValueError(f"{arm} checkpoint prior stream is invalid")
+    if payloads["rope"]["prior_stream"] != payloads["fingerprint"]["prior_stream"]:
+        raise ValueError("checkpoint prior streams are not exactly matched")
     configs = {arm: dict(payload["config"]) for arm, payload in payloads.items()}
-    if configs["rope"].get("row_identity_mode") != "rope" or configs["rope"].get(
-        "row_fingerprint"
-    ) is not False:
+    if (
+        configs["rope"].get("row_identity_mode") != "rope"
+        or configs["rope"].get("row_fingerprint") is not False
+    ):
         raise ValueError("RoPE checkpoint treatment is invalid")
-    if configs["fingerprint"].get("row_identity_mode") != "none" or configs[
-        "fingerprint"
-    ].get("row_fingerprint") is not True:
+    if (
+        configs["fingerprint"].get("row_identity_mode") != "none"
+        or configs["fingerprint"].get("row_fingerprint") is not True
+    ):
         raise ValueError("Fingerprint checkpoint treatment is invalid")
     if configs["fingerprint"].get("row_fingerprint_dim") != 16:
         raise ValueError("Fingerprint checkpoint dimension is not 16")
+    expected_architecture = expected_architectures[model_scale]
+    for arm, config in configs.items():
+        observed_architecture = {key: config.get(key) for key in expected_architecture}
+        if observed_architecture != expected_architecture:
+            raise ValueError(
+                f"{arm} checkpoint is not the expected {model_scale} architecture"
+            )
     treatment = {"row_identity_mode", "row_fingerprint"}
     if {k: v for k, v in configs["rope"].items() if k not in treatment} != {
         k: v for k, v in configs["fingerprint"].items() if k not in treatment
@@ -97,7 +148,10 @@ def _checkpoint_contract(rope: Path, fingerprint: Path) -> dict[str, Any]:
     return {
         arm: {
             "curr_step": int(payloads[arm]["curr_step"]),
-            "model_parameter_tensors": len(payloads[arm]["state_dict"]),
+            "model_state_tensors": len(payloads[arm]["state_dict"]),
+            "model_state_elements": sum(
+                value.numel() for value in payloads[arm]["state_dict"].values()
+            ),
             "model_config": configs[arm],
         }
         for arm in ("rope", "fingerprint")
@@ -115,6 +169,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fingerprint-checkpoint", required=True)
     parser.add_argument("--fingerprint-sha256", required=True)
     parser.add_argument("--released-checkpoint", required=True)
+    parser.add_argument("--comparison-step", required=True, type=int)
+    parser.add_argument("--model-scale", required=True, choices=("compact", "fullsize"))
+    parser.add_argument("--expected-model-sha", required=True)
+    parser.add_argument("--expected-tabarena-sha", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dataset", action="append", default=[])
     return parser
@@ -143,12 +201,29 @@ def main() -> int:
     if observed != expected:
         raise ValueError(f"checkpoint digest mismatch: {observed}")
 
-    contract = _checkpoint_contract(rope, fingerprint)
+    contract = _checkpoint_contract(
+        rope,
+        fingerprint,
+        comparison_step=args.comparison_step,
+        model_scale=args.model_scale,
+    )
     analysis_sha = _git_head(analysis_root)
     model_sha = _git_head(model_root)
+    if model_sha != args.expected_model_sha:
+        raise ValueError(
+            f"model source SHA mismatch: {model_sha} != {args.expected_model_sha}"
+        )
     tabarena_sha = _git_head(tabarena_root)
+    if tabarena_sha != args.expected_tabarena_sha:
+        raise ValueError(
+            "TabArena source SHA mismatch: "
+            f"{tabarena_sha} != {args.expected_tabarena_sha}"
+        )
 
-    roster_path = analysis_root / "analysis/pe_mechanism/manifests/tabarena-v0.1-classification-roster.json"
+    roster_path = (
+        analysis_root
+        / "analysis/pe_mechanism/manifests/tabarena-v0.1-classification-roster.json"
+    )
     if _sha256(roster_path) != ROSTER_SHA256:
         raise ValueError("TabArena roster file digest mismatch")
     roster_payload = json.loads(roster_path.read_text(encoding="utf-8"))
@@ -179,9 +254,10 @@ def main() -> int:
 
     runtime = _import_runtime(tabarena_root, model_root)
     model_cls = _make_system_model(runtime["ExternalSystemModel"])
+    scale_label = "Compact" if args.model_scale == "compact" else "Fullsize"
     names = {
-        "rope": "TabICL_Compact_RoPE_Step2000",
-        "fingerprint": "TabICL_Compact_Fingerprint_Step2000",
+        "rope": f"TabICL_{scale_label}_RoPE_Step{args.comparison_step}",
+        "fingerprint": (f"TabICL_{scale_label}_Fingerprint_Step{args.comparison_step}"),
         "released": "TabICL_Released_Reference",
     }
     framework_to_arm: dict[str, str] = {}
@@ -223,7 +299,9 @@ def main() -> int:
             apply_on_run=True,
             scope_openml=True,
         )
-        arena = runtime["TabArenaContext"](methods=[], backend="native", cache_config=cache)
+        arena = runtime["TabArenaContext"](
+            methods=[], backend="native", cache_config=cache
+        )
         expected_tasks = _validate_context_tasks(arena, roster)
         jobs = arena.build_jobs(
             experiments,
@@ -233,7 +311,9 @@ def main() -> int:
         )
         expected_count = len(roster) * len(ARMS)
         if len(jobs) != expected_count:
-            raise RuntimeError(f"TabArena built {len(jobs)} jobs, expected {expected_count}")
+            raise RuntimeError(
+                f"TabArena built {len(jobs)} jobs, expected {expected_count}"
+            )
         started = time.monotonic()
         results = arena.run_jobs(
             jobs,
@@ -264,11 +344,17 @@ def main() -> int:
             raise RuntimeError("returned and cached TabArena results differ")
 
         rows = {(row["arm"], row["dataset"]): row for row in normalized}
-        pairs = (("rope", "fingerprint"), ("rope", "released"), ("fingerprint", "released"))
+        pairs = (
+            ("rope", "fingerprint"),
+            ("rope", "released"),
+            ("fingerprint", "released"),
+        )
         metric_groups: dict[str, Any] = {}
         for metric in sorted({row["metric"] for row in normalized}):
             metric_roster = tuple(
-                dataset for dataset in roster if rows[("rope", dataset)]["metric"] == metric
+                dataset
+                for dataset in roster
+                if rows[("rope", dataset)]["metric"] == metric
             )
             metric_groups[metric] = {
                 "dataset_count": len(metric_roster),
@@ -307,11 +393,12 @@ def main() -> int:
         ]
         summary = {
             "schema_version": 1,
-            "study": "compact-fingerprint-tabarena-v0.1-exploratory",
+            "study": (f"{args.model_scale}-fingerprint-tabarena-v0.1-exploratory"),
             "formal_eligible": False,
             "leaderboard_replication": False,
             "seed": 42,
-            "comparison_step": 2000,
+            "comparison_step": args.comparison_step,
+            "model_scale": args.model_scale,
             "task_subset": "lite",
             "task_count": len(roster),
             "result_count": len(normalized),
@@ -326,7 +413,10 @@ def main() -> int:
             "metric_groups": metric_groups,
             "datasets": datasets,
             "checkpoint_digests": {
-                arm: {"sha256": observed[arm], "size_bytes": checkpoints[arm].stat().st_size}
+                arm: {
+                    "sha256": observed[arm],
+                    "size_bytes": checkpoints[arm].stat().st_size,
+                }
                 for arm in ARMS
             },
             "checkpoint_contract": contract,
@@ -357,7 +447,8 @@ def main() -> int:
             encoding="utf-8",
         )
         (staging / "runtime.json").write_text(
-            json.dumps(runtime_summary, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            json.dumps(runtime_summary, indent=2, sort_keys=True, allow_nan=False)
+            + "\n",
             encoding="utf-8",
         )
         manifest = {
@@ -365,7 +456,10 @@ def main() -> int:
             "study": summary["study"],
             "formal_eligible": False,
             "artifacts": {
-                name: {"sha256": _sha256(staging / name), "size_bytes": (staging / name).stat().st_size}
+                name: {
+                    "sha256": _sha256(staging / name),
+                    "size_bytes": (staging / name).stat().st_size,
+                }
                 for name in ("summary.json", "runtime.json", "results.tar.gz")
             },
         }
@@ -376,7 +470,11 @@ def main() -> int:
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    print(json.dumps({"output_dir": str(output), "task_count": len(roster)}, sort_keys=True))
+    print(
+        json.dumps(
+            {"output_dir": str(output), "task_count": len(roster)}, sort_keys=True
+        )
+    )
     return 0
 
 
