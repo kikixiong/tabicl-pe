@@ -123,29 +123,23 @@ def test_prior_stream_manifest_advances_with_the_logical_cursor(monkeypatch):
     module._validate_prior_stream(continuation, expected_step=5_001)
 
 
-def test_persistent_workers_are_explicitly_joined_before_process_exit():
+def test_one_step_smoke_uses_the_worker_invariant_in_process_stream(monkeypatch):
     module = _load_script()
+    import tabicl.prior._genload as genload
 
-    class Worker:
-        def is_alive(self):
-            return False
+    calls = {}
 
-    class Iterator:
-        _workers = (Worker(), Worker())
+    def fake_loader(dataset, **kwargs):
+        calls["dataset"] = dataset
+        calls.update(kwargs)
+        return "in-process-loader"
 
-        def __init__(self):
-            self.shutdown_called = False
-
-        def _shutdown_workers(self):
-            self.shutdown_called = True
-
-    iterator = Iterator()
-    dataloader = SimpleNamespace(_iterator=iterator)
-    module._shutdown_persistent_dataloader_workers(
-        SimpleNamespace(dataloader=dataloader)
-    )
-    assert iterator.shutdown_called
-    assert dataloader._iterator is None
+    monkeypatch.setattr(genload, "make_prior_dataloader", fake_loader)
+    dataset = object()
+    trainer = SimpleNamespace(prior_dataset=dataset, dataloader="old-loader")
+    module._configure_one_step_smoke_dataloader(trainer)
+    assert trainer.dataloader == "in-process-loader"
+    assert calls == {"dataset": dataset, "num_workers": 0, "pin_memory": False}
 
 
 def test_manifest_publication_is_canonical_and_write_once(tmp_path):

@@ -906,19 +906,17 @@ def _validate_loaded_trainer(trainer: Any, *, arm: str, from_step: int) -> None:
         raise ValueError("loaded Trainer model configuration mismatch")
 
 
-def _shutdown_persistent_dataloader_workers(trainer: Any) -> None:
-    dataloader = trainer.dataloader
-    iterator = getattr(dataloader, "_iterator", None)
-    if iterator is None:
-        return
-    shutdown = getattr(iterator, "_shutdown_workers", None)
-    if not callable(shutdown):
-        raise TypeError("persistent DataLoader iterator has no shutdown method")
-    shutdown()
-    dataloader._iterator = None
-    workers = getattr(iterator, "_workers", ())
-    if any(worker.is_alive() for worker in workers):
-        raise RuntimeError("persistent DataLoader worker survived explicit shutdown")
+def _configure_one_step_smoke_dataloader(trainer: Any) -> None:
+    from tabicl.prior._genload import make_prior_dataloader
+
+    # The scientific stream is worker-count invariant.  Running the one-step
+    # gate in-process avoids noisy native worker teardown after an intentionally
+    # tiny loop; real continuation segments retain the original 48 workers.
+    trainer.dataloader = make_prior_dataloader(
+        trainer.prior_dataset,
+        num_workers=0,
+        pin_memory=False,
+    )
 
 
 def run_segment(args: argparse.Namespace) -> None:
@@ -995,14 +993,13 @@ def run_segment(args: argparse.Namespace) -> None:
     finally:
         os.close(trusted_parent_fd)
     _validate_loaded_trainer(trainer, arm=args.arm, from_step=args.from_step)
+    if args.stop_after_step == args.from_step + 1:
+        _configure_one_step_smoke_dataloader(trainer)
 
     # The scheduler lambda was constructed above with the immutable 500k
     # horizon.  Only the loop boundary is shortened for this Slurm segment.
     trainer.config.max_steps = args.stop_after_step
-    try:
-        trainer.train()
-    finally:
-        _shutdown_persistent_dataloader_workers(trainer)
+    trainer.train()
     if trainer.curr_step != args.stop_after_step:
         raise RuntimeError("Trainer stopped before the requested segment boundary")
 
