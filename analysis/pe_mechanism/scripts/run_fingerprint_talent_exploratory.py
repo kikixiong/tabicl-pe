@@ -50,7 +50,9 @@ ESTIMATOR_OPTIONS: Mapping[str, Any] = {
     "outlier_threshold": 4.0,
     "softmax_temperature": 0.9,
     "average_logits": True,
-    "batch_size": 2,
+    # Ensemble members are independent; process one at a time so the frozen
+    # full-row protocol fits a 22 GiB A10 without changing the ensemble roster.
+    "batch_size": 1,
     "random_state": 42,
     "n_jobs": 16,
     "use_amp": False,

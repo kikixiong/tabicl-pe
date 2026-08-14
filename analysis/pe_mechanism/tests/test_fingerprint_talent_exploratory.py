@@ -19,6 +19,11 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
 
+def test_a10_protocol_processes_one_ensemble_member_at_a_time():
+    assert MODULE.ESTIMATOR_OPTIONS["n_estimators"] == 2
+    assert MODULE.ESTIMATOR_OPTIONS["batch_size"] == 1
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
