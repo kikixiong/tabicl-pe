@@ -72,7 +72,7 @@ LINEAGE_ARCHITECTURE = {
     "icl_num_blocks": 12,
     "icl_nhead": 8,
 }
-PREDICTION_CHUNK_ROWS = 32_768
+PREDICTION_CHUNK_ROWS = 8_192
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -824,6 +824,8 @@ def _predict_in_chunks(
     model_sha: str,
     checkpoint_sha256: str,
 ) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, Any]]:
+    import torch
+
     probabilities = []
     encoded_targets = []
     expected_classes: list[str] | None = None
@@ -878,6 +880,9 @@ def _predict_in_chunks(
         probabilities.append(current)
         encoded_targets.append(target)
         chunk_count += 1
+        del result, baseline
+        gc.collect()
+        torch.cuda.empty_cache()
     if expected_classes is None or not probabilities:
         raise RuntimeError("validation split produced no prediction chunks")
     return (
