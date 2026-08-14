@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 from argparse import Namespace
 from pathlib import Path
@@ -92,6 +93,34 @@ def test_runtime_validator_rejects_a_50k_scheduler_horizon():
     )
     with pytest.raises(ValueError, match="scheduler horizon/protocol"):
         module._validate_loaded_trainer(trainer, arm="rope", from_step=5_000)
+
+
+def test_prior_stream_manifest_advances_with_the_logical_cursor(monkeypatch):
+    module = _load_script()
+    schema = "{}"
+    schema_sha256 = hashlib.sha256(schema.encode()).hexdigest()
+
+    def state(step):
+        value = {
+            "schema_version": 1,
+            "algorithm": "sha256-schema-seed-rank-logical-step-v1",
+            "schema": schema,
+            "schema_sha256": schema_sha256,
+            "experiment_seed": module.SEED,
+            "ddp_rank": 0,
+            "world_size": 1,
+            "cursor": step,
+        }
+        payload = repr({key: value[key] for key in sorted(value)}).encode()
+        return {**value, "manifest_sha256": hashlib.sha256(payload).hexdigest()}
+
+    origin = state(5_000)
+    continuation = state(5_001)
+    assert origin["manifest_sha256"] != continuation["manifest_sha256"]
+    monkeypatch.setattr(module, "PRIOR_SCHEMA_SHA256", schema_sha256)
+    monkeypatch.setattr(module, "PRIOR_MANIFEST_SHA256", origin["manifest_sha256"])
+    module._validate_prior_stream(origin, expected_step=5_000)
+    module._validate_prior_stream(continuation, expected_step=5_001)
 
 
 def test_manifest_publication_is_canonical_and_write_once(tmp_path):

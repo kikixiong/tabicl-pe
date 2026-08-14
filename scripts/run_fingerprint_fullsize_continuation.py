@@ -329,6 +329,26 @@ def _expected_model_config(arm: str) -> dict[str, Any]:
     }
 
 
+def _validate_prior_stream(prior: Mapping[str, Any], *, expected_step: int) -> None:
+    from tabicl.train._provenance import prior_manifest
+
+    prior_manifest(prior)
+    expected_prior = {
+        "schema_version": 1,
+        "algorithm": "sha256-schema-seed-rank-logical-step-v1",
+        "experiment_seed": SEED,
+        "ddp_rank": 0,
+        "world_size": 1,
+        "cursor": expected_step,
+        "schema_sha256": PRIOR_SCHEMA_SHA256,
+    }
+    for key, expected in expected_prior.items():
+        if prior.get(key) != expected:
+            raise ValueError(f"prior stream mismatch for {key}")
+    if expected_step == 5_000 and prior["manifest_sha256"] != PRIOR_MANIFEST_SHA256:
+        raise ValueError("origin prior stream manifest SHA-256 mismatch")
+
+
 def validate_checkpoint(
     path: Path,
     *,
@@ -405,19 +425,7 @@ def validate_checkpoint(
     )
 
     prior = checkpoint["prior_stream"]
-    expected_prior = {
-        "schema_version": 1,
-        "algorithm": "sha256-schema-seed-rank-logical-step-v1",
-        "experiment_seed": SEED,
-        "ddp_rank": 0,
-        "world_size": 1,
-        "cursor": expected_step,
-        "manifest_sha256": PRIOR_MANIFEST_SHA256,
-        "schema_sha256": PRIOR_SCHEMA_SHA256,
-    }
-    for key, expected in expected_prior.items():
-        if prior.get(key) != expected:
-            raise ValueError(f"prior stream mismatch for {key}")
+    _validate_prior_stream(prior, expected_step=expected_step)
 
     identity = checkpoint["identity_treatment"]
     expected_identity = {
