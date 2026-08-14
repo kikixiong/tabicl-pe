@@ -13,13 +13,34 @@ required=(
   PE_ANALYSIS_ROOT PE_MODEL_ROOT PE_TALENT_ROOT PE_ROPE_CHECKPOINT
   PE_ROPE_SHA256 PE_FINGERPRINT_CHECKPOINT PE_FINGERPRINT_SHA256
   PE_RELEASED_CHECKPOINT PE_OUTPUT_DIR PE_PYTHON PE_COMPARISON_STEP
-  PE_EXPECTED_MODEL_SHA PE_EXPECTED_ANALYSIS_SHA PE_SUBMISSION_RECEIPT
-  PE_ROPE_LAUNCH_RECEIPT PE_ROPE_COMPLETION_RECEIPT
-  PE_FINGERPRINT_LAUNCH_RECEIPT PE_FINGERPRINT_COMPLETION_RECEIPT
+  PE_EXPECTED_MODEL_SHA PE_EXPECTED_ANALYSIS_SHA
 )
 for name in "${required[@]}"; do
   [[ -n "${!name:-}" ]] || { echo "missing $name" >&2; exit 2; }
 done
+
+lineage_args=()
+if [[ -n "${PE_SNAPSHOT_RECEIPT:-}" ]]; then
+  for name in PE_SUBMISSION_RECEIPT PE_ROPE_LAUNCH_RECEIPT \
+    PE_ROPE_COMPLETION_RECEIPT PE_FINGERPRINT_LAUNCH_RECEIPT \
+    PE_FINGERPRINT_COMPLETION_RECEIPT; do
+    [[ -z "${!name:-}" ]] || { echo "$name conflicts with PE_SNAPSHOT_RECEIPT" >&2; exit 2; }
+  done
+  lineage_args=(--snapshot-receipt "$PE_SNAPSHOT_RECEIPT")
+else
+  for name in PE_SUBMISSION_RECEIPT PE_ROPE_LAUNCH_RECEIPT \
+    PE_ROPE_COMPLETION_RECEIPT PE_FINGERPRINT_LAUNCH_RECEIPT \
+    PE_FINGERPRINT_COMPLETION_RECEIPT; do
+    [[ -n "${!name:-}" ]] || { echo "missing $name" >&2; exit 2; }
+  done
+  lineage_args=(
+    --submission-receipt "$PE_SUBMISSION_RECEIPT"
+    --rope-launch-receipt "$PE_ROPE_LAUNCH_RECEIPT"
+    --rope-completion-receipt "$PE_ROPE_COMPLETION_RECEIPT"
+    --fingerprint-launch-receipt "$PE_FINGERPRINT_LAUNCH_RECEIPT"
+    --fingerprint-completion-receipt "$PE_FINGERPRINT_COMPLETION_RECEIPT"
+  )
+fi
 
 dataset_args=()
 while (( $# > 0 )); do
@@ -55,10 +76,6 @@ exec "$PE_PYTHON" -B \
   --comparison-step "$PE_COMPARISON_STEP" \
   --expected-model-sha "$PE_EXPECTED_MODEL_SHA" \
   --expected-analysis-sha "$PE_EXPECTED_ANALYSIS_SHA" \
-  --submission-receipt "$PE_SUBMISSION_RECEIPT" \
-  --rope-launch-receipt "$PE_ROPE_LAUNCH_RECEIPT" \
-  --rope-completion-receipt "$PE_ROPE_COMPLETION_RECEIPT" \
-  --fingerprint-launch-receipt "$PE_FINGERPRINT_LAUNCH_RECEIPT" \
-  --fingerprint-completion-receipt "$PE_FINGERPRINT_COMPLETION_RECEIPT" \
+  "${lineage_args[@]}" \
   --output-dir "$PE_OUTPUT_DIR" \
   "${dataset_args[@]}"

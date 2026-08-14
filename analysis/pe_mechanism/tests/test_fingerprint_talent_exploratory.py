@@ -421,6 +421,133 @@ def test_lineage_contract_rejects_mixed_or_mutated_cohorts(
         )
 
 
+def _snapshot_payload() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "study": MODULE.SNAPSHOT_STUDY,
+        "formal_eligible": False,
+        "exploratory_only": True,
+        "evidence_level": "exploratory_intermediate_snapshot_no_segment_completion",
+        "comparison_step": 11000,
+        "seed": 42,
+        "training_source_commit": "a" * 40,
+        "origin_source_commit": "d" * 40,
+        "tabicl_source_tree": "4" * 40,
+        "environment_sha256": "e" * 64,
+        "scheduler_horizon_steps": 500_000,
+        "architecture": copy.deepcopy(MODULE.LINEAGE_ARCHITECTURE),
+        "prior_stream": {
+            "cursor": 11000,
+            "experiment_seed": 42,
+            "ddp_rank": 0,
+            "world_size": 1,
+            "manifest_sha256": "f" * 64,
+            "schema_sha256": "1" * 64,
+        },
+        "upstream_receipts": {
+            name: {"document_sha256": "2" * 64, "contract_sha256": "3" * 64}
+            for name in (
+                "continuation_submission",
+                "rope_parent",
+                "fingerprint_parent",
+            )
+        },
+        "checkpoints": {
+            arm: {
+                "sha256": ("b" if arm == "rope" else "c") * 64,
+                "size_bytes": 0,
+                "curr_step": 11000,
+                "state_elements": 101 if arm == "rope" else 102,
+                "state_tensors": 11 if arm == "rope" else 12,
+                "treatment": {
+                    "row_identity_mode": "rope" if arm == "rope" else "none",
+                    "row_fingerprint": arm == "fingerprint",
+                    "row_fingerprint_dim": 16,
+                },
+            }
+            for arm in MODULE.MATCHED_ARMS
+        },
+    }
+
+
+def _snapshot_document(payload: dict[str, Any]) -> dict[str, Any]:
+    core = {
+        "kind": MODULE.SNAPSHOT_KIND,
+        "payload": payload,
+        "schema_version": 1,
+    }
+    return {**core, "sha256": MODULE._json_sha256(core)}
+
+
+def _snapshot_fixture(tmp_path: Path):
+    checkpoints = {
+        "rope": tmp_path / "rope.ckpt",
+        "fingerprint": tmp_path / "fingerprint.ckpt",
+    }
+    for path in checkpoints.values():
+        path.write_bytes(b"")
+    contract = {
+        arm: {
+            "model_state_elements": 101 if arm == "rope" else 102,
+            "model_state_tensors": 11 if arm == "rope" else 12,
+            "prior_stream_manifest_sha256": "f" * 64,
+            "prior_schema_sha256": "1" * 64,
+        }
+        for arm in MODULE.MATCHED_ARMS
+    }
+    return checkpoints, contract
+
+
+def test_snapshot_lineage_accepts_exact_intermediate_pair(tmp_path: Path):
+    checkpoints, checkpoint_contract = _snapshot_fixture(tmp_path)
+    receipt = tmp_path / "snapshot.json"
+    _write_json(receipt, _snapshot_document(_snapshot_payload()))
+
+    lineage = MODULE._snapshot_lineage_contract(
+        receipt=receipt,
+        checkpoints=checkpoints,
+        checkpoint_digests={"rope": "b" * 64, "fingerprint": "c" * 64},
+        checkpoint_contract=checkpoint_contract,
+        comparison_step=11000,
+        model_sha="a" * 40,
+    )
+
+    assert lineage["comparison_step"] == 11000
+    assert lineage["formal_eligible"] is False
+    assert lineage["arms"]["fingerprint"]["treatment"]["row_fingerprint"] is True
+    assert set(lineage["receipt_sha256"]) == {"snapshot"}
+
+
+@pytest.mark.parametrize("fault", ("self_hash", "source", "treatment", "prior"))
+def test_snapshot_lineage_rejects_mutation(tmp_path: Path, fault: str):
+    checkpoints, checkpoint_contract = _snapshot_fixture(tmp_path)
+    payload = _snapshot_payload()
+    document = _snapshot_document(payload)
+    if fault == "self_hash":
+        document["sha256"] = "0" * 64
+    elif fault == "source":
+        payload["training_source_commit"] = "9" * 40
+        document = _snapshot_document(payload)
+    elif fault == "treatment":
+        payload["checkpoints"]["fingerprint"]["treatment"]["row_fingerprint"] = False
+        document = _snapshot_document(payload)
+    elif fault == "prior":
+        payload["prior_stream"]["cursor"] = 10999
+        document = _snapshot_document(payload)
+    receipt = tmp_path / "snapshot.json"
+    _write_json(receipt, document)
+
+    with pytest.raises(ValueError):
+        MODULE._snapshot_lineage_contract(
+            receipt=receipt,
+            checkpoints=checkpoints,
+            checkpoint_digests={"rope": "b" * 64, "fingerprint": "c" * 64},
+            checkpoint_contract=checkpoint_contract,
+            comparison_step=11000,
+            model_sha="a" * 40,
+        )
+
+
 def _cached_dataset_fixture(
     root: Path, *, run_contract_sha256: str = "f" * 64
 ) -> tuple[Path, Path]:

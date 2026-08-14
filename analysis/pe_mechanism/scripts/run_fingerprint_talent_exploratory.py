@@ -64,6 +64,8 @@ ESTIMATOR_OPTIONS: Mapping[str, Any] = {
 }
 DATASET_ARTIFACTS = frozenset({"manifest.json", "predictions.npz", "result.json"})
 LINEAGE_STUDY = "tabiclv2-fullsize-rope-fingerprint-pilot-v1"
+SNAPSHOT_KIND = "fingerprint_fullsize_evaluation_snapshot"
+SNAPSHOT_STUDY = "tabiclv2-fullsize-rope-fingerprint-continuation-v1"
 LINEAGE_ARCHITECTURE = {
     "embed_dim": 128,
     "col_num_blocks": 3,
@@ -90,11 +92,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--comparison-step", required=True, type=int)
     parser.add_argument("--expected-model-sha", required=True)
     parser.add_argument("--expected-analysis-sha", required=True)
-    parser.add_argument("--submission-receipt", required=True)
-    parser.add_argument("--rope-launch-receipt", required=True)
-    parser.add_argument("--rope-completion-receipt", required=True)
-    parser.add_argument("--fingerprint-launch-receipt", required=True)
-    parser.add_argument("--fingerprint-completion-receipt", required=True)
+    parser.add_argument("--snapshot-receipt")
+    parser.add_argument("--submission-receipt")
+    parser.add_argument("--rope-launch-receipt")
+    parser.add_argument("--rope-completion-receipt")
+    parser.add_argument("--fingerprint-launch-receipt")
+    parser.add_argument("--fingerprint-completion-receipt")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--dataset", action="append", default=[])
     return parser
@@ -405,6 +408,151 @@ def _lineage_contract(
     }
 
 
+def _snapshot_lineage_contract(
+    *,
+    receipt: Path,
+    checkpoints: Mapping[str, Path],
+    checkpoint_digests: Mapping[str, str],
+    checkpoint_contract: Mapping[str, Mapping[str, Any]],
+    comparison_step: int,
+    model_sha: str,
+) -> dict[str, Any]:
+    """Validate a self-hashed snapshot of a live continuation checkpoint pair."""
+
+    document = _load_mapping(receipt, name="evaluation snapshot receipt")
+    payload = document.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ValueError("evaluation snapshot receipt payload is invalid")
+    expected_document_sha = _json_sha256(
+        {"kind": SNAPSHOT_KIND, "payload": payload, "schema_version": 1}
+    )
+    _require_values(
+        document,
+        {
+            "schema_version": 1,
+            "kind": SNAPSHOT_KIND,
+            "sha256": expected_document_sha,
+        },
+        name="evaluation snapshot receipt",
+    )
+    _require_values(
+        payload,
+        {
+            "schema_version": 1,
+            "study": SNAPSHOT_STUDY,
+            "formal_eligible": False,
+            "exploratory_only": True,
+            "evidence_level": (
+                "exploratory_intermediate_snapshot_no_segment_completion"
+            ),
+            "comparison_step": comparison_step,
+            "seed": 42,
+            "training_source_commit": model_sha,
+            "scheduler_horizon_steps": 500_000,
+        },
+        name="evaluation snapshot payload",
+    )
+    origin_sha = payload.get("origin_source_commit")
+    source_tree = payload.get("tabicl_source_tree")
+    environment_sha = payload.get("environment_sha256")
+    if not isinstance(origin_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", origin_sha):
+        raise ValueError("evaluation snapshot origin source SHA is invalid")
+    if not isinstance(source_tree, str) or not re.fullmatch(
+        r"[0-9a-f]{40}", source_tree
+    ):
+        raise ValueError("evaluation snapshot source tree is invalid")
+    if not isinstance(environment_sha, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", environment_sha
+    ):
+        raise ValueError("evaluation snapshot environment SHA is invalid")
+    if payload.get("architecture") != LINEAGE_ARCHITECTURE:
+        raise ValueError("evaluation snapshot architecture is invalid")
+
+    prior_stream = payload.get("prior_stream")
+    if not isinstance(prior_stream, Mapping):
+        raise ValueError("evaluation snapshot prior stream is invalid")
+    expected_prior = {
+        "cursor": comparison_step,
+        "experiment_seed": 42,
+        "ddp_rank": 0,
+        "world_size": 1,
+        "manifest_sha256": checkpoint_contract["rope"][
+            "prior_stream_manifest_sha256"
+        ],
+        "schema_sha256": checkpoint_contract["rope"]["prior_schema_sha256"],
+    }
+    _require_values(
+        prior_stream, expected_prior, name="evaluation snapshot prior stream"
+    )
+
+    records = payload.get("checkpoints")
+    if not isinstance(records, Mapping) or set(records) != set(MATCHED_ARMS):
+        raise ValueError("evaluation snapshot checkpoint roster is invalid")
+    checkpoint_facts: dict[str, Any] = {}
+    for arm in MATCHED_ARMS:
+        record = records[arm]
+        if not isinstance(record, Mapping):
+            raise ValueError(f"evaluation snapshot {arm} checkpoint is invalid")
+        treatment = {
+            "row_identity_mode": "rope" if arm == "rope" else "none",
+            "row_fingerprint": arm == "fingerprint",
+            "row_fingerprint_dim": 16,
+        }
+        _require_values(
+            record,
+            {
+                "sha256": checkpoint_digests[arm],
+                "size_bytes": checkpoints[arm].stat().st_size,
+                "curr_step": comparison_step,
+                "state_elements": checkpoint_contract[arm]["model_state_elements"],
+                "state_tensors": checkpoint_contract[arm]["model_state_tensors"],
+                "treatment": treatment,
+            },
+            name=f"evaluation snapshot {arm} checkpoint",
+        )
+        checkpoint_facts[arm] = dict(record)
+
+    upstream = payload.get("upstream_receipts")
+    if not isinstance(upstream, Mapping) or set(upstream) != {
+        "continuation_submission",
+        "rope_parent",
+        "fingerprint_parent",
+    }:
+        raise ValueError("evaluation snapshot upstream receipt roster is invalid")
+    for name, record in upstream.items():
+        if not isinstance(record, Mapping) or set(record) != {
+            "document_sha256",
+            "contract_sha256",
+        }:
+            raise ValueError(f"evaluation snapshot upstream receipt {name} is invalid")
+        if any(
+            not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in record.values()
+        ):
+            raise ValueError(f"evaluation snapshot upstream receipt {name} is invalid")
+
+    return {
+        "schema_version": 1,
+        "study": SNAPSHOT_STUDY,
+        "formal_eligible": False,
+        "exploratory_only": True,
+        "evidence_level": (
+            "exploratory_intermediate_snapshot_no_segment_completion"
+        ),
+        "source_commit": model_sha,
+        "origin_source_commit": origin_sha,
+        "tabicl_source_tree": source_tree,
+        "seed": 42,
+        "comparison_step": comparison_step,
+        "scheduler_horizon_steps": 500_000,
+        "environment_sha256": environment_sha,
+        "prior_stream": dict(prior_stream),
+        "upstream_receipts": {name: dict(value) for name, value in upstream.items()},
+        "arms": checkpoint_facts,
+        "receipt_sha256": {"snapshot": _sha256(receipt)},
+    }
+
+
 def _stage_checkpoints(
     checkpoints: Mapping[str, Path], expected_digests: Mapping[str, str]
 ) -> tuple[Path, dict[str, Path]]:
@@ -574,6 +722,12 @@ def _checkpoint_contract(
                 value.numel() for value in payloads[arm]["state_dict"].values()
             ),
             "identity_treatment": payloads[arm]["identity_treatment"],
+            "prior_stream_manifest_sha256": payloads[arm]["prior_stream"].get(
+                "manifest_sha256"
+            ),
+            "prior_schema_sha256": payloads[arm]["prior_stream"].get(
+                "schema_sha256"
+            ),
         }
         for arm in MATCHED_ARMS
     }
@@ -907,6 +1061,7 @@ def _evaluate_dataset(
     talent_root: Path,
     checkpoints: Mapping[str, Path],
     checkpoint_digests: Mapping[str, str],
+    comparison_step: int,
     model_root: Path,
     model_sha: str,
     run_contract_sha256: str,
@@ -995,7 +1150,7 @@ def _evaluate_dataset(
             "reference_role": (
                 "external_released_reference_descriptive_only"
                 if arm == "released"
-                else "matched_step5000_treatment"
+                else f"matched_step{comparison_step}_treatment"
             ),
         }
         del driver
@@ -1273,33 +1428,46 @@ def _run_locked(
         checkpoints["fingerprint"],
         comparison_step=args.comparison_step,
     )
-    receipts = {
-        "submission": _absolute(args.submission_receipt, name="submission_receipt"),
-        "rope_launch": _absolute(args.rope_launch_receipt, name="rope_launch_receipt"),
-        "rope_completion": _absolute(
-            args.rope_completion_receipt, name="rope_completion_receipt"
-        ),
-        "fingerprint_launch": _absolute(
-            args.fingerprint_launch_receipt, name="fingerprint_launch_receipt"
-        ),
-        "fingerprint_completion": _absolute(
-            args.fingerprint_completion_receipt,
-            name="fingerprint_completion_receipt",
-        ),
+    legacy_receipt_values = {
+        "submission": args.submission_receipt,
+        "rope_launch": args.rope_launch_receipt,
+        "rope_completion": args.rope_completion_receipt,
+        "fingerprint_launch": args.fingerprint_launch_receipt,
+        "fingerprint_completion": args.fingerprint_completion_receipt,
     }
-    lineage = _lineage_contract(
-        receipts=receipts,
-        checkpoints=checkpoints,
-        checkpoint_digests=expected_digests,
-        comparison_step=args.comparison_step,
-        model_sha=model_sha,
-    )
-    for arm in MATCHED_ARMS:
-        if (
-            lineage["arms"][arm]["state_elements"]
-            != checkpoint_contract[arm]["model_state_elements"]
-        ):
-            raise ValueError(f"{arm} completion receipt state size is invalid")
+    if args.snapshot_receipt:
+        if any(legacy_receipt_values.values()):
+            raise ValueError("snapshot and legacy lineage receipts are mutually exclusive")
+        snapshot = _absolute(args.snapshot_receipt, name="snapshot_receipt")
+        receipts = {"snapshot": snapshot}
+        lineage = _snapshot_lineage_contract(
+            receipt=snapshot,
+            checkpoints=checkpoints,
+            checkpoint_digests=expected_digests,
+            checkpoint_contract=checkpoint_contract,
+            comparison_step=args.comparison_step,
+            model_sha=model_sha,
+        )
+    else:
+        if not all(legacy_receipt_values.values()):
+            raise ValueError("one snapshot receipt or all legacy receipts are required")
+        receipts = {
+            name: _absolute(value, name=f"{name}_receipt")
+            for name, value in legacy_receipt_values.items()
+        }
+        lineage = _lineage_contract(
+            receipts=receipts,
+            checkpoints=checkpoints,
+            checkpoint_digests=expected_digests,
+            comparison_step=args.comparison_step,
+            model_sha=model_sha,
+        )
+        for arm in MATCHED_ARMS:
+            if (
+                lineage["arms"][arm]["state_elements"]
+                != checkpoint_contract[arm]["model_state_elements"]
+            ):
+                raise ValueError(f"{arm} completion receipt state size is invalid")
 
     manifest_path = (
         analysis_root
@@ -1348,8 +1516,8 @@ def _run_locked(
         "trusted_local_talent_pickle": True,
         "estimator_options": dict(ESTIMATOR_OPTIONS),
         "comparison_roles": {
-            "rope": "matched_step5000_treatment",
-            "fingerprint": "matched_step5000_treatment",
+            "rope": f"matched_step{args.comparison_step}_treatment",
+            "fingerprint": f"matched_step{args.comparison_step}_treatment",
             "released": "external_550000_step_reference_descriptive_only",
         },
     }
@@ -1421,6 +1589,7 @@ def _run_locked(
                     talent_root=talent_root,
                     checkpoints=staged_checkpoints,
                     checkpoint_digests=expected_digests,
+                    comparison_step=args.comparison_step,
                     model_root=model_root,
                     model_sha=model_sha,
                     run_contract_sha256=run_contract_sha256,
