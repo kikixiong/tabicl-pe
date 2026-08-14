@@ -57,10 +57,9 @@ ESTIMATOR_OPTIONS: Mapping[str, Any] = {
     "n_jobs": 16,
     "use_amp": False,
     "use_fa3": False,
-    # The official AUTO threshold keeps the largest TALENT column-embedding
-    # tensor on a 22 GiB A10.  Explicit CPU storage changes only where the
-    # FP32 layer output lives between components, not the computation itself.
-    "offload_mode": "cpu",
+    # The H100 execution gate has enough memory for the official automatic
+    # placement policy while preserving FP32 computation.
+    "offload_mode": "auto",
     "verbose": False,
 }
 DATASET_ARTIFACTS = frozenset({"manifest.json", "predictions.npz", "result.json"})
