@@ -906,6 +906,21 @@ def _validate_loaded_trainer(trainer: Any, *, arm: str, from_step: int) -> None:
         raise ValueError("loaded Trainer model configuration mismatch")
 
 
+def _shutdown_persistent_dataloader_workers(trainer: Any) -> None:
+    dataloader = trainer.dataloader
+    iterator = getattr(dataloader, "_iterator", None)
+    if iterator is None:
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if not callable(shutdown):
+        raise TypeError("persistent DataLoader iterator has no shutdown method")
+    shutdown()
+    dataloader._iterator = None
+    workers = getattr(iterator, "_workers", ())
+    if any(worker.is_alive() for worker in workers):
+        raise RuntimeError("persistent DataLoader worker survived explicit shutdown")
+
+
 def run_segment(args: argparse.Namespace) -> None:
     source_root = Path(args.source_root).resolve()
     environment_path = Path(args.environment_manifest).resolve()
@@ -984,7 +999,10 @@ def run_segment(args: argparse.Namespace) -> None:
     # The scheduler lambda was constructed above with the immutable 500k
     # horizon.  Only the loop boundary is shortened for this Slurm segment.
     trainer.config.max_steps = args.stop_after_step
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        _shutdown_persistent_dataloader_workers(trainer)
     if trainer.curr_step != args.stop_after_step:
         raise RuntimeError("Trainer stopped before the requested segment boundary")
 

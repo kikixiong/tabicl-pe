@@ -64,9 +64,13 @@ SEGMENT_ROOT="$CONTINUATION_ARTIFACT_ROOT/arms/$ARM/seed-42/segments/${FROM_LABE
 mkdir -p "$SEGMENT_ROOT/resource"
 
 GPU_CSV="$SEGMENT_ROOT/resource/gpu.csv"
+MONITOR_INTERVAL=30
+if (( TO_STEP == FROM_STEP + 1 )); then
+  MONITOR_INTERVAL=1
+fi
 nvidia-smi \
   --query-gpu=timestamp,index,name,utilization.gpu,memory.used,memory.total,power.draw \
-  --format=csv,noheader,nounits -l 30 >"$GPU_CSV" &
+  --format=csv,noheader,nounits -l "$MONITOR_INTERVAL" >"$GPU_CSV" &
 MONITOR_PID=$!
 cleanup() {
   kill "$MONITOR_PID" 2>/dev/null || true

@@ -30,6 +30,7 @@ contains "$SLURM" '#SBATCH --cpus-per-task=64'
 contains "$SLURM" '#SBATCH --mem=128G'
 contains "$SLURM" '#SBATCH --gres=gpu:1'
 contains "$SLURM" '[[ "${GPU_NAMES[0]}" == *"NVIDIA H100"* ]]'
+contains "$SLURM" 'MONITOR_INTERVAL=1'
 if grep -F 'ls-remote' "$SLURM" >/dev/null; then
   echo "compute job must not depend on live GitHub availability" >&2
   exit 1

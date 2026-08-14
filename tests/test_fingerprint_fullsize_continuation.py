@@ -123,6 +123,31 @@ def test_prior_stream_manifest_advances_with_the_logical_cursor(monkeypatch):
     module._validate_prior_stream(continuation, expected_step=5_001)
 
 
+def test_persistent_workers_are_explicitly_joined_before_process_exit():
+    module = _load_script()
+
+    class Worker:
+        def is_alive(self):
+            return False
+
+    class Iterator:
+        _workers = (Worker(), Worker())
+
+        def __init__(self):
+            self.shutdown_called = False
+
+        def _shutdown_workers(self):
+            self.shutdown_called = True
+
+    iterator = Iterator()
+    dataloader = SimpleNamespace(_iterator=iterator)
+    module._shutdown_persistent_dataloader_workers(
+        SimpleNamespace(dataloader=dataloader)
+    )
+    assert iterator.shutdown_called
+    assert dataloader._iterator is None
+
+
 def test_manifest_publication_is_canonical_and_write_once(tmp_path):
     module = _load_script()
     record = module._manifest(
