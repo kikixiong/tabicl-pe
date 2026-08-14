@@ -72,6 +72,7 @@ LINEAGE_ARCHITECTURE = {
     "icl_num_blocks": 12,
     "icl_nhead": 8,
 }
+PREDICTION_CHUNK_ROWS = 65_536
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -800,6 +801,98 @@ def _forward_schedule(entries: Sequence[Any]) -> dict[str, Any]:
     }
 
 
+def _row_slice(values: Any, start: int, stop: int) -> Any:
+    if hasattr(values, "iloc"):
+        return values.iloc[start:stop]
+    return values[start:stop]
+
+
+def _all_missing_columns(values: Any) -> np.ndarray:
+    if hasattr(values, "isna"):
+        return np.asarray(values.isna().all(axis=0), dtype=bool)
+    import pandas as pd
+
+    return np.asarray(pd.isna(np.asarray(values))).all(axis=0)
+
+
+def _predict_in_chunks(
+    driver: Any,
+    *,
+    X: Any,
+    y: np.ndarray,
+    arm: str,
+    model_sha: str,
+    checkpoint_sha256: str,
+) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, Any]]:
+    probabilities = []
+    encoded_targets = []
+    expected_classes: list[str] | None = None
+    chunk_count = 0
+    full_missing_columns = _all_missing_columns(X)
+    for start in range(0, len(y), PREDICTION_CHUNK_ROWS):
+        stop = min(len(y), start + PREDICTION_CHUNK_ROWS)
+        chunk_y = np.asarray(y[start:stop])
+        chunk_X = _row_slice(X, start, stop)
+        if not np.array_equal(_all_missing_columns(chunk_X), full_missing_columns):
+            raise RuntimeError(
+                "prediction chunk changes the official all-missing feature mask"
+            )
+        result = driver.predict_proba(chunk_X, y=chunk_y)
+        _assert_treatment(
+            driver,
+            arm,
+            expected_model_sha=model_sha,
+            expected_checkpoint_sha=checkpoint_sha256,
+        )
+        if (
+            not result.exact_baseline_verified
+            or result.source_evidence_level != "strict"
+        ):
+            raise RuntimeError(f"{arm} official inference evidence is not strict")
+        if result.forward_calls:
+            raise RuntimeError(
+                "direct exploratory inference unexpectedly installed hooks"
+            )
+        current = _validated_probabilities(result, rows=len(chunk_y))
+        baseline = np.asarray(result.baseline_probabilities, dtype=np.float32)
+        if not np.array_equal(current, baseline):
+            raise RuntimeError(f"{arm} probabilities differ from the direct baseline")
+        classes = _class_tokens(result.classes)
+        if expected_classes is None:
+            expected_classes = classes
+        elif classes != expected_classes:
+            raise RuntimeError(f"{arm} class encoding changed between chunks")
+        target = np.asarray(
+            driver.estimator.y_encoder_.transform(chunk_y), dtype=np.int64
+        )
+        selected = current[np.arange(target.size), target]
+        accuracy = float(np.mean(np.argmax(current, axis=1) == target))
+        log_loss = float(
+            -np.log(np.clip(selected, np.finfo(np.float32).tiny, 1.0)).mean()
+        )
+        if result.metrics is None or not (
+            math.isclose(accuracy, result.metrics.accuracy, abs_tol=1e-7)
+            and math.isclose(log_loss, result.metrics.log_loss, abs_tol=1e-6)
+        ):
+            raise RuntimeError("chunk metrics disagree with independent recomputation")
+        probabilities.append(current)
+        encoded_targets.append(target)
+        chunk_count += 1
+    if expected_classes is None or not probabilities:
+        raise RuntimeError("validation split produced no prediction chunks")
+    return (
+        np.concatenate(probabilities, axis=0),
+        np.concatenate(encoded_targets, axis=0),
+        expected_classes,
+        {
+            "chunk_count": chunk_count,
+            "maximum_rows_per_call": PREDICTION_CHUNK_ROWS,
+            "all_chunks_exact_baseline_verified": True,
+            "source_evidence_level": "strict",
+        },
+    )
+
+
 def _evaluate_dataset(
     *,
     name: str,
@@ -855,31 +948,15 @@ def _evaluate_dataset(
                 "paired arms used different official inference schedules"
             )
         predict_started = time.monotonic()
-        result = driver.predict_proba(dataset.val.X, y=dataset.val.y)
-        predict_seconds = time.monotonic() - predict_started
-        _assert_treatment(
+        current, target, class_tokens, prediction_contract = _predict_in_chunks(
             driver,
-            arm,
-            expected_model_sha=model_sha,
-            expected_checkpoint_sha=checkpoint_digests[arm],
+            X=dataset.val.X,
+            y=np.asarray(dataset.val.y),
+            arm=arm,
+            model_sha=model_sha,
+            checkpoint_sha256=checkpoint_digests[arm],
         )
-        if (
-            not result.exact_baseline_verified
-            or result.source_evidence_level != "strict"
-        ):
-            raise RuntimeError(f"{arm} official inference evidence is not strict")
-        if result.forward_calls:
-            raise RuntimeError(
-                "direct exploratory inference unexpectedly installed hooks"
-            )
-        current = _validated_probabilities(result, rows=len(dataset.val.y))
-        baseline = np.asarray(result.baseline_probabilities, dtype=np.float32)
-        if not np.array_equal(current, baseline):
-            raise RuntimeError(f"{arm} probabilities differ from the direct baseline")
-        class_tokens = _class_tokens(result.classes)
-        target = np.asarray(
-            driver.estimator.y_encoder_.transform(dataset.val.y), dtype=np.int64
-        )
+        predict_seconds = time.monotonic() - predict_started
         if expected_classes is None:
             expected_classes = class_tokens
             encoded_target = target
@@ -892,11 +969,6 @@ def _evaluate_dataset(
         log_loss = float(
             -np.log(np.clip(selected, np.finfo(np.float32).tiny, 1.0)).mean()
         )
-        if result.metrics is None or not (
-            math.isclose(accuracy, result.metrics.accuracy, abs_tol=1e-7)
-            and math.isclose(log_loss, result.metrics.log_loss, abs_tol=1e-6)
-        ):
-            raise RuntimeError("independently recomputed metrics disagree")
         probabilities[arm] = current
         arm_records[arm] = {
             "accuracy": accuracy,
@@ -906,17 +978,20 @@ def _evaluate_dataset(
             "treatment": treatment,
             "checkpoint_sha256": driver.checkpoint_sha,
             "model_sha": driver.model_sha,
-            "source_evidence_level": result.source_evidence_level,
-            "exact_baseline_verified": result.exact_baseline_verified,
+            "source_evidence_level": prediction_contract["source_evidence_level"],
+            "exact_baseline_verified": prediction_contract[
+                "all_chunks_exact_baseline_verified"
+            ],
             "probabilities_sha256": _array_sha256(current),
             "official_forward_schedule": schedule,
+            "prediction_chunking": prediction_contract,
             "reference_role": (
                 "external_released_reference_descriptive_only"
                 if arm == "released"
                 else "matched_step5000_treatment"
             ),
         }
-        del result, driver
+        del driver
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -948,6 +1023,7 @@ def _evaluate_dataset(
             ),
             "n_classes": len(expected_classes),
             "row_sampling": "none_full_split_original_order",
+            "prediction_chunk_rows": PREDICTION_CHUNK_ROWS,
             "row_roster_sha256": {
                 "train": _row_roster_sha256(name, "train", dataset.train.y),
                 "val": _row_roster_sha256(name, "val", dataset.val.y),
@@ -1028,6 +1104,7 @@ def _validated_cached_record(
             "fit_split": "train",
             "evaluation_split": "val",
             "row_sampling": "none_full_split_original_order",
+            "prediction_chunk_rows": PREDICTION_CHUNK_ROWS,
         },
         name=f"cached dataset {name}",
     )
@@ -1046,16 +1123,35 @@ def _validated_cached_record(
     arms = record.get("arms")
     if not isinstance(arms, Mapping) or set(arms) != set(ARMS):
         raise RuntimeError(f"cached arm roster is invalid for {name}")
+    n_evaluation = record.get("n_evaluation")
+    if not isinstance(n_evaluation, int) or isinstance(n_evaluation, bool):
+        raise RuntimeError(f"cached evaluation row count is invalid for {name}")
+    if n_evaluation <= 0:
+        raise RuntimeError(f"cached evaluation row count is invalid for {name}")
+    expected_chunking = {
+        "chunk_count": math.ceil(n_evaluation / PREDICTION_CHUNK_ROWS),
+        "maximum_rows_per_call": PREDICTION_CHUNK_ROWS,
+        "all_chunks_exact_baseline_verified": True,
+        "source_evidence_level": "strict",
+    }
+    for arm in ARMS:
+        arm_record = arms[arm]
+        if not isinstance(arm_record, Mapping):
+            raise RuntimeError(f"cached arm record is invalid for {name}/{arm}")
+        if arm_record.get("prediction_chunking") != expected_chunking:
+            raise RuntimeError(
+                f"cached prediction chunk contract is invalid for {name}/{arm}"
+            )
     with np.load(destination / "predictions.npz", allow_pickle=False) as predictions:
         if set(predictions.files) != {"target", *ARMS}:
             raise RuntimeError(f"cached prediction roster is invalid for {name}")
         target = np.asarray(predictions["target"])
-        if target.shape != (record.get("n_evaluation"),):
+        if target.shape != (n_evaluation,):
             raise RuntimeError(f"cached target shape is invalid for {name}")
         for arm in ARMS:
             probabilities = np.asarray(predictions[arm])
             if probabilities.shape != (
-                record.get("n_evaluation"),
+                n_evaluation,
                 record.get("n_classes"),
             ):
                 raise RuntimeError(
@@ -1233,6 +1329,7 @@ def _run_locked(
         "fit_split": "train",
         "evaluation_split": "val",
         "row_sampling": "none_full_split_original_order",
+        "prediction_chunk_rows": PREDICTION_CHUNK_ROWS,
         "test_split_policy": (
             "raw loader integrity-checks local test bytes; test labels and rows are not "
             "used for fitting, metrics, model selection, or dataset selection"

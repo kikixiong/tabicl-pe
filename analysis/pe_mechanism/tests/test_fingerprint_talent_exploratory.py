@@ -22,6 +22,7 @@ SPEC.loader.exec_module(MODULE)
 def test_a10_protocol_processes_one_ensemble_member_at_a_time():
     assert MODULE.ESTIMATOR_OPTIONS["n_estimators"] == 2
     assert MODULE.ESTIMATOR_OPTIONS["batch_size"] == 1
+    assert MODULE.PREDICTION_CHUNK_ROWS == 65_536
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -133,6 +134,71 @@ class _FakeDriver:
         self.source_evidence_level = "strict"
         self.estimator = SimpleNamespace(
             model_=_FakeModel(identity, fingerprint=fingerprint)
+        )
+
+
+class _ChunkDriver(_FakeDriver):
+    def __init__(self) -> None:
+        super().__init__("rope")
+        self.calls: list[int] = []
+        self.estimator.y_encoder_ = SimpleNamespace(
+            transform=lambda values: np.asarray(values, dtype=np.int64)
+        )
+
+    def predict_proba(self, X, *, y):
+        self.calls.append(len(X))
+        target = np.asarray(y, dtype=np.int64)
+        probabilities = np.full((len(target), 2), 0.2, dtype=np.float32)
+        probabilities[np.arange(len(target)), target] = 0.8
+        return SimpleNamespace(
+            probabilities=probabilities,
+            baseline_probabilities=probabilities.copy(),
+            classes=np.asarray([0, 1]),
+            forward_calls=(),
+            exact_baseline_verified=True,
+            source_evidence_level="strict",
+            metrics=SimpleNamespace(
+                accuracy=1.0,
+                log_loss=float(-np.log(np.float32(0.8))),
+            ),
+        )
+
+
+def test_prediction_chunks_cover_every_row_in_original_order(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(MODULE, "PREDICTION_CHUNK_ROWS", 2)
+    driver = _ChunkDriver()
+    labels = np.asarray([0, 1, 1, 0, 1])
+    probabilities, target, classes, contract = MODULE._predict_in_chunks(
+        driver,
+        X=np.arange(10).reshape(5, 2),
+        y=labels,
+        arm="rope",
+        model_sha="1" * 40,
+        checkpoint_sha256="2" * 64,
+    )
+
+    assert driver.calls == [2, 2, 1]
+    assert np.array_equal(target, labels)
+    assert np.array_equal(np.argmax(probabilities, axis=1), labels)
+    assert classes == ["int64:np.int64(0)", "int64:np.int64(1)"]
+    assert contract["chunk_count"] == 3
+    assert contract["maximum_rows_per_call"] == 2
+
+
+def test_prediction_chunks_reject_changed_all_missing_feature_mask(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(MODULE, "PREDICTION_CHUNK_ROWS", 2)
+    with pytest.raises(RuntimeError, match="all-missing feature mask"):
+        MODULE._predict_in_chunks(
+            _ChunkDriver(),
+            X=np.asarray([[np.nan], [np.nan], [1.0], [2.0]]),
+            y=np.asarray([0, 1, 0, 1]),
+            arm="rope",
+            model_sha="1" * 40,
+            checkpoint_sha256="2" * 64,
         )
 
 
@@ -383,6 +449,12 @@ def _cached_dataset_fixture(
                 -np.log(np.clip(selected, np.finfo(np.float32).tiny, 1.0)).mean()
             ),
             "probabilities_sha256": MODULE._array_sha256(probabilities),
+            "prediction_chunking": {
+                "chunk_count": 1,
+                "maximum_rows_per_call": MODULE.PREDICTION_CHUNK_ROWS,
+                "all_chunks_exact_baseline_verified": True,
+                "source_evidence_level": "strict",
+            },
         }
     result = {
         "schema_version": 1,
@@ -392,6 +464,7 @@ def _cached_dataset_fixture(
         "fit_split": "train",
         "evaluation_split": "val",
         "row_sampling": "none_full_split_original_order",
+        "prediction_chunk_rows": MODULE.PREDICTION_CHUNK_ROWS,
         "n_evaluation": 2,
         "n_classes": 2,
         "input_sha256": {"info.json": MODULE._sha256(input_path)},
@@ -469,6 +542,23 @@ def test_cached_record_rejects_changed_talent_input_even_when_cache_is_untouched
     (talent_root / "toy" / "info.json").write_bytes(b"changed\n")
 
     with pytest.raises(RuntimeError, match="input bytes changed"):
+        _validate_cached(destination, talent_root)
+
+
+def test_cached_record_rejects_mutated_chunk_contract_with_rehashed_manifest(
+    tmp_path: Path,
+):
+    destination, talent_root = _cached_dataset_fixture(tmp_path)
+    result_path = destination / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["arms"]["fingerprint"]["prediction_chunking"]["chunk_count"] = 2
+    _write_json(result_path, result)
+    manifest_path = destination / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["result.json"] = MODULE._sha256(result_path)
+    _write_json(manifest_path, manifest)
+
+    with pytest.raises(RuntimeError, match="prediction chunk contract is invalid"):
         _validate_cached(destination, talent_root)
 
 
