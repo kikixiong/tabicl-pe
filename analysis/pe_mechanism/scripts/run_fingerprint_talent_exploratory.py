@@ -72,7 +72,7 @@ LINEAGE_ARCHITECTURE = {
     "icl_num_blocks": 12,
     "icl_nhead": 8,
 }
-PREDICTION_CHUNK_ROWS = 65_536
+PREDICTION_CHUNK_ROWS = 32_768
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -22,7 +22,7 @@ SPEC.loader.exec_module(MODULE)
 def test_a10_protocol_processes_one_ensemble_member_at_a_time():
     assert MODULE.ESTIMATOR_OPTIONS["n_estimators"] == 2
     assert MODULE.ESTIMATOR_OPTIONS["batch_size"] == 1
-    assert MODULE.PREDICTION_CHUNK_ROWS == 65_536
+    assert MODULE.PREDICTION_CHUNK_ROWS == 32_768
 
 
 def _write_json(path: Path, payload: object) -> None:
