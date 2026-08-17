@@ -179,33 +179,80 @@ export PYTHONPATH="$analysis_root/analysis/pe_mechanism/src"
 monitor_root="$run_root/gpu-monitor"
 ensure_real_directory "$monitor_root" gpu-monitor
 monitor_csv="$monitor_root/canary-${SLURM_JOB_ID:-manual}.csv"
-monitor_helper="$analysis_root/analysis/pe_mechanism/scripts/safe_gpu_monitor.sh"
-reject_symlink_components "$monitor_helper" monitor-helper
-[[ -x "$monitor_helper" && -f "$monitor_helper" && ! -L "$monitor_helper" ]] || {
-  printf 'error: GPU monitor helper must be a real executable\n' >&2
-  exit 2
-}
-# safe_gpu_monitor.sh owns one no-follow descriptor and samples with "sleep 30".
+# The coprocess shell is replaced by the already verified Python monitor process.
 coproc PAIR_GPU_MONITOR {
-  "$monitor_helper" "$PE_PAIR_PYTHON" "$monitor_csv"
+  exec "$PE_PAIR_PYTHON" -I -B "$python_verifier" \
+    --entry "$PE_PAIR_PYTHON" \
+    --contract "$PE_PAIR_PYTHON_CONTRACT" \
+    --expected-document-sha256 "$PE_PAIR_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256" \
+    --expected-file-sha256 "$PE_PAIR_EXPECTED_PYTHON_CONTRACT_FILE_SHA256" \
+    --gpu-monitor "$monitor_csv"
 }
 monitor_pid=$PAIR_GPU_MONITOR_PID
 monitor_ready_fd=${PAIR_GPU_MONITOR[0]}
 monitor_input_fd=${PAIR_GPU_MONITOR[1]}
-exec {monitor_input_fd}>&-
+monitor_finalized=0
+
+close_monitor_input_fd() {
+  if [[ -n "${monitor_input_fd:-}" ]]; then
+    exec {monitor_input_fd}>&- || true
+    monitor_input_fd=''
+  fi
+}
+close_monitor_ready_fd() {
+  if [[ -n "${monitor_ready_fd:-}" ]]; then
+    exec {monitor_ready_fd}<&- || true
+    monitor_ready_fd=''
+  fi
+}
+cleanup_monitor_resources() {
+  close_monitor_input_fd
+  if (( ${monitor_finalized:-0} == 0 )) && [[ -n "${monitor_pid:-}" ]]; then
+    wait "$monitor_pid" 2>/dev/null || true
+    monitor_pid=''
+  fi
+  close_monitor_ready_fd
+}
+cleanup_monitor() {
+  local original_status=$?
+  trap - EXIT INT TERM
+  cleanup_monitor_resources
+  exit "$original_status"
+}
+cleanup_monitor_signal() {
+  local signal_number=$1
+  trap - EXIT INT TERM
+  cleanup_monitor_resources
+  exit "$((128 + signal_number))"
+}
+finalize_monitor() {
+  local monitor_complete='' monitor_wait_status=0
+  printf 'STOP\n' >&"$monitor_input_fd" || return 1
+  exec {monitor_input_fd}>&-
+  monitor_input_fd=''
+  IFS= read -r -t 45 monitor_complete <&"$monitor_ready_fd" || return 1
+  [[ "$monitor_complete" == COMPLETE ]] || return 1
+  exec {monitor_ready_fd}<&-
+  monitor_ready_fd=''
+  if wait "$monitor_pid"; then
+    monitor_wait_status=0
+  else
+    monitor_wait_status=$?
+  fi
+  monitor_pid=''
+  (( monitor_wait_status == 0 )) || return 1
+  monitor_finalized=1
+}
+trap cleanup_monitor EXIT
+trap 'cleanup_monitor_signal 2' INT
+trap 'cleanup_monitor_signal 15' TERM
+
 monitor_ready=''
 if ! IFS= read -r -t 30 monitor_ready <&"$monitor_ready_fd" \
   || [[ "$monitor_ready" != READY ]]; then
-  wait "$monitor_pid" 2>/dev/null || true
   printf 'error: GPU monitor failed secure initialization\n' >&2
   exit 2
 fi
-exec {monitor_ready_fd}<&-
-cleanup_monitor() {
-  kill "$monitor_pid" 2>/dev/null || true
-  wait "$monitor_pid" 2>/dev/null || true
-}
-trap cleanup_monitor EXIT INT TERM
 
 run_bound_python -B \
   "$analysis_root/analysis/pe_mechanism/scripts/run_pair_full_suite_shard.py" \
@@ -224,7 +271,8 @@ run_bound_python -B \
   --expected-suite beyondarena \
   --phase canary
 
-kill -0 "$monitor_pid" 2>/dev/null || {
-  printf 'error: GPU monitor exited before evaluator completion\n' >&2
+if ! finalize_monitor; then
+  printf 'error: GPU monitor did not finalize successfully\n' >&2
   exit 1
-}
+fi
+trap - EXIT INT TERM

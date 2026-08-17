@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import signal
 import subprocess
 import sys
 from typing import Any
@@ -37,6 +38,7 @@ AGGREGATOR = PACKAGE_ROOT / "scripts" / "aggregate_pair_full_suite.py"
 WRAPPER = PACKAGE_ROOT / "scripts" / "slurm_pair_full_suite_shard.sh"
 CANARY_WRAPPER = PACKAGE_ROOT / "scripts" / "slurm_pair_full_suite_canary.sh"
 A10_WRAPPER = PACKAGE_ROOT / "scripts" / "slurm_pair_tabarena_a10.sh"
+PYTHON_VERIFIER = PACKAGE_ROOT / "scripts" / "verify_python_environment.py"
 SUBMITTER = PACKAGE_ROOT / "scripts" / "submit_pair_full_suite.py"
 TABARENA_SHA = "c987d91556a14d4c9b3383c35d1b0ec68ff81883"
 MODEL_SHA = "1" * 40
@@ -1065,23 +1067,59 @@ def test_runner_aggregator_and_slurm_wrapper_are_syntax_checked_and_bounded() ->
         "#SBATCH --gres=gpu:1",
     ):
         assert directive in wrapper
-    assert "sleep 30" in wrapper
     assert "*H100*" in wrapper
     canary = CANARY_WRAPPER.read_text(encoding="utf-8")
     assert "#SBATCH --qos=medium" in canary
     assert "#SBATCH --time=24:00:00" in canary
     assert "PE_PAIR_EXPECTED_ANALYSIS_SHA PE_PAIR_EXPECTED_TABARENA_SHA" in canary
     assert "required_paths" in canary
-    assert "sleep 30" in canary
     a10 = A10_WRAPPER.read_text(encoding="utf-8")
     assert '"NVIDIA A10"' in a10
-    assert "sleep 30" in a10
     for source in (wrapper, canary, a10):
         assert "reject_symlink_components" in source
         assert "reject_parent_symlink_components" in source
         assert "verify_python_environment.py" in source
         assert '[[ -x "$PE_PAIR_PYTHON" && -L "$PE_PAIR_PYTHON" ]]' in source
+        assert 'exec "$PE_PAIR_PYTHON" -I -B "$python_verifier"' in source
+        assert '--gpu-monitor "$monitor_csv"' in source
+        assert "safe_gpu_monitor" not in source
+        assert "--exec-bound" not in source
+        assert "monitor_python=" not in source
         assert "ensure_real_directory \"$monitor_root\"" in source
+        assert "printf 'STOP\\n'" in source
+        assert '[[ "$monitor_complete" == COMPLETE ]]' in source
+        assert 'IFS= read -r -t 45 monitor_complete' in source
+        assert 'wait "$monitor_pid"' in source
+        assert "kill -0" not in source
+        assert 'kill "$monitor_pid"' not in source
+        assert "local original_status=$?" in source
+        assert "trap - EXIT INT TERM" in source
+        assert 'exit "$original_status"' in source
+        assert "trap cleanup_monitor EXIT\n" in source
+        assert "trap 'cleanup_monitor_signal 2' INT" in source
+        assert "trap 'cleanup_monitor_signal 15' TERM" in source
+        assert 'exit "$((128 + signal_number))"' in source
+        assert "trap cleanup_monitor EXIT INT TERM" not in source
+        assert "monitor_pid=''" in source
+        cleanup_start = source.index("cleanup_monitor_resources() {")
+        cleanup_end = source.index("cleanup_monitor() {", cleanup_start)
+        cleanup = source[cleanup_start:cleanup_end]
+        assert cleanup.index("close_monitor_input_fd") < cleanup.index(
+            'wait "$monitor_pid"'
+        )
+        assert cleanup.index('wait "$monitor_pid"') < cleanup.index(
+            "monitor_pid=''"
+        )
+        assert cleanup.index("monitor_pid=''") < cleanup.index(
+            "close_monitor_ready_fd"
+        )
+    monitor_source = PYTHON_VERIFIER.read_text(encoding="utf-8")
+    assert "os.O_NOFOLLOW" in monitor_source
+    assert "os.O_EXCL" in monitor_source
+    assert "select.select" in monitor_source
+    assert 'NVIDIA_SMI = "/usr/bin/nvidia-smi"' in monitor_source
+    assert 'control != "STOP\\n"' in monitor_source
+    assert 'print("COMPLETE", flush=True)' in monitor_source
     aggregate_source = aggregate_wrapper.read_text(encoding="utf-8")
     assert "verify_python_environment.py" in aggregate_source
     assert '[[ -x "$PE_PAIR_PYTHON" && -L "$PE_PAIR_PYTHON" ]]' in aggregate_source
@@ -1089,6 +1127,117 @@ def test_runner_aggregator_and_slurm_wrapper_are_syntax_checked_and_bounded() ->
     assert "dataset_names=[task.name]" in runner
     assert runner.index("self.arena.build_jobs(") < runner.index("self.arena.run_jobs(")
     assert AGGREGATOR.is_file()
+
+
+def test_wrapper_finalizer_rejects_monitor_that_exits_after_ready() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+    start = source.index("finalize_monitor() {")
+    end = source.index("\n}\n", start) + len("\n}\n")
+    finalizer = source[start:end]
+    harness = f"""
+set -euo pipefail
+{finalizer}
+coproc PAIR_GPU_MONITOR {{
+  printf 'READY\\n'
+  exit 23
+}}
+monitor_pid=$PAIR_GPU_MONITOR_PID
+monitor_ready_fd=${{PAIR_GPU_MONITOR[0]}}
+monitor_input_fd=${{PAIR_GPU_MONITOR[1]}}
+monitor_finalized=0
+IFS= read -r monitor_ready <&"$monitor_ready_fd"
+[[ "$monitor_ready" == READY ]]
+sleep 0.1
+if finalize_monitor; then
+  exit 90
+fi
+if wait "$monitor_pid"; then
+  exit 91
+else
+  monitor_status=$?
+fi
+[[ "$monitor_status" == 23 ]]
+"""
+    completed = subprocess.run(
+        ["bash", "-c", harness], capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("interrupt", "expected_status"),
+    [(signal.SIGINT, 130), (signal.SIGTERM, 143)],
+)
+def test_wrapper_monitor_cleanup_preserves_nonzero_signal_status(
+    interrupt: signal.Signals, expected_status: int
+) -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+    start = source.index("close_monitor_input_fd() {")
+    end = source.index("finalize_monitor() {", start)
+    cleanup_functions = source[start:end]
+    harness = f"""
+set -euo pipefail
+{cleanup_functions}
+kill() {{
+  exit 99
+}}
+coproc PAIR_GPU_MONITOR {{
+  exit 23
+}}
+monitor_pid=$PAIR_GPU_MONITOR_PID
+monitor_ready_fd=${{PAIR_GPU_MONITOR[0]}}
+monitor_input_fd=${{PAIR_GPU_MONITOR[1]}}
+monitor_finalized=0
+trap cleanup_monitor EXIT
+trap 'cleanup_monitor_signal 2' INT
+trap 'cleanup_monitor_signal 15' TERM
+sleep 0.1
+printf 'READY\\n'
+while :; do sleep 1; done
+"""
+    process = subprocess.Popen(
+        ["bash", "-c", harness],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline() == "READY\n"
+        process.send_signal(interrupt)
+        assert process.wait(timeout=5) == expected_status
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_wrapper_monitor_cleanup_waits_cached_child_and_preserves_exit_status() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+    start = source.index("close_monitor_input_fd() {")
+    end = source.index("finalize_monitor() {", start)
+    cleanup_functions = source[start:end]
+    harness = f"""
+set -euo pipefail
+{cleanup_functions}
+kill() {{
+  exit 99
+}}
+coproc PAIR_GPU_MONITOR {{
+  exit 23
+}}
+monitor_pid=$PAIR_GPU_MONITOR_PID
+monitor_ready_fd=${{PAIR_GPU_MONITOR[0]}}
+monitor_input_fd=${{PAIR_GPU_MONITOR[1]}}
+monitor_finalized=0
+trap cleanup_monitor EXIT
+sleep 0.1
+exit 37
+"""
+    completed = subprocess.run(
+        ["bash", "-c", harness], capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 37, completed.stderr
 
 
 def test_submitter_holds_canary_and_git_preflight_requires_clean_detached(

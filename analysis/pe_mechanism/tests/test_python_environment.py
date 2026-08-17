@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import subprocess
 import sys
@@ -193,6 +194,190 @@ def test_bound_launcher_preserves_venv_and_postverifies(tmp_path: Path) -> None:
         f"from pathlib import Path; Path({str(path)!r}).write_text('tampered')",
     ]
     assert subprocess.run(tamper, check=False, capture_output=True).returncode != 0
+
+
+def _fake_nvidia_smi(tmp_path: Path, *, fail_after_first: bool = False) -> Path:
+    executable = tmp_path / "nvidia-smi"
+    failure_guard = ""
+    if fail_after_first:
+        counter = tmp_path / "nvidia-smi-called"
+        failure_guard = (
+            f"if [ -e {str(counter)!r} ]; then exit 23; fi\n"
+            f": > {str(counter)!r}\n"
+        )
+    executable.write_text(
+        "#!/bin/sh\n"
+        + failure_guard
+        + "printf '0, NVIDIA H100 80GB HBM3, 87, 1024, 81559\\n'\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    return executable
+
+
+def _start_gpu_monitor(
+    *,
+    entry: Path,
+    contract_path: Path,
+    contract_file_sha256: str,
+    contract_document_sha256: str,
+    output_csv: Path,
+    nvidia_smi: Path,
+) -> subprocess.Popen[str]:
+    loader = (
+        "import importlib.util;"
+        f"s=importlib.util.spec_from_file_location('bound_verifier',{str(VERIFIER)!r});"
+        "m=importlib.util.module_from_spec(s);"
+        "s.loader.exec_module(m);"
+        f"m.NVIDIA_SMI={str(nvidia_smi)!r};"
+        "raise SystemExit(m.main())"
+    )
+    return subprocess.Popen(
+        [
+            str(entry),
+            "-I",
+            "-B",
+            "-c",
+            loader,
+            "--entry",
+            str(entry),
+            "--contract",
+            str(contract_path),
+            "--expected-file-sha256",
+            contract_file_sha256,
+            "--expected-document-sha256",
+            contract_document_sha256,
+            "--gpu-monitor",
+            str(output_csv),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+
+def _protocol_line(process: subprocess.Popen[str], *, timeout: float = 10) -> str:
+    assert process.stdout is not None
+    readable, _, _ = select.select((process.stdout,), (), (), timeout)
+    assert readable, "timed out waiting for GPU monitor protocol output"
+    return process.stdout.readline().rstrip("\n")
+
+
+def _send_control(process: subprocess.Popen[str], control: str | None) -> None:
+    assert process.stdin is not None
+    if control is not None:
+        process.stdin.write(control)
+        process.stdin.flush()
+    process.stdin.close()
+    process.stdin = None
+
+
+def test_in_process_gpu_monitor_ready_stop_complete_and_no_reopen_after_ready(
+    tmp_path: Path,
+) -> None:
+    entry, _ = _venv(tmp_path)
+    contract = build_python_environment_contract(entry)
+    path, file_sha = _write_contract(tmp_path, contract)
+    output_csv = tmp_path / "gpu.csv"
+    process = _start_gpu_monitor(
+        entry=entry,
+        contract_path=path,
+        contract_file_sha256=file_sha,
+        contract_document_sha256=contract["sha256"],
+        output_csv=output_csv,
+        nvidia_smi=_fake_nvidia_smi(tmp_path),
+    )
+    replacement = tmp_path / "replacement-python"
+    replacement.write_bytes(b"replacement must never be executed")
+    try:
+        assert _protocol_line(process) == "READY"
+        entry.unlink()
+        entry.symlink_to(replacement)
+        config = entry.parent.parent / "pyvenv.cfg"
+        config.write_text(
+            config.read_text(encoding="utf-8") + "# post-ready tamper\n",
+            encoding="utf-8",
+        )
+        _send_control(process, "STOP\n")
+        assert _protocol_line(process) == "COMPLETE"
+        assert process.wait(timeout=10) == 0
+        lines = output_csv.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == (
+            "timestamp,index,name,utilization_gpu_pct,memory_used_mib,"
+            "memory_total_mib"
+        )
+        assert len(lines) == 3
+        assert all(
+            line.endswith(",0, NVIDIA H100 80GB HBM3, 87, 1024, 81559")
+            for line in lines[1:]
+        )
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+
+
+def test_gpu_monitor_refuses_existing_csv_without_overwrite(tmp_path: Path) -> None:
+    entry, _ = _venv(tmp_path)
+    contract = build_python_environment_contract(entry)
+    path, file_sha = _write_contract(tmp_path, contract)
+    output_csv = tmp_path / "gpu.csv"
+    output_csv.write_text("do-not-overwrite\n", encoding="utf-8")
+    process = _start_gpu_monitor(
+        entry=entry,
+        contract_path=path,
+        contract_file_sha256=file_sha,
+        contract_document_sha256=contract["sha256"],
+        output_csv=output_csv,
+        nvidia_smi=_fake_nvidia_smi(tmp_path),
+    )
+    stdout, _stderr = process.communicate(timeout=10)
+    assert process.returncode != 0
+    assert "READY" not in stdout
+    assert output_csv.read_text(encoding="utf-8") == "do-not-overwrite\n"
+
+
+@pytest.mark.parametrize("control", [None, "NOT_STOP\n"])
+def test_gpu_monitor_rejects_stdin_eof_and_non_stop(
+    tmp_path: Path, control: str | None
+) -> None:
+    entry, _ = _venv(tmp_path)
+    contract = build_python_environment_contract(entry)
+    path, file_sha = _write_contract(tmp_path, contract)
+    process = _start_gpu_monitor(
+        entry=entry,
+        contract_path=path,
+        contract_file_sha256=file_sha,
+        contract_document_sha256=contract["sha256"],
+        output_csv=tmp_path / "gpu.csv",
+        nvidia_smi=_fake_nvidia_smi(tmp_path),
+    )
+    assert _protocol_line(process) == "READY"
+    _send_control(process, control)
+    assert process.wait(timeout=10) != 0
+    assert _protocol_line(process, timeout=1) == ""
+
+
+def test_gpu_monitor_final_sample_failure_has_no_complete_and_exits_nonzero(
+    tmp_path: Path,
+) -> None:
+    entry, _ = _venv(tmp_path)
+    contract = build_python_environment_contract(entry)
+    path, file_sha = _write_contract(tmp_path, contract)
+    process = _start_gpu_monitor(
+        entry=entry,
+        contract_path=path,
+        contract_file_sha256=file_sha,
+        contract_document_sha256=contract["sha256"],
+        output_csv=tmp_path / "gpu.csv",
+        nvidia_smi=_fake_nvidia_smi(tmp_path, fail_after_first=True),
+    )
+    assert _protocol_line(process) == "READY"
+    _send_control(process, "STOP\n")
+    assert process.wait(timeout=10) != 0
+    assert _protocol_line(process, timeout=1) == ""
 
 
 def test_contract_path_replacement_during_single_fd_read_fails(
