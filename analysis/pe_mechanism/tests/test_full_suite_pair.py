@@ -1088,7 +1088,7 @@ def test_right_arm_oom_retries_the_whole_pair_in_fresh_staging(
 
     def oom_once(task, staging, fallback):
         attempts.append((fallback["level"], staging))
-        if task.name == "dataset-a" and fallback["level"] == 0:
+        if task.name == "dataset-a" and fallback["level"] == 1:
             _write_prediction(staging / "rope" / "predictions.npz")
             raise PairTaskOOM("right arm CUDA OOM")
         assert not any((staging / arm / "predictions.npz").exists() for arm in pair.arm_order)
@@ -1105,12 +1105,12 @@ def test_right_arm_oom_retries_the_whole_pair_in_fresh_staging(
     first_task = run_root / "tasks" / "0000-dataset-a" / "task.json"
     payload = json.loads(first_task.read_text(encoding="utf-8"))
     assert payload["fallback"] == {
-        "level": 1,
-        "name": "batch4-auto",
+        "level": 2,
+        "name": "batch4-cpu",
         "batch_size": 4,
-        "offload_mode": "auto",
+        "offload_mode": "cpu",
     }
-    dataset_a_staging = [path for level, path in attempts if level in (0, 1)][:2]
+    dataset_a_staging = [path for level, path in attempts if level in (1, 2)][:2]
     assert len(set(dataset_a_staging)) == 2
     assert list((run_root / ".staging").iterdir()) == []
 
@@ -1137,7 +1137,7 @@ def test_final_oom_level_leaves_no_success_arm_or_partial_task(tmp_path: Path) -
             provenance=_provenance(),
             executor=always_oom,
         )
-    assert levels == [0, 1, 2, 3]
+    assert levels == [1, 2, 3]
     assert list((run_root / "tasks").iterdir()) == []
     assert list((run_root / ".staging").iterdir()) == []
     assert list((run_root / "shards").iterdir()) == []

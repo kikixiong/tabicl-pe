@@ -43,7 +43,6 @@ _PINNED_ROSTERS = {
     },
 }
 _OOM_FALLBACK_POLICY = (
-    {"level": 0, "name": "batch8-auto", "batch_size": 8, "offload_mode": "auto"},
     {"level": 1, "name": "batch4-auto", "batch_size": 4, "offload_mode": "auto"},
     {"level": 2, "name": "batch4-cpu", "batch_size": 4, "offload_mode": "cpu"},
     {"level": 3, "name": "batch4-disk", "batch_size": 4, "offload_mode": "disk"},
