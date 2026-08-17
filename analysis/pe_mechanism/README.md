@@ -66,6 +66,26 @@ sbatch --chdir=/absolute/private/slurm-work \
 Pass the four required `PE_*` variables with `--export` or from a private
 submit wrapper. Do not submit the public script directly from its checkout.
 
+## Exploratory BeyondArena smoke
+
+[`scripts/run_fingerprint_beyondarena_exploratory.py`](scripts/run_fingerprint_beyondarena_exploratory.py)
+adapts the same fixed one-estimator RoPE/Fingerprint/released comparison to
+BeyondArena. Its default `lite` roster contains exactly one IID, one grouped,
+and one temporal classification dataset. The runner resolves that explicit
+roster before materialization and checks the complete 3-by-roster job matrix,
+so a smoke invocation cannot silently expand into the full 142-dataset suite.
+Use repeated `--dataset-name` arguments to choose another bounded,
+classification-only, text-free roster.
+
+The output is exploratory: it reports per-task errors, scale-free wins and
+mean ranks by split regime, but it is neither the recommended BeyondArena
+`core` protocol nor a leaderboard reproduction. Persistent Data Foundry and
+materialized task caches must be routed outside Git with
+`PE_BEYONDARENA_CACHE`; raw result caches are archived only inside the private
+output directory. Schedule the GPU run with
+[`scripts/slurm_fingerprint_beyondarena_exploratory.sh`](scripts/slurm_fingerprint_beyondarena_exploratory.sh)
+and provide scheduler stdout/stderr paths externally.
+
 `--output-dir` is always required. It must be an absolute path outside the Git
 source tree. Checkpoints, activations, predictions, logs, caches, and generated
 test data must stay outside this repository.
