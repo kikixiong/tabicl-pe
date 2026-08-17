@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+from numbers import Real
 import os
 from pathlib import Path
 import re
@@ -927,7 +928,7 @@ def load_shard_plan(path: Path, *, roster: Roster) -> ShardPlan:
         payload["schema_version"] != 1
         or payload["kind"] != "cost_balanced_pair_shard_plan"
         or payload["suite"] != expected_suite
-        or payload["version"] != "v1"
+        or payload["version"] != "v2"
         or payload["source_commit"] != roster.source_commit
         or payload["roster_sha256"] != roster.names_sha256
         or payload["shard_count"] != 8
@@ -939,10 +940,10 @@ def load_shard_plan(path: Path, *, roster: Roster) -> ShardPlan:
         fields={"name", "formula", "assignment"},
     )
     if cost_model != {
-        "name": "tabicl_pair_lpt_proxy_v1",
+        "name": "tabicl_pair_lpt_proxy_v2",
         "formula": (
             "num_instances*num_cols_after_preprocessing + "
-            "num_instances_test*min(num_instances_train,1024)"
+            "floor(num_instances_test)*min(floor(num_instances_train),1024)"
         ),
         "assignment": (
             "longest_processing_time_first_ties_by_dataset_then_lowest_shard"
@@ -1021,14 +1022,17 @@ def load_shard_plan(path: Path, *, roster: Roster) -> ShardPlan:
     )
 
 
-def _metadata_int(record: Mapping[str, Any], field: str, *, dataset: str) -> int:
+def _metadata_int(
+    record: Mapping[str, Any], field: str, *, dataset: str, floor: bool = False
+) -> int:
     value = record.get(field)
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"metadata {field} is invalid for {dataset}")
-    try:
-        number = int(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"metadata {field} is invalid for {dataset}") from error
+    if not math.isfinite(float(value)):
+        raise ValueError(f"metadata {field} is invalid for {dataset}")
+    number = math.floor(value) if floor else int(value)
+    if not floor and number != value:
+        raise ValueError(f"metadata {field} must be integral for {dataset}")
     if number < 1:
         raise ValueError(f"metadata {field} must be positive for {dataset}")
     return number
@@ -1045,14 +1049,25 @@ def validate_plan_metadata(
         raise ValueError("benchmark metadata does not exactly cover the frozen roster")
     costs: dict[str, int] = {}
     normalized: dict[str, dict[str, Any]] = {}
+    floor_split_counts = roster.suite_id == "tabarena-v0.1"
     for name in roster.names:
         record = records[name]
         num_instances = _metadata_int(record, "num_instances", dataset=name)
         dimensions = _metadata_int(
             record, "num_cols_after_preprocessing", dataset=name
         )
-        train = _metadata_int(record, "num_instances_train", dataset=name)
-        test = _metadata_int(record, "num_instances_test", dataset=name)
+        train = _metadata_int(
+            record,
+            "num_instances_train",
+            dataset=name,
+            floor=floor_split_counts,
+        )
+        test = _metadata_int(
+            record,
+            "num_instances_test",
+            dataset=name,
+            floor=floor_split_counts,
+        )
         regime = record.get("split_regime")
         if regime not in _SPLIT_REGIMES:
             raise ValueError(f"metadata split regime is invalid for {name}")

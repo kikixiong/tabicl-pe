@@ -10,6 +10,8 @@ import hashlib
 import importlib
 import importlib.metadata
 import json
+import math
+from numbers import Real
 import os
 from pathlib import Path
 import platform
@@ -18,6 +20,207 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, Mapping
+
+
+_NATIVE_LITE_COLUMNS = frozenset(
+    {
+        "dataset_name",
+        "tabarena_task_name",
+        "task_id_str",
+        "problem_type",
+        "eval_metric",
+        "num_instances",
+        "num_features",
+        "num_cols_after_preprocessing",
+        "num_text_cols",
+        "task_type",
+        "repeat",
+        "fold",
+        "split_index",
+        "num_instances_train",
+        "num_instances_test",
+    }
+)
+
+
+def _metadata_text(value: Any, field: str, *, dataset: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"native metadata {field} is invalid for {dataset}")
+    return value
+
+
+def _metadata_number(value: Any, field: str, *, dataset: str) -> Real:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"native metadata {field} is not numeric for {dataset}")
+    if not math.isfinite(float(value)):
+        raise ValueError(f"native metadata {field} is not finite for {dataset}")
+    return value
+
+
+def _metadata_integer(
+    value: Any, field: str, *, dataset: str, minimum: int
+) -> int:
+    number = _metadata_number(value, field, dataset=dataset)
+    integer = int(number)
+    if number != integer or integer < minimum:
+        raise ValueError(f"native metadata {field} is invalid for {dataset}")
+    return integer
+
+
+def _metadata_positive_number(value: Any, field: str, *, dataset: str) -> Real:
+    number = _metadata_number(value, field, dataset=dataset)
+    if number <= 0:
+        raise ValueError(f"native metadata {field} must be positive for {dataset}")
+    return number
+
+
+def _metadata_missing(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, Real) and math.isnan(float(value))
+    )
+
+
+def _native_lite_metadata(
+    arena: Any, *, names: tuple[str, ...], suite_id: str
+) -> dict[str, dict[str, Any]]:
+    """Read exact r0f0 rows from the pinned native task-metadata API.
+
+    ``arena.task_metadata`` is intentionally not accepted here: in pinned TabArena
+    c987 it is a lossy legacy bridge whose train/test sizes are split means.
+    """
+    collection = getattr(arena, "task_metadata_collection", None)
+    if collection is None:
+        raise TypeError("benchmark context lacks native task_metadata_collection")
+    try:
+        lite = collection.subset_tasks(
+            dataset_names=list(names), split_indices="lite"
+        )
+        frame = lite.to_dataframe()
+    except AttributeError as error:
+        raise TypeError("benchmark native task metadata API is unavailable") from error
+    columns = set(getattr(frame, "columns", ()))
+    missing_columns = sorted(_NATIVE_LITE_COLUMNS - columns)
+    if missing_columns:
+        raise ValueError(
+            f"native lite metadata is missing required columns: {missing_columns}"
+        )
+    rows = frame.to_dict(orient="records")
+    expected_names = set(names)
+    observed_names = {row.get("dataset_name") for row in rows}
+    if observed_names != expected_names:
+        raise ValueError("native lite metadata does not exactly cover the frozen roster")
+    by_name: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        name = _metadata_text(row["dataset_name"], "dataset_name", dataset="<roster>")
+        if name in by_name:
+            raise ValueError(f"native lite metadata is not one-to-one for {name}")
+        repeat = _metadata_integer(row["repeat"], "repeat", dataset=name, minimum=0)
+        fold = _metadata_integer(row["fold"], "fold", dataset=name, minimum=0)
+        split_index = _metadata_text(row["split_index"], "split_index", dataset=name)
+        if (repeat, fold, split_index) != (0, 0, "r0f0"):
+            raise ValueError(f"native lite metadata is not exact r0f0 for {name}")
+
+        internal = _metadata_text(
+            row["tabarena_task_name"], "tabarena_task_name", dataset=name
+        )
+        problem = _metadata_text(row["problem_type"], "problem_type", dataset=name)
+        if problem not in {"binary", "multiclass"}:
+            raise ValueError(f"roster task is not classification: {name}")
+        metric = _metadata_text(row["eval_metric"], "eval_metric", dataset=name)
+        expected_metric = "roc_auc" if problem == "binary" else "log_loss"
+        if metric != expected_metric:
+            raise ValueError(f"native metadata eval_metric is invalid for {name}")
+        task_type = _metadata_text(row["task_type"], "task_type", dataset=name)
+        if task_type not in {"random", "temporal", "grouped"}:
+            raise ValueError(f"native metadata task_type is invalid for {name}")
+
+        num_instances = _metadata_integer(
+            row["num_instances"], "num_instances", dataset=name, minimum=1
+        )
+        train_raw = _metadata_positive_number(
+            row["num_instances_train"], "num_instances_train", dataset=name
+        )
+        test_raw = _metadata_positive_number(
+            row["num_instances_test"], "num_instances_test", dataset=name
+        )
+        if (
+            train_raw > num_instances
+            or test_raw > num_instances
+            or train_raw + test_raw > num_instances
+        ):
+            raise ValueError(f"native lite split sizes exceed dataset size for {name}")
+
+        if suite_id == "beyondarena":
+            dimensions = _metadata_integer(
+                row["num_cols_after_preprocessing"],
+                "num_cols_after_preprocessing",
+                dataset=name,
+                minimum=1,
+            )
+            if (
+                _metadata_integer(
+                    row["num_text_cols"], "num_text_cols", dataset=name, minimum=0
+                )
+                != 0
+            ):
+                raise ValueError(f"BeyondArena task contains text features: {name}")
+            train = _metadata_integer(
+                train_raw, "num_instances_train", dataset=name, minimum=1
+            )
+            test = _metadata_integer(
+                test_raw, "num_instances_test", dataset=name, minimum=1
+            )
+            split_regime = "iid" if task_type == "random" else task_type
+        elif suite_id == "tabarena-v0.1":
+            if task_type != "random":
+                raise ValueError(f"TabArena-v0.1 task is not an IID split: {name}")
+            if not _metadata_missing(row["num_cols_after_preprocessing"]):
+                raise ValueError(
+                    "TabArena-v0.1 unexpectedly supplies post-preprocessing dimensions "
+                    f"for {name}"
+                )
+            dimensions = _metadata_integer(
+                row["num_features"], "num_features", dataset=name, minimum=1
+            )
+            # The pinned v0.1 source stores nominal 2/3 and 1/3 sizes as floats;
+            # retain them exactly here; the v2 shard-plan validator applies floor.
+            train = train_raw
+            test = test_raw
+            split_regime = "iid"
+        else:
+            raise ValueError(f"unsupported benchmark suite: {suite_id}")
+
+        by_name[name] = {
+            "dataset_name": name,
+            "benchmark_dataset_id": internal,
+            "problem_type": problem,
+            "metric": metric,
+            "num_instances": num_instances,
+            "num_cols_after_preprocessing": dimensions,
+            "num_instances_train": train,
+            "num_instances_test": test,
+            "split_regime": split_regime,
+        }
+
+    try:
+        tids = lite.dataset_to_tid()
+    except AttributeError as error:
+        raise TypeError("benchmark native dataset_to_tid API is unavailable") from error
+    if not isinstance(tids, Mapping):
+        raise TypeError("benchmark native dataset_to_tid result is not a mapping")
+    internal_ids: set[str] = set()
+    for name in names:
+        record = by_name[name]
+        internal = record["benchmark_dataset_id"]
+        if internal in internal_ids:
+            raise ValueError(f"native benchmark dataset id is duplicated: {internal}")
+        internal_ids.add(internal)
+        if internal not in tids:
+            raise ValueError(f"native task id is missing for {name}")
+        record["task_id"] = _metadata_integer(
+            tids[internal], "task_id", dataset=name, minimum=1
+        )
+    return by_name
 
 
 def _reject_symlink_components(path: Path, *, label: str) -> None:
@@ -416,60 +619,51 @@ class PairTaskRuntime:
         )
         self.arena = context_cls(methods=[], backend="native", cache_config=cache)
 
-    def plan_records(self) -> dict[str, dict[str, Any]]:
-        records: dict[str, dict[str, Any]] = {}
-        metadata = self.arena.task_metadata
-        for name in self.roster.names:
-            selected = metadata[metadata["dataset_name"] == name].copy()
-            if len(selected) != 1:
-                raise ValueError(f"benchmark metadata is not one-to-one for {name}")
-            row = selected.to_dict(orient="records")[0]
-            regime = (
-                "iid"
-                if self.roster.suite_id != "beyondarena"
-                or row.get("task_type") == "random"
-                else str(row["task_type"])
+    def _lite_metadata(self) -> dict[str, dict[str, Any]]:
+        cached = getattr(self, "_lite_metadata_cache", None)
+        if cached is None:
+            cached = _native_lite_metadata(
+                self.arena,
+                names=tuple(self.roster.names),
+                suite_id=self.roster.suite_id,
             )
-            dimensions = row.get("num_cols_after_preprocessing")
-            if dimensions in (None, ""):
-                dimensions = row["num_features"]
-            records[name] = {
-                "num_instances": row["num_instances"],
-                "num_cols_after_preprocessing": dimensions,
-                "num_instances_train": row["num_instances_train"],
-                "num_instances_test": row["num_instances_test"],
-                "split_regime": regime,
+            self._lite_metadata_cache = cached
+        return cached
+
+    def plan_records(self) -> dict[str, dict[str, Any]]:
+        metadata = self._lite_metadata()
+        return {
+            name: {
+                field: metadata[name][field]
+                for field in (
+                    "num_instances",
+                    "num_cols_after_preprocessing",
+                    "num_instances_train",
+                    "num_instances_test",
+                    "split_regime",
+                )
             }
-        return records
+            for name in self.roster.names
+        }
 
     def _task_metadata(self, name: str) -> tuple[str, dict[str, Any]]:
-        metadata = self.arena.task_metadata
-        selected = metadata[metadata["dataset_name"] == name].copy()
-        if len(selected) != 1:
-            raise ValueError(f"benchmark metadata is not one-to-one for {name}")
-        row = selected.to_dict(orient="records")[0]
-        problem = str(row["problem_type"])
-        if problem not in {"binary", "multiclass"}:
-            raise ValueError(f"roster task is not classification: {name}")
-        if self.roster.suite_id == "beyondarena":
-            if int(row["num_text_cols"]) != 0:
-                raise ValueError(f"BeyondArena task contains text features: {name}")
-            split_regime = "iid" if row["task_type"] == "random" else str(row["task_type"])
-        else:
-            split_regime = "iid"
-        internal = str(row["dataset"] if "dataset" in row else row["dataset_name"])
+        metadata = self._lite_metadata()
+        if name not in metadata:
+            raise ValueError(f"task is outside the frozen roster: {name}")
+        row = metadata[name]
+        internal = row["benchmark_dataset_id"]
         expected = {
-            "task_id": int(row["tid"]),
-            "problem_type": problem,
-            "metric": str(row["eval_metric"]),
+            "task_id": row["task_id"],
+            "problem_type": row["problem_type"],
+            "metric": row["metric"],
         }
         task = {
             "dataset_name": name,
             "benchmark_dataset_id": internal,
             "task_id": expected["task_id"],
-            "problem_type": problem,
+            "problem_type": expected["problem_type"],
             "metric": expected["metric"],
-            "split_regime": split_regime,
+            "split_regime": row["split_regime"],
             "fold": 0,
             "repeat": 0,
             "split_index": 0,

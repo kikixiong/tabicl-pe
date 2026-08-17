@@ -1,0 +1,170 @@
+{
+  "assignment_hash_algorithm": "sha256_newline_join_roster_order_name_tab_shard_tab_cost",
+  "assignment_sha256": "6abc38058806dae5e296fc4e361774e0fe1bac59b41c3f8bbe85b8b35c6223cb",
+  "canary": {
+    "names": [
+      "amex_non_iid_1m",
+      "ghanas_indigenous_intel",
+      "home_credit_default_stability_1m",
+      "lung_cancer_epithelial_genexp"
+    ],
+    "requirements": {
+      "grouped": "amex_non_iid_1m",
+      "max_lpt_workload": "home_credit_default_stability_1m",
+      "max_dimensions": "lung_cancer_epithelial_genexp",
+      "max_rows": "amex_non_iid_1m",
+      "temporal": "ghanas_indigenous_intel"
+    }
+  },
+  "cost_model": {
+    "assignment": "longest_processing_time_first_ties_by_dataset_then_lowest_shard",
+    "formula": "num_instances*num_cols_after_preprocessing + floor(num_instances_test)*min(floor(num_instances_train),1024)",
+    "name": "tabicl_pair_lpt_proxy_v2"
+  },
+  "kind": "cost_balanced_pair_shard_plan",
+  "roster_sha256": "7b440b2676184bd0fe7b2e604f4aa6ad22e76a54cf74b626a79e8b58bd172473",
+  "schema_version": 1,
+  "shard_count": 8,
+  "shards": [
+    {
+      "estimated_cost_units": 1112272688,
+      "index": 0,
+      "names": [
+        "home_credit_default_stability_1m"
+      ]
+    },
+    {
+      "estimated_cost_units": 502658910,
+      "index": 1,
+      "names": [
+        "amex_non_iid_1m"
+      ]
+    },
+    {
+      "estimated_cost_units": 382096169,
+      "index": 2,
+      "names": [
+        "biogeographical_ancestry_prediction",
+        "biomechanical_orthopaedic_prediction",
+        "credit_card_clients_default",
+        "fitness_club",
+        "forensic_glass_identification",
+        "ghanas_indigenous_intel",
+        "hr_analytics",
+        "ieee_fraud_detection",
+        "lung_cancer_epithelial_genexp",
+        "musk",
+        "qsar_biodeg",
+        "splice"
+      ]
+    },
+    {
+      "estimated_cost_units": 382097704,
+      "index": 3,
+      "names": [
+        "anes_voting_2026",
+        "gallstone_disease",
+        "heart_failure_followup_survival",
+        "hepatitis_survival_prediction",
+        "hiva_agnostic",
+        "indian_liver_patient_dataset",
+        "iranian_churn",
+        "jm1",
+        "kdd_cup_09_appetency",
+        "maternal_health_risk",
+        "mic",
+        "parkinsons_biomedical_voice_measurements",
+        "sepsis_prediction_1m",
+        "taiwanese_bankruptcy_prediction",
+        "thyroid_discordant"
+      ]
+    },
+    {
+      "estimated_cost_units": 382090532,
+      "index": 4,
+      "names": [
+        "asp_potassco_classification",
+        "audiology_diagnosis",
+        "coil_2000",
+        "credit_approval",
+        "hazelnut_spread_contaminant_detection",
+        "home_credit_default_risk",
+        "homeq_default_prediction",
+        "ljubljana_primary_tumor",
+        "mice_protein_trisomy_discriminant",
+        "naticusdroid_android_permissions_dataset",
+        "otto_group_product_classification_challenge",
+        "santander_customer_satisfaction",
+        "sepsis_survival_minimal_clinical_records"
+      ]
+    },
+    {
+      "estimated_cost_units": 382100346,
+      "index": 5,
+      "names": [
+        "amazon_employee_access",
+        "aps_failure",
+        "bad_customer_detection",
+        "bank_customer_churn",
+        "blood_transfusion",
+        "cardiotocography",
+        "covertype",
+        "credit_g",
+        "customer_satisfaction_in_airline",
+        "ecoli_proteins",
+        "heart_disease_hungary",
+        "heart_disease_va_long_beach",
+        "kick",
+        "online_shoppers_purchasing_intention_dataset",
+        "predict_students_dropout_and_academic_success",
+        "sdss_17"
+      ]
+    },
+    {
+      "estimated_cost_units": 382094157,
+      "index": 6,
+      "names": [
+        "acquire_valued_shoppers_challenge",
+        "bank_marketing",
+        "bioresponse",
+        "diabetes_130_us",
+        "early_stage_diabetes_risk_prediction",
+        "give_me_some_credit",
+        "heart_disease_cleveland",
+        "heloc",
+        "hepatitis_c_prediction",
+        "horse_colic_survival",
+        "in_vehicle_coupon_recommendation",
+        "marketing_campaign",
+        "pancreatic_cancer_mouse_detection",
+        "polish_companies_bankruptcy",
+        "porto_seguro",
+        "tour_travels_churn",
+        "website_phishing"
+      ]
+    },
+    {
+      "estimated_cost_units": 382090277,
+      "index": 7,
+      "names": [
+        "churn",
+        "clock_protein_toxicity",
+        "dementia_prediction",
+        "ecommerce_shipping",
+        "eryhemato_squamous_disease",
+        "homesite_quote_conversion",
+        "hotel_booking_demand",
+        "ljubljana_breast_cancer",
+        "lung_cancer",
+        "micro_mass",
+        "prostate_cancer_detection",
+        "santander_customer_transaction_prediction",
+        "seismic_bumps",
+        "south_africa_coronary_heart_disease"
+      ]
+    }
+  ],
+  "source_commit": "c987d91556a14d4c9b3383c35d1b0ec68ff81883",
+  "suite": "BeyondArena",
+  "version": "v2"
+}

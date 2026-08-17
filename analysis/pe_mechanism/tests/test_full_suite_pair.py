@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+from dataclasses import replace
 from pathlib import Path
 import signal
 import subprocess
@@ -32,7 +33,17 @@ from pe_mechanism.full_suite_pair import (
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PACKAGE_ROOT.parents[1]
 ROSTER = PACKAGE_ROOT / "manifests" / "beyondarena-nontext-classification-lite-v1.json"
-PLAN = PACKAGE_ROOT / "manifests" / "beyondarena-nontext-classification-lite-v1-shards.json"
+PLAN = PACKAGE_ROOT / "manifests" / "beyondarena-nontext-classification-lite-v2-shards.json"
+V1_PLAN = PACKAGE_ROOT / "manifests" / "beyondarena-nontext-classification-lite-v1-shards.json"
+TABARENA_ROSTER = PACKAGE_ROOT / "manifests" / "tabarena-v0.1-classification-roster.json"
+TABARENA_PLAN = PACKAGE_ROOT / "manifests" / "tabarena-v0.1-classification-lite-v2-shards.json"
+TABARENA_V1_PLAN = PACKAGE_ROOT / "manifests" / "tabarena-v0.1-classification-lite-v1-shards.json"
+NATIVE_LITE_FIXTURE = (
+    PACKAGE_ROOT / "tests" / "fixtures" / "beyondarena-c987-lite-native-metadata.json"
+)
+TABARENA_NATIVE_LITE_FIXTURE = (
+    PACKAGE_ROOT / "tests" / "fixtures" / "tabarena-v0.1-c987-lite-native-metadata.json"
+)
 RUNNER = PACKAGE_ROOT / "scripts" / "run_pair_full_suite_shard.py"
 AGGREGATOR = PACKAGE_ROOT / "scripts" / "aggregate_pair_full_suite.py"
 WRAPPER = PACKAGE_ROOT / "scripts" / "slurm_pair_full_suite_shard.sh"
@@ -332,15 +343,15 @@ def _plan(tmp_path: Path, roster):
                 "schema_version": 1,
                 "kind": "cost_balanced_pair_shard_plan",
                 "suite": "BeyondArena",
-                "version": "v1",
+                "version": "v2",
                 "source_commit": TABARENA_SHA,
                 "roster_sha256": roster.names_sha256,
                 "shard_count": 8,
                 "cost_model": {
-                    "name": "tabicl_pair_lpt_proxy_v1",
+                    "name": "tabicl_pair_lpt_proxy_v2",
                     "formula": (
                         "num_instances*num_cols_after_preprocessing + "
-                        "num_instances_test*min(num_instances_train,1024)"
+                        "floor(num_instances_test)*min(floor(num_instances_train),1024)"
                     ),
                     "assignment": (
                         "longest_processing_time_first_ties_by_dataset_then_lowest_shard"
@@ -487,6 +498,68 @@ def _strings(value: Any):
             yield from _strings(item)
 
 
+def _runner_module(label: str):
+    spec = importlib.util.spec_from_file_location(label, RUNNER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FixtureNativeCollection:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    def subset_tasks(self, *, dataset_names, split_indices):
+        assert split_indices == "lite"
+        requested = set(dataset_names)
+        selected = [
+            dict(row)
+            for row in self.rows
+            if row["dataset_name"] in requested
+        ]
+        available = {row["dataset_name"] for row in selected}
+        if available != requested:
+            raise ValueError("fixture native lite split is missing a requested dataset")
+        return _FixtureNativeCollection(selected)
+
+    def to_dataframe(self):
+        return pd.DataFrame(self.rows)
+
+    def dataset_to_tid(self):
+        result = {}
+        for row in self.rows:
+            task_id = str(row["task_id_str"])
+            parts = task_id.split("|")
+            result[row["tabarena_task_name"]] = int(
+                parts[1] if len(parts) > 1 else task_id
+            )
+        return result
+
+
+class _FixtureArena:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.task_metadata_collection = _FixtureNativeCollection(rows)
+
+    @property
+    def task_metadata(self):  # pragma: no cover - forbidden legacy boundary
+        raise AssertionError("the lossy legacy task_metadata bridge was accessed")
+
+
+def _native_fixture_rows() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    payload = json.loads(NATIVE_LITE_FIXTURE.read_text(encoding="utf-8"))
+    return payload, payload["rows"]
+
+
+def _tabarena_native_fixture_rows() -> tuple[
+    dict[str, Any], list[dict[str, Any]]
+]:
+    payload = json.loads(
+        TABARENA_NATIVE_LITE_FIXTURE.read_text(encoding="utf-8")
+    )
+    return payload, payload["rows"]
+
+
 def test_beyondarena_roster_is_exact_nontext_classification_lite_89() -> None:
     roster = load_roster(ROSTER)
     plan = load_shard_plan(PLAN, roster=roster)
@@ -520,6 +593,188 @@ def test_beyondarena_roster_is_exact_nontext_classification_lite_89() -> None:
         for value in _strings(payload)
         for token in forbidden
     )
+
+
+@pytest.mark.parametrize(
+    ("roster_path", "plan_path", "assignment_sha256", "totals"),
+    [
+        (
+            ROSTER,
+            PLAN,
+            "6abc38058806dae5e296fc4e361774e0fe1bac59b41c3f8bbe85b8b35c6223cb",
+            (
+                1_112_272_688,
+                502_658_910,
+                382_096_169,
+                382_097_704,
+                382_090_532,
+                382_100_346,
+                382_094_157,
+                382_090_277,
+            ),
+        ),
+        (
+            TABARENA_ROSTER,
+            TABARENA_PLAN,
+            "af5b6a869cc8384deb20ca7c64c07826e4d834e61d745df274488db62de98fc7",
+            (
+                52_700_000,
+                47_059_512,
+                38_860_992,
+                38_288_944,
+                38_292_651,
+                38_275_978,
+                38_335_757,
+                38_280_801,
+            ),
+        ),
+    ],
+)
+def test_shard_cost_contract_declares_floor_without_changing_frozen_plan(
+    roster_path: Path,
+    plan_path: Path,
+    assignment_sha256: str,
+    totals: tuple[int, ...],
+) -> None:
+    roster = load_roster(roster_path)
+    plan = load_shard_plan(plan_path, roster=roster)
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert payload["version"] == "v2"
+    assert payload["cost_model"]["name"] == "tabicl_pair_lpt_proxy_v2"
+    assert payload["cost_model"]["formula"] == (
+        "num_instances*num_cols_after_preprocessing + "
+        "floor(num_instances_test)*min(floor(num_instances_train),1024)"
+    )
+    assert plan.assignment_sha256 == assignment_sha256
+    assert plan.estimated_cost_units == totals
+
+
+@pytest.mark.parametrize(
+    ("roster_path", "plan_path", "file_sha256"),
+    [
+        (
+            ROSTER,
+            V1_PLAN,
+            "9fdd7da8d4fbb2e8551318d9a2bd56a77ae732fd27c77a7c6f34c0585e4c7adf",
+        ),
+        (
+            TABARENA_ROSTER,
+            TABARENA_V1_PLAN,
+            "a3ee265e982678ac4f7870f8a920de0896dd0f106049b8c2863388b34b234e1a",
+        ),
+    ],
+)
+def test_ambiguous_v1_shard_plans_are_preserved_but_rejected_for_production(
+    roster_path: Path, plan_path: Path, file_sha256: str
+) -> None:
+    assert _sha(plan_path) == file_sha256
+    roster = load_roster(roster_path)
+    with pytest.raises(ValueError, match="pinned eight-shard roster"):
+        load_shard_plan(plan_path, roster=roster)
+
+
+def test_pair_runtime_uses_exact_pinned_native_lite_schema_not_legacy_bridge() -> None:
+    module = _runner_module("pair_shard_runner_native_schema")
+    fixture, rows = _native_fixture_rows()
+    assert fixture["source_commit"] == TABARENA_SHA
+    assert fixture["source_metadata_sha256"] == (
+        "04b46ef37647298991e380f972fab190ed0a26a43dbc2699f10c735cd72816fc"
+    )
+    runtime = module.PairTaskRuntime.__new__(module.PairTaskRuntime)
+    runtime.arena = _FixtureArena(rows)
+    runtime.roster = type(
+        "FixtureRoster",
+        (),
+        {
+            "names": tuple(row["dataset_name"] for row in rows),
+            "suite_id": "beyondarena",
+        },
+    )()
+
+    records = runtime.plan_records()
+    assert records["amex_non_iid_1m"] == {
+        "num_instances": 1_249_605,
+        "num_cols_after_preprocessing": 198,
+        "num_instances_train": 1_000_350,
+        "num_instances_test": 249_255,
+        "split_regime": "grouped",
+    }
+    assert records["ghanas_indigenous_intel"]["split_regime"] == "temporal"
+    assert records["lung_cancer_epithelial_genexp"][
+        "num_cols_after_preprocessing"
+    ] == 22_215
+    internal, evidence = runtime._task_metadata("ghanas_indigenous_intel")
+    assert internal == "ghanas_indigenous_intel-ecbbda50d44e"
+    assert evidence["expected"] == {
+        "task_id": 4_482_953_497,
+        "problem_type": "multiclass",
+        "metric": "log_loss",
+    }
+    assert evidence["task"]["split_index"] == 0
+
+
+def test_tabarena_native_lite_uses_real_fractional_counts_and_none_dimensions() -> None:
+    module = _runner_module("pair_shard_runner_tabarena_native_fractional")
+    fixture, rows = _tabarena_native_fixture_rows()
+    assert fixture["source_commit"] == TABARENA_SHA
+    assert fixture["source_metadata_sha256"] == (
+        "02f35e19dead7e3795f65e91eb00fdb7fa255896ed6bde0f29b2ce0af7a46296"
+    )
+    records = module._native_lite_metadata(
+        _FixtureArena(rows),
+        names=("Bank_Customer_Churn",),
+        suite_id="tabarena-v0.1",
+    )
+    assert records["Bank_Customer_Churn"] == {
+        "dataset_name": "Bank_Customer_Churn",
+        "benchmark_dataset_id": "Bank_Customer_Churn",
+        "task_id": 363_619,
+        "problem_type": "binary",
+        "metric": "roc_auc",
+        "num_instances": 10_000,
+        "num_cols_after_preprocessing": 10,
+        "num_instances_train": 6_666.666666666667,
+        "num_instances_test": 3_333.333333333333,
+        "split_regime": "iid",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("wrong_split", "not exact r0f0"),
+        ("duplicate", "not one-to-one"),
+        ("fractional_train", "num_instances_train is invalid"),
+        ("missing_dimensions", "num_cols_after_preprocessing is not"),
+    ],
+)
+def test_native_lite_metadata_corruption_fails_closed(
+    mutation: str, message: str
+) -> None:
+    module = _runner_module(f"pair_shard_runner_native_corruption_{mutation}")
+    _, source_rows = _native_fixture_rows()
+    rows = [dict(row) for row in source_rows]
+    if mutation == "wrong_split":
+        rows[0]["split_index"] = "r0f1"
+        rows[0]["fold"] = 1
+    elif mutation == "duplicate":
+        duplicate = dict(rows[0])
+        duplicate["tabarena_task_name"] += "-duplicate"
+        duplicate["task_id_str"] = duplicate["task_id_str"].replace(
+            "6293333622", "6293333623"
+        )
+        rows.append(duplicate)
+    elif mutation == "fractional_train":
+        rows[0]["num_instances_train"] = 1_000_349.5
+    elif mutation == "missing_dimensions":
+        rows[0]["num_cols_after_preprocessing"] = None
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(mutation)
+    names = tuple(dict.fromkeys(row["dataset_name"] for row in rows))
+    with pytest.raises(ValueError, match=message):
+        module._native_lite_metadata(
+            _FixtureArena(rows), names=names, suite_id="beyondarena"
+        )
 
 
 def test_pair_manifest_is_exactly_two_arms_and_content_verified(tmp_path: Path) -> None:
@@ -674,6 +929,20 @@ def test_cost_plan_tampering_and_canary_misclassification_fail_closed(
 ) -> None:
     roster = _roster(tmp_path)
     plan, records = _plan(tmp_path, roster)
+    fractional_counts = {name: dict(record) for name, record in records.items()}
+    fractional_counts["dataset-a"]["num_instances_train"] += 0.75
+    fractional_counts["dataset-a"]["num_instances_test"] += 0.75
+    with pytest.raises(ValueError, match="must be integral"):
+        validate_plan_metadata(plan, roster=roster, records=fractional_counts)
+    tabarena_roster = replace(roster, suite_id="tabarena-v0.1")
+    assert validate_plan_metadata(
+        plan, roster=tabarena_roster, records=fractional_counts
+    )["assignment_sha256"] == plan.assignment_sha256
+    fractional_total = {name: dict(record) for name, record in records.items()}
+    fractional_total["dataset-a"]["num_instances"] += 0.5
+    with pytest.raises(ValueError, match="must be integral"):
+        validate_plan_metadata(plan, roster=roster, records=fractional_total)
+
     payload = json.loads(plan.path.read_text(encoding="utf-8"))
     payload["shards"][0]["names"], payload["shards"][1]["names"] = (
         payload["shards"][1]["names"],

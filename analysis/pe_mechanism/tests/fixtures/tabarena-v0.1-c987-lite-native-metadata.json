@@ -1,0 +1,26 @@
+{
+  "kind": "pinned_tabarena_native_metadata_fixture",
+  "schema_version": 1,
+  "source_commit": "c987d91556a14d4c9b3383c35d1b0ec68ff81883",
+  "source_metadata_sha256": "02f35e19dead7e3795f65e91eb00fdb7fa255896ed6bde0f29b2ce0af7a46296",
+  "source_schema": "TabArenaTaskMetadata.to_dataframe one-row-per-split",
+  "rows": [
+    {
+      "dataset_name": "Bank_Customer_Churn",
+      "tabarena_task_name": "Bank_Customer_Churn",
+      "task_id_str": 363619,
+      "problem_type": "binary",
+      "eval_metric": "roc_auc",
+      "num_instances": 10000.0,
+      "num_features": 10,
+      "num_cols_after_preprocessing": null,
+      "num_text_cols": null,
+      "task_type": "random",
+      "repeat": 0,
+      "fold": 0,
+      "split_index": "r0f0",
+      "num_instances_train": 6666.666666666667,
+      "num_instances_test": 3333.333333333333
+    }
+  ]
+}
