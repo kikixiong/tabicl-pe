@@ -123,6 +123,19 @@ def test_dataset_metadata_rejects_text_tasks() -> None:
         MODULE._select_dataset_metadata(metadata, ("iid",))
 
 
+def test_grouped_categorical_target_is_normalized_without_changing_labels() -> None:
+    target = pd.Series(pd.Categorical([1, 0, 1], categories=[0, 1]), name="status")
+    normalized = MODULE._normalize_classification_target(target)
+    assert normalized.dtype == "int64"
+    assert normalized.tolist() == [1, 0, 1]
+    assert normalized.index.equals(target.index)
+
+
+def test_target_normalization_rejects_multilabel_shape() -> None:
+    with pytest.raises(ValueError, match="one-dimensional"):
+        MODULE._normalize_classification_target([[0, 1], [1, 0]])
+
+
 def test_checkpoint_contract_accepts_matched_fullsize_pair(tmp_path: Path) -> None:
     rope = tmp_path / "rope.ckpt"
     fingerprint = tmp_path / "fingerprint.ckpt"

@@ -206,6 +206,49 @@ def _mean_ranks_by_regime(
     }
 
 
+def _normalize_classification_target(y: Any) -> Any:
+    """Return a one-dimensional scalar Series for sklearn-compatible targets.
+
+    Data Foundry grouped tasks may retain a pandas categorical/extension dtype
+    after the group-aware split.  Converting through Python scalars preserves
+    the labels while avoiding sklearn's ``unknown`` target classification.
+    """
+    import numpy as np
+    import pandas as pd
+    from sklearn.utils.multiclass import type_of_target
+
+    values = np.asarray(y)
+    if values.ndim == 2 and values.shape[1] == 1:
+        values = values[:, 0]
+    if values.ndim != 1:
+        raise ValueError("BeyondArena classification target must be one-dimensional")
+    index = getattr(y, "index", None)
+    if index is not None and len(index) != len(values):
+        raise ValueError("BeyondArena classification target index has the wrong length")
+    normalized = pd.Series(
+        values.tolist(),
+        index=index,
+        name=getattr(y, "name", None),
+    )
+    if type_of_target(normalized) not in {"binary", "multiclass"}:
+        raise ValueError("BeyondArena classification target is not discrete")
+    return normalized
+
+
+def _make_beyond_system_model(external_system_model: type, base_factory: Any) -> type:
+    base = base_factory(external_system_model)
+
+    class BeyondFixedTabICLSystem(base):
+        def _fit_system(self, X: Any, y: Any, **kwargs: Any) -> Any:
+            return super()._fit_system(
+                X,
+                _normalize_classification_target(y),
+                **kwargs,
+            )
+
+    return BeyondFixedTabICLSystem
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--analysis-root", required=True)
@@ -287,7 +330,9 @@ def main() -> int:
     )
     roster, expected_tasks = _select_dataset_metadata(arena.task_metadata, requested)
 
-    model_cls = _make_system_model(runtime["ExternalSystemModel"])
+    model_cls = _make_beyond_system_model(
+        runtime["ExternalSystemModel"], _make_system_model
+    )
     names = {
         "rope": f"TabICL_Fullsize_RoPE_Step{args.comparison_step}",
         "fingerprint": f"TabICL_Fullsize_Fingerprint_Step{args.comparison_step}",
