@@ -86,6 +86,16 @@ output directory. Schedule the GPU run with
 [`scripts/slurm_fingerprint_beyondarena_exploratory.sh`](scripts/slurm_fingerprint_beyondarena_exploratory.sh)
 and provide scheduler stdout/stderr paths externally.
 
+The legacy seed-42 Stage-1 comparison uses the separate fail-closed
+[`scripts/run_matched_beyondarena_exploratory.py`](scripts/run_matched_beyondarena_exploratory.py)
+runner and
+[`scripts/slurm_matched_beyondarena_exploratory.sh`](scripts/slurm_matched_beyondarena_exploratory.sh).
+It accepts only the frozen 250k No-RoPE/RoPE snapshot manifest and can add the
+released checkpoint as a reference. The snapshot proves equal step, seed
+label, configuration, source commit, and checkpoint schema; it does not prove
+an identical synthetic-batch trajectory because these legacy checkpoints do
+not contain prior/DataLoader/RNG stream state. Keep this result exploratory.
+
 `--output-dir` is always required. It must be an absolute path outside the Git
 source tree. Checkpoints, activations, predictions, logs, caches, and generated
 test data must stay outside this repository.
