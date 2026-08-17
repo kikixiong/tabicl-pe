@@ -14,6 +14,7 @@ import sys
 import time
 from typing import Any, Mapping, Sequence
 
+from pe_mechanism.python_environment import build_python_environment_contract
 from pe_mechanism.talent_full_suite import (
     OPERATION_JOURNAL_KIND,
     PLAN_KIND,
@@ -25,6 +26,7 @@ from pe_mechanism.talent_full_suite import (
     canonical_json_sha256,
     canary_dataset_records,
     frozen_discovery_roster,
+    json_document_sha256,
     load_json_object_with_sha256,
     load_private_run_config,
     require_disjoint_output,
@@ -118,6 +120,9 @@ def _command_plan(
     output_root: Path,
     scratch_root: Path,
     python: Path,
+    python_contract: Path,
+    python_contract_document_sha256: str,
+    python_contract_file_sha256: str,
     analysis_sha: str,
     model_sha: str,
     run_config_sha256: str,
@@ -137,6 +142,13 @@ def _command_plan(
         "PE_TALENT_RUN_CONFIG": str(run_config),
         "PE_TALENT_SHARD_PLAN": str(shard_plan),
         "PE_TALENT_PYTHON": str(python),
+        "PE_TALENT_PYTHON_CONTRACT": str(python_contract),
+        "PE_TALENT_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256": (
+            python_contract_document_sha256
+        ),
+        "PE_TALENT_EXPECTED_PYTHON_CONTRACT_FILE_SHA256": (
+            python_contract_file_sha256
+        ),
         "PE_TALENT_EXPECTED_ANALYSIS_SHA": analysis_sha,
         "PE_TALENT_EXPECTED_MODEL_SHA": model_sha,
         "PE_TALENT_EXPECTED_RUN_CONFIG_SHA256": run_config_sha256,
@@ -160,6 +172,13 @@ def _command_plan(
         "PE_TALENT_SHARD_PLAN": str(shard_plan),
         "PE_TALENT_OUTPUT_ROOT": str(output_root),
         "PE_TALENT_PYTHON": str(python),
+        "PE_TALENT_PYTHON_CONTRACT": str(python_contract),
+        "PE_TALENT_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256": (
+            python_contract_document_sha256
+        ),
+        "PE_TALENT_EXPECTED_PYTHON_CONTRACT_FILE_SHA256": (
+            python_contract_file_sha256
+        ),
         "PE_TALENT_EXPECTED_ANALYSIS_SHA": analysis_sha,
         "PE_TALENT_EXPECTED_RUN_CONFIG_SHA256": run_config_sha256,
         "PE_TALENT_EXPECTED_SHARD_PLAN_SHA256": shard_plan_sha256,
@@ -402,6 +421,10 @@ def _verify_inputs_unchanged(
     config: Mapping[str, Any],
     plan_path: Path,
     plan_file_sha: str,
+    python_entry: Path,
+    python_contract_path: Path,
+    python_contract: Mapping[str, Any],
+    python_contract_file_sha256: str,
 ) -> None:
     verify_clean_detached_git(analysis_root, expected_sha=analysis_sha)
     verify_clean_detached_git(model_root, expected_sha=model_sha)
@@ -409,6 +432,11 @@ def _verify_inputs_unchanged(
         raise RuntimeError("run config changed after validation")
     if sha256_file(plan_path) != plan_file_sha:
         raise RuntimeError("shard plan changed after validation")
+    if (
+        sha256_file(python_contract_path) != python_contract_file_sha256
+        or build_python_environment_contract(python_entry) != python_contract
+    ):
+        raise RuntimeError("Python venv entry environment changed after validation")
     for pair in config["pairs"]:
         for arm in pair["arms"]:
             if sha256_file(arm["checkpoint"]) != arm["checkpoint_sha256"]:
@@ -430,9 +458,9 @@ def _run(args: argparse.Namespace) -> int:
     capacity_root = absolute_path(
         args.capacity_root, name="capacity_root", directory=True
     )
-    python = absolute_path(args.python, name="python")
-    if not os.access(python, os.X_OK):
-        raise ValueError("python must be executable")
+    python = Path(args.python)
+    python_contract = build_python_environment_contract(python)
+    python_contract_file_sha256 = json_document_sha256(python_contract)
     analysis_sha = verify_clean_detached_git(
         analysis_root, expected_sha=args.expected_analysis_sha
     )
@@ -462,6 +490,9 @@ def _run(args: argparse.Namespace) -> int:
     output_root = output_value.parent.resolve(strict=True) / output_value.name
     if output_root.exists() or output_root.is_symlink():
         raise ValueError("fresh TALENT output_root must be absent")
+    python_contract_path = (
+        output_root / ".private-operations/python-environment-contract.json"
+    )
     protected = [
         analysis_root,
         model_root,
@@ -513,6 +544,9 @@ def _run(args: argparse.Namespace) -> int:
         output_root=output_root,
         scratch_root=scratch_root,
         python=python,
+        python_contract=python_contract_path,
+        python_contract_document_sha256=python_contract["sha256"],
+        python_contract_file_sha256=python_contract_file_sha256,
         analysis_sha=analysis_sha,
         model_sha=model_sha,
         run_config_sha256=config["config_sha256"],
@@ -540,6 +574,9 @@ def _run(args: argparse.Namespace) -> int:
         (output_root / name).mkdir()
     private_operations = output_root / ".private-operations"
     private_operations.mkdir(mode=0o700)
+    atomic_json(python_contract_path, python_contract)
+    if sha256_file(python_contract_path) != python_contract_file_sha256:
+        raise RuntimeError("Python environment contract file serialization changed")
     if min(
         _available_bytes(output_root),
         _available_bytes(capacity_root),
@@ -563,6 +600,9 @@ def _run(args: argparse.Namespace) -> int:
             output_root=output_root,
             scratch_root=scratch_root,
             python=python,
+            python_contract=python_contract_path,
+            python_contract_document_sha256=python_contract["sha256"],
+            python_contract_file_sha256=python_contract_file_sha256,
             analysis_sha=analysis_sha,
             model_sha=model_sha,
             run_config_sha256=config["config_sha256"],
@@ -583,6 +623,9 @@ def _run(args: argparse.Namespace) -> int:
             output_root=output_root,
             scratch_root=scratch_root,
             python=python,
+            python_contract=python_contract_path,
+            python_contract_document_sha256=python_contract["sha256"],
+            python_contract_file_sha256=python_contract_file_sha256,
             analysis_sha=analysis_sha,
             model_sha=model_sha,
             run_config_sha256=config["config_sha256"],
@@ -602,6 +645,10 @@ def _run(args: argparse.Namespace) -> int:
             config=config,
             plan_path=plan_path,
             plan_file_sha=plan_file_sha,
+            python_entry=python,
+            python_contract_path=python_contract_path,
+            python_contract=python_contract,
+            python_contract_file_sha256=python_contract_file_sha256,
         )
         if min(
             _available_bytes(output_root),
@@ -623,6 +670,10 @@ def _run(args: argparse.Namespace) -> int:
             "canary_dataset_ordinals": [record["ordinal"] for record in canary],
             "shard_count": 8,
             "capacity": capacity_contract,
+            "python_environment_contract_document_sha256": python_contract["sha256"],
+            "python_environment_contract_file_sha256": (
+                python_contract_file_sha256
+            ),
             "job_roles": {
                 "canary": {"submission_state": "held"},
                 "full_array": {"dependency": "afterok:canary"},

@@ -97,6 +97,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-csv", action="append", required=True)
     parser.add_argument("--expected-run-config-sha256", required=False)
     parser.add_argument("--expected-shard-plan-sha256", required=False)
+    parser.add_argument("--expected-python-contract-document-sha256", required=True)
+    parser.add_argument("--expected-python-contract-file-sha256", required=True)
     parser.add_argument("--output-dir", required=True)
     return parser
 
@@ -225,6 +227,8 @@ def _validate_campaign_receipts(
         "canary_dataset_ordinals",
         "shard_count",
         "capacity",
+        "python_environment_contract_document_sha256",
+        "python_environment_contract_file_sha256",
         "job_roles",
         "command_plan_sha256_by_role",
         "operation_journal_sha256_at_submission",
@@ -248,6 +252,12 @@ def _validate_campaign_receipts(
         or submission.get("shard_plan_document_sha256") != plan_document_sha256
         or submission.get("canary_dataset_ordinals") != list(canary_ordinals)
         or submission.get("shard_count") != 8
+        or not _is_hex(
+            submission.get("python_environment_contract_document_sha256"), 64
+        )
+        or not _is_hex(
+            submission.get("python_environment_contract_file_sha256"), 64
+        )
         or not isinstance(capacity, Mapping)
         or set(capacity)
         != {
@@ -355,6 +365,12 @@ def _validate_campaign_receipts(
         "submission_receipt_document_sha256": submission_document["sha256"],
         "release_receipt_file_sha256": release_file_sha256,
         "release_receipt_document_sha256": release_document["sha256"],
+        "python_environment_contract_document_sha256": submission[
+            "python_environment_contract_document_sha256"
+        ],
+        "python_environment_contract_file_sha256": submission[
+            "python_environment_contract_file_sha256"
+        ],
     }
 
 
@@ -467,6 +483,7 @@ def _require_consistent_job_group(
         "common_run_contract_sha256",
         "environment_contract_sha256",
         "environment_contract",
+        "python_environment_contract",
     ):
         reference = jobs[0][field]
         if any(job[field] != reference for job in jobs[1:]):
@@ -776,6 +793,7 @@ def _validate_shard(
     plan_file_sha256: str,
     plan_document: Mapping[str, Any],
     analysis_sha: str,
+    python_environment_contract: Mapping[str, str],
     canary: bool = False,
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     validate_directory_manifest(root, kind=SHARD_KIND)
@@ -827,6 +845,14 @@ def _validate_shard(
         ),
         ("disk_offload_scratch_contract", DISK_OFFLOAD_SCRATCH_CONTRACT),
         ("environment_contract_sha256", json_document_sha256(environment)),
+        (
+            "python_environment_contract_document_sha256",
+            python_environment_contract["document_sha256"],
+        ),
+        (
+            "python_environment_contract_file_sha256",
+            python_environment_contract["file_sha256"],
+        ),
         )
     )
     expected_contract_keys = set(expected_common) | {
@@ -963,6 +989,7 @@ def _validate_shard(
         "execution_scope": job_contract["execution_scope"],
         "gpu_name": environment["gpu"]["name"],
         "environment_contract": dict(environment),
+        "python_environment_contract": dict(python_environment_contract),
         "monitor_window": {
             "started_at_unix_seconds": completed_attempt[
                 "started_at_unix_seconds"
@@ -1315,6 +1342,12 @@ def _combine(
 
 
 def _run(args: argparse.Namespace) -> int:
+    python_environment_contract = {
+        "document_sha256": args.expected_python_contract_document_sha256,
+        "file_sha256": args.expected_python_contract_file_sha256,
+    }
+    if any(not _is_hex(value, 64) for value in python_environment_contract.values()):
+        raise ValueError("Python environment contract digests are malformed")
     analysis_root = absolute_path(
         args.analysis_root, name="analysis_root", directory=True
     )
@@ -1370,6 +1403,7 @@ def _run(args: argparse.Namespace) -> int:
             plan_file_sha256=plan_file_sha256,
             plan_document=plan_document,
             analysis_sha=analysis_sha,
+            python_environment_contract=python_environment_contract,
         )
         key = (digest, shard_id)
         if key in observed_shards:
@@ -1401,6 +1435,7 @@ def _run(args: argparse.Namespace) -> int:
             plan_file_sha256=plan_file_sha256,
             plan_document=plan_document,
             analysis_sha=analysis_sha,
+            python_environment_contract=python_environment_contract,
             canary=True,
         )
         if shard_id != "canary":
@@ -1487,6 +1522,16 @@ def _run(args: argparse.Namespace) -> int:
         receipt_paths_by_config[digest] = (submission_path, release_path)
     if set(receipt_evidence) != set(config_by_digest):
         raise ValueError("campaign receipt union is not exact")
+    for digest, campaign in receipt_evidence.items():
+        if {
+            "document_sha256": campaign[
+                "python_environment_contract_document_sha256"
+            ],
+            "file_sha256": campaign["python_environment_contract_file_sha256"],
+        } != python_environment_contract:
+            raise ValueError(
+                f"campaign {digest} Python environment binding differs from jobs"
+            )
     aggregate = _combine(
         configs=configs,
         by_config=by_config,

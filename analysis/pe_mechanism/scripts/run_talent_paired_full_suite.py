@@ -71,6 +71,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-model-sha", required=True)
     parser.add_argument("--expected-run-config-sha256", required=True)
     parser.add_argument("--expected-shard-plan-sha256", required=True)
+    parser.add_argument("--expected-python-contract-document-sha256", required=True)
+    parser.add_argument("--expected-python-contract-file-sha256", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--scratch-root", required=True)
     return parser
@@ -988,6 +990,22 @@ def _assert_complete_work_tree(work: Path, *, expected_ordinals: set[int]) -> No
 
 
 def _run(args: argparse.Namespace) -> int:
+    python_environment_contract = {
+        "python_environment_contract_document_sha256": (
+            args.expected_python_contract_document_sha256
+        ),
+        "python_environment_contract_file_sha256": (
+            args.expected_python_contract_file_sha256
+        ),
+    }
+    if any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in python_environment_contract.values()
+    ):
+        raise ValueError("Python environment contract digests are malformed")
     analysis_root = absolute_path(
         args.analysis_root, name="analysis_root", directory=True
     )
@@ -1082,6 +1100,7 @@ def _run(args: argparse.Namespace) -> int:
         },
         "disk_offload_scratch_contract": dict(DISK_OFFLOAD_SCRATCH_CONTRACT),
         "environment_contract_sha256": json_document_sha256(environment),
+        **python_environment_contract,
     }
     job_contract = {
         "shard_id": args.shard_id,

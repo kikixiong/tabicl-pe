@@ -630,6 +630,9 @@ def test_submit_plan_is_canary_then_array_then_cpu_aggregate(tmp_path: Path):
         output_root=tmp_path / "output",
         scratch_root=tmp_path / "scratch",
         python=tmp_path / "python",
+        python_contract=tmp_path / "python-contract.json",
+        python_contract_document_sha256="8" * 64,
+        python_contract_file_sha256="9" * 64,
         analysis_sha="a" * 40,
         model_sha="b" * 40,
         run_config_sha256="c" * 64,
@@ -702,6 +705,8 @@ def test_campaign_receipts_are_strict_bound_and_public_safe(tmp_path: Path):
                 "scratch": "ok_at_or_above_22_gib",
             },
         },
+        "python_environment_contract_document_sha256": "3" * 64,
+        "python_environment_contract_file_sha256": "4" * 64,
         "job_roles": {
             "canary": {"submission_state": "held"},
             "full_array": {"dependency": "afterok:canary"},
@@ -747,6 +752,8 @@ def test_campaign_receipts_are_strict_bound_and_public_safe(tmp_path: Path):
         "submission_receipt_document_sha256",
         "release_receipt_file_sha256",
         "release_receipt_document_sha256",
+        "python_environment_contract_document_sha256",
+        "python_environment_contract_file_sha256",
     }
     bad_release = self_hashed_document(
         SUBMITTER.RELEASE_KIND,
@@ -786,6 +793,10 @@ def test_gpu_csv_and_cross_job_common_contract_gates(tmp_path: Path):
         "common_run_contract_sha256": "d" * 64,
         "environment_contract_sha256": "e" * 64,
         "environment_contract": {"safe": True},
+        "python_environment_contract": {
+            "document_sha256": "f" * 64,
+            "file_sha256": "1" * 64,
+        },
     }
     jobs = [dict(common), dict(common)]
     AGGREGATOR._require_consistent_job_group("pair", jobs)

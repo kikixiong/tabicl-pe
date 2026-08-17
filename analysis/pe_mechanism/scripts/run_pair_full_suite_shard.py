@@ -634,6 +634,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--expected-analysis-sha", required=True)
     parser.add_argument("--expected-tabarena-sha", required=True)
+    parser.add_argument("--expected-python-contract-document-sha256", required=True)
+    parser.add_argument("--expected-python-contract-file-sha256", required=True)
     parser.add_argument(
         "--expected-suite", required=True, choices=("beyondarena", "tabarena-v0.1")
     )
@@ -644,6 +646,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
+    python_environment_contract = {
+        "document_sha256": args.expected_python_contract_document_sha256,
+        "file_sha256": args.expected_python_contract_file_sha256,
+    }
+    if any(
+        len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in python_environment_contract.values()
+    ):
+        raise ValueError("Python environment contract digests are malformed")
     analysis_root = _absolute_directory(args.analysis_root, label="analysis_root")
     model_root = _absolute_directory(args.model_root, label="model_root")
     tabarena_root = _absolute_directory(args.tabarena_root, label="tabarena_root")
@@ -747,6 +760,7 @@ def main() -> int:
                 provenance=provenance,
                 executor=executor,
                 runtime_environment=environment,
+                python_environment_contract=python_environment_contract,
             )
         else:
             if args.shard_index is None:
@@ -760,6 +774,7 @@ def main() -> int:
                 shard_index=args.shard_index,
                 executor=executor,
                 runtime_environment=environment,
+                python_environment_contract=python_environment_contract,
             )
         _verify_bound_inputs(original_pair, roster, plan)
         _verify_bound_inputs(pair, roster, plan)

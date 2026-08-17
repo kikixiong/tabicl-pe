@@ -14,9 +14,11 @@ set -euo pipefail
 required=(
   PE_PAIR_ANALYSIS_ROOT PE_PAIR_MODEL_ROOT PE_PAIR_TABARENA_ROOT
   PE_PAIR_CACHE_ROOT PE_PAIR_MANIFEST PE_PAIR_ROSTER PE_PAIR_SHARD_PLAN
-  PE_PAIR_RUN_ROOT PE_PAIR_PYTHON PE_PAIR_EXPECTED_ANALYSIS_SHA
+  PE_PAIR_RUN_ROOT PE_PAIR_PYTHON PE_PAIR_PYTHON_CONTRACT PE_PAIR_EXPECTED_ANALYSIS_SHA
   PE_PAIR_EXPECTED_TABARENA_SHA PE_PAIR_EXPECTED_MANIFEST_SHA256
   PE_PAIR_EXPECTED_ROSTER_SHA256 PE_PAIR_EXPECTED_SHARD_PLAN_SHA256
+  PE_PAIR_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256
+  PE_PAIR_EXPECTED_PYTHON_CONTRACT_FILE_SHA256
   PE_PAIR_PHASE
 )
 for name in "${required[@]}"; do
@@ -32,7 +34,9 @@ for name in PE_PAIR_EXPECTED_ANALYSIS_SHA PE_PAIR_EXPECTED_TABARENA_SHA; do
 done
 for name in \
   PE_PAIR_EXPECTED_MANIFEST_SHA256 PE_PAIR_EXPECTED_ROSTER_SHA256 \
-  PE_PAIR_EXPECTED_SHARD_PLAN_SHA256; do
+  PE_PAIR_EXPECTED_SHARD_PLAN_SHA256 \
+  PE_PAIR_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256 \
+  PE_PAIR_EXPECTED_PYTHON_CONTRACT_FILE_SHA256; do
   value=${!name}
   [[ "$value" =~ ^[0-9a-f]{64}$ ]] || {
     printf 'error: %s must be a lowercase SHA-256 digest\n' "$name" >&2
@@ -51,6 +55,10 @@ reject_symlink_components() {
       exit 2
     }
   done
+}
+reject_parent_symlink_components() {
+  local path=$1 label=$2
+  reject_symlink_components "$(dirname -- "$path")" "$label parent"
 }
 ensure_real_directory() {
   local path=$1 label=$2
@@ -106,13 +114,14 @@ verify_sha256() {
 for name in \
   PE_PAIR_ANALYSIS_ROOT PE_PAIR_MODEL_ROOT PE_PAIR_TABARENA_ROOT \
   PE_PAIR_CACHE_ROOT PE_PAIR_MANIFEST PE_PAIR_ROSTER PE_PAIR_SHARD_PLAN \
-  PE_PAIR_RUN_ROOT PE_PAIR_PYTHON; do
+  PE_PAIR_RUN_ROOT PE_PAIR_PYTHON_CONTRACT; do
   reject_symlink_components "${!name}" "$name"
 done
+reject_parent_symlink_components "$PE_PAIR_PYTHON" PE_PAIR_PYTHON
 for name in \
   PE_PAIR_ANALYSIS_ROOT PE_PAIR_MODEL_ROOT PE_PAIR_TABARENA_ROOT \
   PE_PAIR_CACHE_ROOT PE_PAIR_MANIFEST PE_PAIR_ROSTER PE_PAIR_SHARD_PLAN \
-  PE_PAIR_RUN_ROOT PE_PAIR_PYTHON; do
+  PE_PAIR_RUN_ROOT PE_PAIR_PYTHON PE_PAIR_PYTHON_CONTRACT; do
   value=${!name}
   [[ "$value" == /* ]] || {
     printf 'error: %s must be absolute\n' "$name" >&2
@@ -143,14 +152,16 @@ case "$PE_PAIR_PHASE" in
     exit 2
     ;;
 esac
-for file in "$PE_PAIR_MANIFEST" "$PE_PAIR_ROSTER" "$PE_PAIR_SHARD_PLAN"; do
+for file in \
+  "$PE_PAIR_MANIFEST" "$PE_PAIR_ROSTER" "$PE_PAIR_SHARD_PLAN" \
+  "$PE_PAIR_PYTHON_CONTRACT"; do
   [[ -f "$file" && ! -L "$file" ]] || {
     printf 'error: input manifest must be a real file: %s\n' "$file" >&2
     exit 2
   }
 done
-[[ -x "$PE_PAIR_PYTHON" && ! -L "$PE_PAIR_PYTHON" ]] || {
-  printf 'error: PE_PAIR_PYTHON must be a real executable\n' >&2
+[[ -x "$PE_PAIR_PYTHON" && -L "$PE_PAIR_PYTHON" ]] || {
+  printf 'error: PE_PAIR_PYTHON must be a venv symlink entry\n' >&2
   exit 2
 }
 
@@ -169,6 +180,20 @@ verify_sha256 \
 verify_sha256 "$PE_PAIR_ROSTER" "$PE_PAIR_EXPECTED_ROSTER_SHA256" roster
 verify_sha256 \
   "$PE_PAIR_SHARD_PLAN" "$PE_PAIR_EXPECTED_SHARD_PLAN_SHA256" shard-plan
+python_verifier="$analysis_root/analysis/pe_mechanism/scripts/verify_python_environment.py"
+reject_symlink_components "$python_verifier" python-environment-verifier
+[[ -f "$python_verifier" && ! -L "$python_verifier" ]] || {
+  printf 'error: Python environment verifier must be a real file\n' >&2
+  exit 2
+}
+run_bound_python() {
+  "$PE_PAIR_PYTHON" -I -B "$python_verifier" \
+    --entry "$PE_PAIR_PYTHON" \
+    --contract "$PE_PAIR_PYTHON_CONTRACT" \
+    --expected-document-sha256 "$PE_PAIR_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256" \
+    --expected-file-sha256 "$PE_PAIR_EXPECTED_PYTHON_CONTRACT_FILE_SHA256" \
+    -- "$@"
+}
 gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader | sed -n '1p')
 [[ "$gpu_name" == "NVIDIA A10" ]] || {
   printf 'error: TabArena wrapper requires NVIDIA A10, got %s\n' "$gpu_name" >&2
@@ -221,7 +246,7 @@ cleanup_monitor() {
 }
 trap cleanup_monitor EXIT INT TERM
 
-"$PE_PAIR_PYTHON" -B \
+run_bound_python -B \
   "$analysis_root/analysis/pe_mechanism/scripts/run_pair_full_suite_shard.py" \
   --analysis-root "$analysis_root" \
   --model-root "$PE_PAIR_MODEL_ROOT" \
@@ -233,6 +258,8 @@ trap cleanup_monitor EXIT INT TERM
   --run-root "$run_root" \
   --expected-analysis-sha "$PE_PAIR_EXPECTED_ANALYSIS_SHA" \
   --expected-tabarena-sha "$PE_PAIR_EXPECTED_TABARENA_SHA" \
+  --expected-python-contract-document-sha256 "$PE_PAIR_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256" \
+  --expected-python-contract-file-sha256 "$PE_PAIR_EXPECTED_PYTHON_CONTRACT_FILE_SHA256" \
   --expected-suite tabarena-v0.1 \
   "${phase_args[@]}"
 

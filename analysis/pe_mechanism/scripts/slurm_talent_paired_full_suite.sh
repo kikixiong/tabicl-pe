@@ -18,7 +18,9 @@ required=(
   PE_TALENT_PYTHON PE_TALENT_EXPECTED_ANALYSIS_SHA
   PE_TALENT_EXPECTED_MODEL_SHA PE_TALENT_SCRATCH_ROOT
   PE_TALENT_GPU_CSV_ROOT PE_TALENT_EXPECTED_RUN_CONFIG_SHA256
-  PE_TALENT_EXPECTED_SHARD_PLAN_SHA256
+  PE_TALENT_EXPECTED_SHARD_PLAN_SHA256 PE_TALENT_PYTHON_CONTRACT
+  PE_TALENT_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256
+  PE_TALENT_EXPECTED_PYTHON_CONTRACT_FILE_SHA256
 )
 for name in "${required[@]}"; do
   [[ -n "${!name:-}" ]] || { printf 'error: missing %s\n' "$name" >&2; exit 2; }
@@ -26,7 +28,8 @@ done
 for name in \
   PE_TALENT_ANALYSIS_ROOT PE_TALENT_MODEL_ROOT PE_TALENT_DATA_ROOT \
   PE_TALENT_RUN_CONFIG PE_TALENT_SHARD_PLAN PE_TALENT_OUTPUT_ROOT \
-  PE_TALENT_PYTHON PE_TALENT_SCRATCH_ROOT PE_TALENT_GPU_CSV_ROOT; do
+  PE_TALENT_PYTHON PE_TALENT_PYTHON_CONTRACT PE_TALENT_SCRATCH_ROOT \
+  PE_TALENT_GPU_CSV_ROOT; do
   [[ "${!name}" == /* ]] || {
     printf 'error: %s must be absolute\n' "$name" >&2
     exit 2
@@ -63,6 +66,21 @@ fi
 [[ "$PE_TALENT_EXPECTED_MODEL_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
 [[ "$PE_TALENT_EXPECTED_RUN_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
 [[ "$PE_TALENT_EXPECTED_SHARD_PLAN_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
+[[ "$PE_TALENT_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
+[[ "$PE_TALENT_EXPECTED_PYTHON_CONTRACT_FILE_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
+
+reject_parent_symlink_components() {
+  local current
+  current=$(dirname -- "$1")
+  while true; do
+    [[ ! -L "$current" && -d "$current" ]] || {
+      printf 'error: Python entry parent is unsafe\n' >&2
+      exit 2
+    }
+    [[ "$current" == / ]] && break
+    current=$(dirname -- "$current")
+  done
+}
 
 for directory in \
   "$PE_TALENT_ANALYSIS_ROOT" "$PE_TALENT_MODEL_ROOT" "$PE_TALENT_DATA_ROOT" \
@@ -73,15 +91,28 @@ for directory in \
     exit 2
   }
 done
-for file in "$PE_TALENT_RUN_CONFIG" "$PE_TALENT_SHARD_PLAN"; do
+for file in \
+  "$PE_TALENT_RUN_CONFIG" "$PE_TALENT_SHARD_PLAN" \
+  "$PE_TALENT_PYTHON_CONTRACT"; do
   [[ -f "$file" && ! -L "$file" ]] || {
     printf 'error: input must be a regular non-symlink file: %s\n' "$file" >&2
     exit 2
   }
 done
-[[ -x "$PE_TALENT_PYTHON" && ! -L "$PE_TALENT_PYTHON" ]] || {
-  printf 'error: PE_TALENT_PYTHON must be a real executable\n' >&2
+reject_parent_symlink_components "$PE_TALENT_PYTHON"
+[[ -x "$PE_TALENT_PYTHON" && -L "$PE_TALENT_PYTHON" ]] || {
+  printf 'error: PE_TALENT_PYTHON must be a venv symlink entry\n' >&2
   exit 2
+}
+python_verifier="$PE_TALENT_ANALYSIS_ROOT/analysis/pe_mechanism/scripts/verify_python_environment.py"
+[[ -f "$python_verifier" && ! -L "$python_verifier" ]] || exit 2
+run_bound_python() {
+  "$PE_TALENT_PYTHON" -I -B "$python_verifier" \
+    --entry "$PE_TALENT_PYTHON" \
+    --contract "$PE_TALENT_PYTHON_CONTRACT" \
+    --expected-document-sha256 "$PE_TALENT_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256" \
+    --expected-file-sha256 "$PE_TALENT_EXPECTED_PYTHON_CONTRACT_FILE_SHA256" \
+    -- "$@"
 }
 
 gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader | sed -n '1p')
@@ -141,7 +172,7 @@ gpu_csv_partial="$gpu_csv.partial"
 ) >"$gpu_csv_partial" &
 monitor_pid=$!
 
-"$PE_TALENT_PYTHON" -B \
+run_bound_python -B \
   "$PE_TALENT_ANALYSIS_ROOT/analysis/pe_mechanism/scripts/run_talent_paired_full_suite.py" \
   --analysis-root "$PE_TALENT_ANALYSIS_ROOT" \
   --model-root "$PE_TALENT_MODEL_ROOT" \
@@ -153,6 +184,8 @@ monitor_pid=$!
   --expected-model-sha "$PE_TALENT_EXPECTED_MODEL_SHA" \
   --expected-run-config-sha256 "$PE_TALENT_EXPECTED_RUN_CONFIG_SHA256" \
   --expected-shard-plan-sha256 "$PE_TALENT_EXPECTED_SHARD_PLAN_SHA256" \
+  --expected-python-contract-document-sha256 "$PE_TALENT_EXPECTED_PYTHON_CONTRACT_DOCUMENT_SHA256" \
+  --expected-python-contract-file-sha256 "$PE_TALENT_EXPECTED_PYTHON_CONTRACT_FILE_SHA256" \
   --scratch-root "$scratch" \
   "${canary_args[@]}" \
   --output-dir "$PE_TALENT_OUTPUT_ROOT/shard-$shard_id"

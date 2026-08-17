@@ -1051,7 +1051,8 @@ def test_paired_bootstrap_is_finite_reproducible_and_directional() -> None:
 
 
 def test_runner_aggregator_and_slurm_wrapper_are_syntax_checked_and_bounded() -> None:
-    for path in (WRAPPER, CANARY_WRAPPER, A10_WRAPPER):
+    aggregate_wrapper = PACKAGE_ROOT / "scripts" / "slurm_pair_full_suite_aggregate.sh"
+    for path in (WRAPPER, CANARY_WRAPPER, A10_WRAPPER, aggregate_wrapper):
         completed = subprocess.run(
             ["bash", "-n", str(path)], capture_output=True, text=True, check=False
         )
@@ -1077,7 +1078,13 @@ def test_runner_aggregator_and_slurm_wrapper_are_syntax_checked_and_bounded() ->
     assert "sleep 30" in a10
     for source in (wrapper, canary, a10):
         assert "reject_symlink_components" in source
+        assert "reject_parent_symlink_components" in source
+        assert "verify_python_environment.py" in source
+        assert '[[ -x "$PE_PAIR_PYTHON" && -L "$PE_PAIR_PYTHON" ]]' in source
         assert "ensure_real_directory \"$monitor_root\"" in source
+    aggregate_source = aggregate_wrapper.read_text(encoding="utf-8")
+    assert "verify_python_environment.py" in aggregate_source
+    assert '[[ -x "$PE_PAIR_PYTHON" && -L "$PE_PAIR_PYTHON" ]]' in aggregate_source
     runner = RUNNER.read_text(encoding="utf-8")
     assert "dataset_names=[task.name]" in runner
     assert runner.index("self.arena.build_jobs(") < runner.index("self.arena.run_jobs(")
@@ -1144,8 +1151,12 @@ def test_submitter_holds_canary_and_git_preflight_requires_clean_detached(
         "PE_PAIR_EXPECTED_MANIFEST_SHA256",
         "PE_PAIR_EXPECTED_ROSTER_SHA256",
         "PE_PAIR_EXPECTED_SHARD_PLAN_SHA256",
+        "PE_PAIR_EXPECTED_PYTHON_CONTRACT_FILE_SHA256",
     ):
         assert name in submitter
+    assert 'required_distributions=("autogluon.tabular",)' in submitter
+    assert "python = Path(args.python)" in submitter
+    assert "python_environment_contract_document_sha256" in submitter
 
 
 def test_submitter_rollback_reports_only_scheduler_verified_terminal_jobs(

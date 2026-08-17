@@ -1176,6 +1176,7 @@ def _run_contract(
     plan: ShardPlan,
     provenance: Mapping[str, str],
     runtime_environment: Mapping[str, Any] | None = None,
+    python_environment_contract: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     if provenance.get("model_sha") != pair.model_source_sha:
         raise ValueError("model checkout does not match the pair manifest")
@@ -1186,6 +1187,22 @@ def _run_contract(
         if runtime_environment is not None
         else {"evidence_status": "not_supplied_by_external_executor"}
     )
+    python_binding = (
+        dict(python_environment_contract)
+        if python_environment_contract is not None
+        else {"evidence_status": "not_supplied_by_external_executor"}
+    )
+    if python_binding != {"evidence_status": "not_supplied_by_external_executor"} and (
+        set(python_binding)
+        != {"document_sha256", "file_sha256"}
+        or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in python_binding.values()
+        )
+    ):
+        raise ValueError("Python environment contract binding is malformed")
     return {
         "schema_version": 1,
         "kind": "two_arm_full_suite_run",
@@ -1208,6 +1225,7 @@ def _run_contract(
         "runtime_environment_sha256": hashlib.sha256(
             _canonical_json(environment)
         ).hexdigest(),
+        "python_environment_contract": python_binding,
     }
 
 
@@ -1259,6 +1277,7 @@ def initialize_run(
     plan: ShardPlan,
     provenance: Mapping[str, str],
     runtime_environment: Mapping[str, Any] | None = None,
+    python_environment_contract: Mapping[str, str] | None = None,
 ) -> Mapping[str, Any]:
     _real_directory(run_root, label="run_root", create=True)
     _real_directory(run_root / "tasks", label="tasks control directory", create=True)
@@ -1272,6 +1291,7 @@ def initialize_run(
         plan=plan,
         provenance=provenance,
         runtime_environment=runtime_environment,
+        python_environment_contract=python_environment_contract,
     )
     _atomic_publish_json(run_root / "run.json", contract)
     return contract
@@ -1303,6 +1323,9 @@ def build_task_payload(
         "checkpoint_contract": dict(run_contract["checkpoint_contract"]),
         "inference_contract_sha256": run_contract["inference_contract_sha256"],
         "runtime_environment_sha256": run_contract["runtime_environment_sha256"],
+        "python_environment_contract": dict(
+            run_contract["python_environment_contract"]
+        ),
         "code_provenance": dict(run_contract["code_provenance"]),
     }
 
@@ -1334,6 +1357,7 @@ def validate_task_payload(
             "checkpoint_contract",
             "inference_contract_sha256",
             "runtime_environment_sha256",
+            "python_environment_contract",
             "code_provenance",
         },
     )
@@ -1348,6 +1372,7 @@ def validate_task_payload(
         "checkpoint_contract",
         "inference_contract_sha256",
         "runtime_environment_sha256",
+        "python_environment_contract",
         "code_provenance",
     ):
         if value[field] != run_contract[field]:
@@ -1597,6 +1622,9 @@ def _arm_result_payload(
         "checkpoint_contract": dict(run_contract["checkpoint_contract"]),
         "inference_contract_sha256": run_contract["inference_contract_sha256"],
         "runtime_environment_sha256": run_contract["runtime_environment_sha256"],
+        "python_environment_contract": dict(
+            run_contract["python_environment_contract"]
+        ),
         "code_provenance": dict(run_contract["code_provenance"]),
     }
 
@@ -1656,6 +1684,7 @@ def _validate_task_directory(
                 "checkpoint_contract",
                 "inference_contract_sha256",
                 "runtime_environment_sha256",
+                "python_environment_contract",
                 "code_provenance",
             },
         )
@@ -1888,6 +1917,7 @@ def run_shard(
     shard_index: int,
     executor: TaskExecutor,
     runtime_environment: Mapping[str, Any] | None = None,
+    python_environment_contract: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     contract = initialize_run(
         run_root,
@@ -1896,6 +1926,7 @@ def run_shard(
         plan=plan,
         provenance=provenance,
         runtime_environment=runtime_environment,
+        python_environment_contract=python_environment_contract,
     )
     canary_marker = run_root / "canary.json"
     expected_canary = _expected_canary_marker(
@@ -2032,6 +2063,7 @@ def run_canary(
     provenance: Mapping[str, str],
     executor: TaskExecutor,
     runtime_environment: Mapping[str, Any] | None = None,
+    python_environment_contract: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     contract = initialize_run(
         run_root,
@@ -2040,6 +2072,7 @@ def run_canary(
         plan=plan,
         provenance=provenance,
         runtime_environment=runtime_environment,
+        python_environment_contract=python_environment_contract,
     )
     executed = 0
     resumed = 0
@@ -2164,6 +2197,7 @@ def aggregate_run(
         plan=plan,
         provenance=code_provenance(**contract.get("code_provenance", {})),
         runtime_environment=contract.get("runtime_environment"),
+        python_environment_contract=contract.get("python_environment_contract"),
     )
     if contract != expected_contract:
         raise ValueError("run.json differs from the supplied pair or roster")
@@ -2315,6 +2349,9 @@ def aggregate_run(
         },
         "inference": dict(pair.inference),
         "code_provenance": dict(contract["code_provenance"]),
+        "python_environment_contract": dict(
+            contract["python_environment_contract"]
+        ),
         "task_artifacts": task_artifacts,
         "datasets": [
             {

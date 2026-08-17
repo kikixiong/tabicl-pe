@@ -21,6 +21,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--roster", required=True)
     parser.add_argument("--shard-plan", required=True)
     parser.add_argument("--run-root", required=True)
+    parser.add_argument("--expected-python-contract-document-sha256", required=True)
+    parser.add_argument("--expected-python-contract-file-sha256", required=True)
     return parser
 
 
@@ -33,6 +35,12 @@ def main() -> int:
     roster = load_roster(Path(args.roster))
     plan = load_shard_plan(Path(args.shard_plan), roster=roster)
     aggregate = aggregate_run(run_root, pair=pair, roster=roster, plan=plan)
+    expected_python = {
+        "document_sha256": args.expected_python_contract_document_sha256,
+        "file_sha256": args.expected_python_contract_file_sha256,
+    }
+    if aggregate.get("python_environment_contract") != expected_python:
+        raise ValueError("aggregate Python environment contract binding differs")
     print(
         json.dumps(
             {
