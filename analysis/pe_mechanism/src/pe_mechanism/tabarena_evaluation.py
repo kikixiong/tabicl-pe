@@ -685,6 +685,12 @@ def _make_system_model(external_system_model: type) -> type:
             self.seed = seed
             self.classifier_options = dict(classifier_options)
             self.model: Any | None = None
+            self.feature_columns: tuple[Any, ...] | None = None
+
+        def _select_supported_features(self, X: Any) -> Any:
+            if self.feature_columns is None:
+                return X
+            return X.loc[:, list(self.feature_columns)]
 
         def _fit_system(
             self,
@@ -721,6 +727,18 @@ def _make_system_model(external_system_model: type) -> type:
                 n_jobs=max(1, int(num_cpus or 1)),
                 **self.classifier_options,
             )
+            if hasattr(X, "columns"):
+                from sklearn.compose import make_column_selector
+
+                categorical = make_column_selector(
+                    dtype_include=["string", "object", "category", "boolean"]
+                )(X)
+                numeric = make_column_selector(dtype_include="number")(X)
+                selected = set(categorical) | set(numeric)
+                self.feature_columns = tuple(
+                    column for column in X.columns if column in selected
+                )
+                X = self._select_supported_features(X)
             self.model.fit(X, y)
             return self
 
@@ -729,14 +747,15 @@ def _make_system_model(external_system_model: type) -> type:
                 raise RuntimeError("TabICL system is not fitted")
             import pandas as pd
 
-            return pd.Series(self.model.predict(X), index=X.index)
+            values = self.model.predict(self._select_supported_features(X))
+            return pd.Series(values, index=X.index)
 
         def _predict_proba(self, X: Any) -> Any:
             if self.model is None:
                 raise RuntimeError("TabICL system is not fitted")
             import pandas as pd
 
-            values = self.model.predict_proba(X)
+            values = self.model.predict_proba(self._select_supported_features(X))
             return pd.DataFrame(values, index=X.index, columns=self.model.classes_)
 
         def cleanup(self) -> None:

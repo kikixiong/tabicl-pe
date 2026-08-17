@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 import pickle
+import sys
+from types import ModuleType
 
 import numpy as np
 import pytest
@@ -22,6 +24,7 @@ from pe_mechanism.provenance import (
 from pe_mechanism.tabarena_evaluation import (
     EvaluationSpec,
     _load_cached_results,
+    _make_system_model,
     _normalize_results,
     _paired_comparison,
     _parse_config,
@@ -31,6 +34,79 @@ from pe_mechanism.tabarena_evaluation import (
 
 
 PACKAGE_ROOT = Path(__file__).parents[1]
+
+
+def test_system_model_uses_same_supported_columns_for_fit_and_predict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pandas as pd
+
+    seen: list[list[str]] = []
+
+    class FakeClassifier:
+        classes_ = np.array([0, 1])
+
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        def fit(self, X, y) -> None:
+            del y
+            seen.append(list(X.columns))
+
+        def predict(self, X):
+            seen.append(list(X.columns))
+            return np.zeros(len(X), dtype=int)
+
+        def predict_proba(self, X):
+            seen.append(list(X.columns))
+            return np.tile([0.75, 0.25], (len(X), 1))
+
+    class ExternalSystemModel:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+    tabicl = ModuleType("tabicl")
+    monkeypatch.setitem(sys.modules, "tabicl", tabicl)
+    monkeypatch.setattr(tabicl, "TabICLClassifier", FakeClassifier, raising=False)
+    checkpoint = tmp_path / "model.ckpt"
+    checkpoint.write_bytes(b"checkpoint")
+    system = _make_system_model(ExternalSystemModel)(
+        checkpoint=str(checkpoint),
+        arm="rope",
+        device="cuda",
+        n_estimators=1,
+        seed=42,
+        classifier_options={},
+    )
+    train = pd.DataFrame(
+        {
+            "numeric": [1.0, 2.0],
+            "category": ["a", "b"],
+            "masked_at_test": [3.0, 4.0],
+            "timestamp": pd.to_datetime(["2024-01-01", "2024-01-02"]),
+        }
+    )
+    test = train.copy()
+    test["masked_at_test"] = np.nan
+    system._fit_system(
+        train,
+        np.array([0, 1]),
+        target_name="target",
+        problem_type="binary",
+        eval_metric=None,
+        validation_metadata=None,
+        num_cpus=1,
+        num_gpus=1,
+        memory_limit=None,
+        time_limit=None,
+        random_state=42,
+    )
+    system._predict(test)
+    probabilities = system._predict_proba(test)
+
+    expected = ["numeric", "category", "masked_at_test"]
+    assert seen == [expected, expected, expected]
+    assert probabilities.shape == (2, 2)
 
 
 def _digest(path: Path) -> str:
