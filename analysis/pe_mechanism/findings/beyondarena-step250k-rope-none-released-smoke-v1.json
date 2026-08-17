@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "finding_id": "tabicl-step250k-beyondarena-rope-none-released-smoke-v1",
+  "study": "matched-step250k-rope-none-beyondarena-exploratory",
+  "evidence_scope": "legacy_same_step_pilot_plus_released_reference_three_task_smoke",
+  "formal_claim": "forbidden",
+  "formal_eligible": false,
+  "leaderboard_replication": false,
+  "protocol": {
+    "benchmark": "BeyondArena",
+    "task_subset": "lite-explicit-roster",
+    "problem_types": [
+      "binary",
+      "multiclass"
+    ],
+    "dataset_roster": [
+      "blood_transfusion",
+      "parkinsons_biomedical_voice_measurements",
+      "ghanas_indigenous_intel"
+    ],
+    "split_regimes": [
+      "iid",
+      "grouped",
+      "temporal"
+    ],
+    "task_count": 3,
+    "result_count": 9,
+    "comparison_step": 250000,
+    "seed_label": 42,
+    "n_estimators": 1,
+    "ensemble_size": 1,
+    "augmentation": "none"
+  },
+  "match_scope": {
+    "attested": [
+      "training_step",
+      "seed_label",
+      "source_commit",
+      "architecture_and_configuration",
+      "checkpoint_state_schema"
+    ],
+    "not_attested": [
+      "identical_prior_batch_stream",
+      "identical_dataloader_state",
+      "identical_rng_trajectory"
+    ],
+    "reason": "The legacy pilot checkpoints do not contain prior, DataLoader, or RNG stream state."
+  },
+  "code_provenance": {
+    "analysis_code_sha": "0398712519b4db040cb7fdcb4459dea9051021e0",
+    "benchmark_code_sha": "c987d91556a14d4c9b3383c35d1b0ec68ff81883",
+    "model_code_sha": "2d44e7540ffd4ec6216aa0058970b1de1034aa1d",
+    "training_code_sha": "2d44e7540ffd4ec6216aa0058970b1de1034aa1d",
+    "checkpoint_pair_manifest_sha256": "14a8c5069f1b6609ac5020caf9c544d98fb276b910028203912379e47b483447",
+    "checkpoint_checksum_marker_sha256": "f55d03a728ffb1c8e20f08227db654040261accce0803d65fbd84817dfca9889"
+  },
+  "checkpoint_digests": {
+    "rope_step250000": "8dd12abadc32ae57b30a2249696efb8e9081a3ea0db2cdd9807ffb150ffb15b3",
+    "none_step250000": "5251d99bc34109d5c9923d93d48c647f70d0c82bbd51557939d586c82779fac4",
+    "released_reference": "bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0"
+  },
+  "private_evidence_digests": {
+    "run_manifest_sha256": "4d07168acb38b9bc47822cb9215c426eefbbe41ba6bda2b76430875965b04291",
+    "results_archive_sha256": "8045c7bf77b8ca6b006d91b4c11d6b6afb30b724d3b8ad5e7b68f18adbd4a4a3",
+    "runtime_summary_sha256": "546f24aaf357663da4b91e4dd1d534bc5480cbc39da6102df39a02aecad4585f",
+    "result_summary_sha256": "a4ee92112e9b81389ef1b9b7b1c91009b95b25528135e308e930954dfbf120a9"
+  },
+  "runtime": {
+    "accelerator": "NVIDIA A10",
+    "data_foundry": "0.0.6.dev20260813093617"
+  },
+  "overall_mean_rank_lower_is_better": {
+    "rope": 1.3333333333333333,
+    "none": 2.3333333333333335,
+    "released": 2.3333333333333335
+  },
+  "overall_scale_free_comparisons": [
+    {
+      "left_arm": "rope",
+      "right_arm": "none",
+      "left_wins": 3,
+      "right_wins": 0,
+      "ties": 0,
+      "two_sided_exact_sign_test_p": 0.25
+    },
+    {
+      "left_arm": "rope",
+      "right_arm": "released",
+      "left_wins": 2,
+      "right_wins": 1,
+      "ties": 0,
+      "two_sided_exact_sign_test_p": 1.0
+    },
+    {
+      "left_arm": "none",
+      "right_arm": "released",
+      "left_wins": 2,
+      "right_wins": 1,
+      "ties": 0,
+      "two_sided_exact_sign_test_p": 1.0
+    }
+  ],
+  "per_dataset_metric_error_lower_is_better": [
+    {
+      "dataset": "blood_transfusion",
+      "split_regime": "iid",
+      "metric": "roc_auc",
+      "rope": 0.21048245614035088,
+      "none": 0.21065789473684216,
+      "released": 0.21811403508771932
+    },
+    {
+      "dataset": "parkinsons_biomedical_voice_measurements",
+      "split_regime": "grouped",
+      "metric": "roc_auc",
+      "rope": 0.02444444444444449,
+      "none": 0.02777777777777779,
+      "released": 0.04555555555555557
+    },
+    {
+      "dataset": "ghanas_indigenous_intel",
+      "split_regime": "temporal",
+      "metric": "log_loss",
+      "rope": 0.17982089068197346,
+      "none": 0.18588740445818264,
+      "released": 0.14342226698565996
+    }
+  ],
+  "verdict": {
+    "rope_won_all_three_tasks_against_none": true,
+    "rope_superiority_supported": false,
+    "released_reference_dominates_both_pilots": false,
+    "reason": "RoPE had lower metric error than No-RoPE on all three smoke tasks, but the exact sign-test p-value is 0.25, the absolute margins are small, and this is not the BeyondArena core protocol. The legacy checkpoints also do not attest identical prior-batch trajectories.",
+    "relation_to_tabarena_step250000": "The earlier 38-task TabArena classification run pointed in the opposite exploratory direction: No-RoPE beat RoPE on 24 of 38 tasks with p=0.1433. The disagreement indicates benchmark-regime sensitivity and does not establish a general PE effect.",
+    "next_action": "Use a larger predeclared BeyondArena classification roster before making a regime-level claim; reserve formal conclusions for provenance-complete matched RoPE, Temporary, and No-RoPE checkpoints."
+  },
+  "statistical_note": "Metric error is lower-is-better. Cross-metric summaries use only within-dataset ranks and wins. All p-values are unadjusted exploratory summaries."
+}
