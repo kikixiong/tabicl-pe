@@ -429,6 +429,66 @@ that positional encoding is irrelevant and not a formal three-arm result. The
 pre-declared stopping rule therefore forbids expanding to the reverse direction
 or dense autoencoder merely to search for a positive result.
 
+## Paired full-suite checkpoint evaluation
+
+The full-suite runners compare exactly two trained checkpoints at a time. They
+are discovery tools: every supported run is `formal_eligible=false`, is not a
+leaderboard reproduction, and cannot be combined across training steps to
+attribute an effect to a positional treatment.
+
+The committed rosters and shard plans freeze three classification-only scopes:
+
+- BeyondArena lite uses 89 non-text datasets at repeat 0, fold 0 and split 0;
+- TabArena v0.1 uses its 38 classification datasets at the same lite split;
+- TALENT uses the 109-dataset discovery roster with full train fitting and full
+  validation evaluation. The protected validation and held-out rosters are not
+  accepted by this runner.
+
+BeyondArena first executes a content-bound canary covering the largest row
+count, largest post-preprocessing column count, the maximum LPT cost, and the
+grouped and temporal split regimes. A successful canary releases the frozen
+eight-way cost-balanced shard plan. TALENT similarly runs its two largest
+discovery datasets and `madeline` before its eight production shards. An
+aggregate is published only after the exact roster union is present once,
+every shard marker matches current bytes, and all checkpoint, split, source,
+runtime and prediction contracts still agree.
+
+Each dataset is one atomic paired transaction. Every arm has a private
+`predictions.npz`, `result.json`, and `manifest.json`; a successful arm is
+never published alone. The prediction archive stores enough target, class and
+content evidence to revalidate probability shape, finiteness, row alignment
+and metrics. OOM recovery discards the complete in-progress pair and retries
+both arms under the frozen fallback order. Other exceptions do not authorize a
+fallback. Raw predictions, logs, telemetry, scheduler receipts, checkpoints
+and machine paths remain outside the source tree.
+
+The pair submitters are dry-run by default. They validate a clean detached
+analysis checkout, the exact model and benchmark source revisions, immutable
+checkpoint and lineage bytes, the 20/22 GiB capacity gates, and disjoint output
+locations before creating a held canary, dependent eight-way array and
+dependent aggregate. The canary is released only after the full submission
+receipt is durable. A failed submission may cancel only jobs created by that
+invocation.
+
+The relevant entry points are:
+
+```text
+scripts/submit_pair_full_suite.py
+scripts/run_pair_full_suite_shard.py
+scripts/aggregate_pair_full_suite.py
+scripts/submit_talent_paired_full_suite.py
+scripts/plan_talent_paired_full_suite.py
+scripts/run_talent_paired_full_suite.py
+scripts/aggregate_talent_paired_full_suite.py
+```
+
+Private pair manifests, data roots, caches, output roots and checkpoint paths
+must use verified absolute paths outside this checkout. Use one exact model
+source per pair: the step-250000 RoPE/No-PE pair, the step-50000
+RoPE/Fingerprint pair and a future step-500000 RoPE/No-PE pair are separate
+campaigns. Their aggregates may be displayed as a learning curve, but only
+same-step paired comparisons support a treatment contrast.
+
 ## Development tests
 
 Keep the environment, bytecode, and test caches outside the source tree. One

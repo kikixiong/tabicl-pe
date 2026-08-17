@@ -1,8 +1,32 @@
 # PE mechanism analysis handoff
 
-**As of:** 2026-08-10 (`Europe/London`)
+**As of:** 2026-08-17 (`Europe/London`)
 
 ## Stable contract
+
+### Active full-suite execution order
+
+The current operational branch is `codex/beyondarena-eval-v1`.  Freeze and
+push one immutable evaluation commit before submitting anything.  Then run,
+strictly in order: all 89 BeyondArena tasks for the step-250000 RoPE/No-PE
+pair; all 89 for the step-50000 RoPE/Fingerprint pair; and all 109 TALENT
+discovery tasks for both pairs.  This first phase has 792 required
+dataset/arm results.  A missing frozen task blocks the campaign rather than
+being silently excluded.
+
+Only after that first phase passes may the legacy RoPE Stage 1 continuation
+and No-PE Stage 2 continuation be submitted.  When the matched step-500000
+snapshots exist and validate, run the RoPE/No-PE pair on TabArena (38),
+BeyondArena (89), and TALENT discovery (109), for 472 more dataset/arm results,
+while the healthy Stage 2 jobs continue independently.  Never compare the
+step-50000 and step-250000 pairs as though checkpoint age were a PE treatment.
+
+All outputs from this campaign are exploratory and `formal_eligible=false`.
+Keep checkpoints, predictions, logs, scheduler identifiers, accelerator
+telemetry, and cluster paths private.  Push only code, frozen contracts,
+portable provenance, aggregate statistics, and sanitized findings.  Do not
+touch TALENT validation/held-out datasets, regression/text tasks, or released
+weights in this campaign.
 
 This workstream is a descendant of the immutable formal training candidate at
 `23f476d20c3fda898b547a19d0918bb0d72438b4`. It must not modify or weaken the

@@ -1,8 +1,35 @@
 # PE mechanism analysis status
 
-**As of:** 2026-08-10 (`Europe/London`)
+**As of:** 2026-08-17 (`Europe/London`)
 
 ## Current phase
+
+### Full-suite exploratory checkpoint campaign
+
+A new descendant evaluation workstream is being frozen on
+`codex/beyondarena-eval-v1`.  It does not change the training protocol or turn
+legacy checkpoints into formal evidence.  Its fixed comparisons are:
+
+- step-250000 Stable RoPE versus step-250000 No-PE;
+- step-50000 Stable RoPE versus step-50000 Fingerprint;
+- after both legacy continuations reach step 500000, Stable RoPE versus No-PE
+  at that same step.
+
+The frozen benchmark scopes are TabArena v0.1's 38 classification tasks,
+BeyondArena's 89 supported non-text classification tasks under `lite/r0f0`,
+and TALENT's 109 discovery classification datasets.  Regression and text
+tasks, released weights, and TALENT validation/held-out datasets are outside
+this campaign.  Different-step observations are learning-curve descriptions,
+not PE-treatment contrasts.
+
+The evaluator candidate uses same-device, same-dataset paired execution,
+atomic per-arm predictions/results/manifests, exact checkpoint and data
+lineage, deterministic cost-balanced sharding, pair-level OOM retry, and
+fail-closed aggregation.  It must be committed and pushed before any evidence
+job is submitted.  No full-suite result or continuation job exists yet.  The
+first 792 expected results must be complete before either legacy training chain
+is continued.  Later step-500000 evaluation requires 472 additional results
+across the three suites and remains exploratory.
 
 The mechanism package is being carried forward on descendant branch
 `codex/pe-mechanism-sae-v2`. Its immutable training ancestor is
