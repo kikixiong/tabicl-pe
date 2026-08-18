@@ -204,11 +204,13 @@ runtime_root="$run_root/.slurm-runtime/${SLURM_ARRAY_JOB_ID:-manual}-${PE_PAIR_P
 ensure_real_directory "$runtime_root/home" runtime-home
 ensure_real_directory "$runtime_root/cache/huggingface" runtime-huggingface
 ensure_real_directory "$runtime_root/cache/xdg" runtime-xdg
-ensure_real_directory "$runtime_root/tmp" runtime-tmp
+ensure_real_directory "$runtime_root/home/tmp" runtime-tmp
 export HOME="$runtime_root/home"
 export HF_HOME="$runtime_root/cache/huggingface"
 export XDG_CACHE_HOME="$runtime_root/cache/xdg"
-export TMPDIR="$runtime_root/tmp"
+export TMPDIR="$HOME/tmp"
+export TMP="$TMPDIR"
+export TEMP="$TMPDIR"
 export WANDB_MODE=disabled
 export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1

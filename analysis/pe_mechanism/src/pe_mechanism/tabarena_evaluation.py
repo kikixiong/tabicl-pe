@@ -847,7 +847,9 @@ def _execute_tabarena(
             ],
         )
         built = runtime["TabArenaV0pt1ExperimentBundle"](
-            models=[(generator, 0)], system_experiments=True
+            models=[(generator, 0)],
+            system_experiments=True,
+            model_artifacts_base_path=scratch_root / "model-artifacts",
         ).build_experiments()
         if len(built) != 1 or built[0].name in framework_to_arm:
             raise RuntimeError(

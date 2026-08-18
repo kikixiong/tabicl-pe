@@ -727,7 +727,11 @@ class PairTaskRuntime:
                     }
                 ],
             )
-            built = bundle_cls(models=[(generator, 0)], system_experiments=True).build_experiments()
+            built = bundle_cls(
+                models=[(generator, 0)],
+                system_experiments=True,
+                model_artifacts_base_path=tempfile.gettempdir(),
+            ).build_experiments()
             if len(built) != 1 or built[0].name in framework_to_arm:
                 raise RuntimeError("benchmark did not build one unique experiment per arm")
             built[0].experiment_cls = prediction_runner

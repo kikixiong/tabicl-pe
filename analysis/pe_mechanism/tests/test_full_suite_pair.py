@@ -1337,9 +1337,11 @@ def test_runner_aggregator_and_slurm_wrapper_are_syntax_checked_and_bounded() ->
     ):
         assert directive in wrapper
     assert "*H100*" in wrapper
+    assert "#SBATCH --mem=384G" in wrapper
     canary = CANARY_WRAPPER.read_text(encoding="utf-8")
     assert "#SBATCH --qos=medium" in canary
     assert "#SBATCH --time=24:00:00" in canary
+    assert "#SBATCH --mem=384G" in canary
     assert "PE_PAIR_EXPECTED_ANALYSIS_SHA PE_PAIR_EXPECTED_TABARENA_SHA" in canary
     assert "required_paths" in canary
     a10 = A10_WRAPPER.read_text(encoding="utf-8")
@@ -1355,6 +1357,10 @@ def test_runner_aggregator_and_slurm_wrapper_are_syntax_checked_and_bounded() ->
         assert "--exec-bound" not in source
         assert "monitor_python=" not in source
         assert "ensure_real_directory \"$monitor_root\"" in source
+        assert 'ensure_real_directory "$runtime_root/home/tmp" runtime-tmp' in source
+        assert 'export TMPDIR="$HOME/tmp"' in source
+        assert 'export TMP="$TMPDIR"' in source
+        assert 'export TEMP="$TMPDIR"' in source
         assert "printf 'STOP\\n'" in source
         assert '[[ "$monitor_complete" == COMPLETE ]]' in source
         assert 'IFS= read -r -t 45 monitor_complete' in source
@@ -1394,6 +1400,7 @@ def test_runner_aggregator_and_slurm_wrapper_are_syntax_checked_and_bounded() ->
     assert '[[ -x "$PE_PAIR_PYTHON" && -L "$PE_PAIR_PYTHON" ]]' in aggregate_source
     runner = RUNNER.read_text(encoding="utf-8")
     assert "dataset_names=[task.name]" in runner
+    assert "model_artifacts_base_path=tempfile.gettempdir()" in runner
     assert runner.index("self.arena.build_jobs(") < runner.index("self.arena.run_jobs(")
     assert AGGREGATOR.is_file()
 

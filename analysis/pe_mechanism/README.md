@@ -495,10 +495,10 @@ Keep the environment, bytecode, and test caches outside the source tree. One
 safe local setup is:
 
 ```bash
-uv venv /tmp/tabfm-pe-mechanism-test-env
-uv pip install --python /tmp/tabfm-pe-mechanism-test-env/bin/python -e './[test]'
-uv pip install --python /tmp/tabfm-pe-mechanism-test-env/bin/python -e './analysis/pe_mechanism[test]'
-PYTHONDONTWRITEBYTECODE=1 /tmp/tabfm-pe-mechanism-test-env/bin/python -m pytest -q -p no:cacheprovider analysis/pe_mechanism/tests
+uv venv ~/tmp/tabfm-pe-mechanism-test-env
+uv pip install --python ~/tmp/tabfm-pe-mechanism-test-env/bin/python -e './[test]'
+uv pip install --python ~/tmp/tabfm-pe-mechanism-test-env/bin/python -e './analysis/pe_mechanism[test]'
+PYTHONDONTWRITEBYTECODE=1 ~/tmp/tabfm-pe-mechanism-test-env/bin/python -m pytest -q -p no:cacheprovider analysis/pe_mechanism/tests
 ```
 
 The low-level array workflows can use the analysis package by itself. The
