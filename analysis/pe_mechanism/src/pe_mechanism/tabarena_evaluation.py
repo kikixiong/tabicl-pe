@@ -736,7 +736,9 @@ def _make_system_model(external_system_model: type) -> type:
                 numeric = make_column_selector(dtype_include="number")(X)
                 selected = set(categorical) | set(numeric)
                 self.feature_columns = tuple(
-                    column for column in X.columns if column in selected
+                    column
+                    for column in X.columns
+                    if column in selected and X[column].notna().any()
                 )
                 X = self._select_supported_features(X)
             self.model.fit(X, y)

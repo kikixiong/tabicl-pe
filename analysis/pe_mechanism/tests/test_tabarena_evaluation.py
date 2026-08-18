@@ -82,11 +82,13 @@ def test_system_model_uses_same_supported_columns_for_fit_and_predict(
         {
             "numeric": [1.0, 2.0],
             "category": ["a", "b"],
+            "missing_in_train": [np.nan, np.nan],
             "masked_at_test": [3.0, 4.0],
             "timestamp": pd.to_datetime(["2024-01-01", "2024-01-02"]),
         }
     )
     test = train.copy()
+    test["missing_in_train"] = [5.0, 6.0]
     test["masked_at_test"] = np.nan
     system._fit_system(
         train,
