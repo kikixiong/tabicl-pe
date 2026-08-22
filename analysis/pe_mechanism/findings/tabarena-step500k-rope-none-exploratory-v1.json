@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "finding_id": "tabicl-step500k-tabarena-rope-none-exploratory-v1",
+  "study": "tabicl-stage1-step500k-tabarena-v0.1-classification",
+  "evidence_scope": "exploratory_same_step_legacy_pilot",
+  "formal_claim": "forbidden",
+  "formal_eligible": false,
+  "leaderboard_replication": false,
+  "protocol": {
+    "benchmark": "TabArena",
+    "suite_version": "v0.1",
+    "task_subset": "lite",
+    "problem_types": [
+      "binary",
+      "multiclass"
+    ],
+    "task_count": 38,
+    "result_count": 76,
+    "comparison_step": 500000,
+    "training_stage": 1,
+    "seed": 42,
+    "n_estimators": 1,
+    "ensemble_size": 1,
+    "augmentation": "none"
+  },
+  "coverage": {
+    "classification_roster": "complete",
+    "paired_arm_results": "76_of_76",
+    "official_split": {
+      "fold": 0,
+      "repeat": 0,
+      "split_index": 0,
+      "regime": "iid"
+    }
+  },
+  "code_provenance": {
+    "analysis_code_sha": "c9ff4f202aa52efd77b16ed93637a33b73946848",
+    "benchmark_code_sha": "c987d91556a14d4c9b3383c35d1b0ec68ff81883",
+    "model_code_sha": "2a871d57792febfadbfe9282d4cac3b53367b9a2",
+    "training_code_sha": "2a871d57792febfadbfe9282d4cac3b53367b9a2",
+    "dataset_roster_sha256": "3c26133c8b986aba530624b5c7a5dee42e4b29938bc09afa04f76b6462c4adf1",
+    "checkpoint_pair_manifest_sha256": "d65bdbec371e26cedbd5d16b04405c904ce402fe031062f4804cc3876ae51b14",
+    "shared_config_sha256": "c39e04c20c732e10fe424fbe8923186d548692ca2de1bbd67d2989330de3edbb"
+  },
+  "checkpoint_digests": {
+    "rope_step500000": "154e6ca7e90c062e344d6f4644c09c130023785e328213c31f800ef353baaf33",
+    "none_step500000": "14efa93349cb7b6f7d458508012a084526d970aeb00749bbb1cebbbe38aaec87"
+  },
+  "private_evidence_digests": {
+    "run_manifest_sha256": "dfb0b9f139869fe00d72ed4ea094c1ca306d328e85ef8c5d3031b08f3f86bf0e",
+    "canary_summary_sha256": "90d4687c44e584a9f09da92386597ff0b6636ac7734b11faaf6c84f5de1d499f",
+    "aggregate_sha256": "7be91be5c1f9aea9851f8ce57d04c04365fe6fc86b3367bcad68e97dbd693ced"
+  },
+  "treatments": {
+    "rope": {
+      "row_identity_mode": "rope",
+      "row_fingerprint": false
+    },
+    "none": {
+      "row_identity_mode": "none",
+      "row_fingerprint": false
+    }
+  },
+  "overall_scale_free_comparison": {
+    "rope_wins": 19,
+    "none_wins": 19,
+    "ties": 0,
+    "mean_rank_lower_is_better": {
+      "rope": 1.5,
+      "none": 1.5
+    },
+    "two_sided_exact_sign_test_p": 1.0
+  },
+  "metric_groups": {
+    "roc_auc": {
+      "dataset_count": 30,
+      "rope_wins": 15,
+      "none_wins": 15,
+      "ties": 0,
+      "rope_error_minus_none_error": {
+        "mean": -0.00146740307219414,
+        "paired_bootstrap_95ci": [
+          -0.0055043944947217385,
+          0.0018259855297834908
+        ],
+        "paired_bootstrap_resamples": 20000,
+        "paired_bootstrap_seed": 20260817
+      },
+      "two_sided_exact_sign_test_p": 1.0
+    },
+    "log_loss": {
+      "dataset_count": 8,
+      "rope_wins": 4,
+      "none_wins": 4,
+      "ties": 0,
+      "rope_error_minus_none_error": {
+        "mean": 0.0019260351246082777,
+        "paired_bootstrap_95ci": [
+          -0.0035740992777126054,
+          0.007201167272536855
+        ],
+        "paired_bootstrap_resamples": 20000,
+        "paired_bootstrap_seed": 20260817
+      },
+      "two_sided_exact_sign_test_p": 1.0
+    }
+  },
+  "verdict": {
+    "rope_benefit_at_step500000_supported": false,
+    "none_benefit_at_step500000_supported": false,
+    "statistical_equivalence_established": false,
+    "reason": "RoPE and No-RoPE each won 19 of 38 tasks. Both metric-specific paired bootstrap intervals crossed zero, so this single-seed Stage-1 TabArena-lite run detected no advantage for either treatment. It did not predefine or test an equivalence margin.",
+    "next_action": "Complete matched Stage 2 and Stage 3 training, then repeat paired evaluation and test the pre-registered formal multi-seed RoPE, Temporary, and No-RoPE cohort."
+  },
+  "limitations": [
+    "single seed",
+    "legacy pilot lineage without exact prior-stream replay proof",
+    "Stage 1 checkpoint rather than terminal Stage 3 checkpoint",
+    "one lite inference configuration",
+    "not a leaderboard replication"
+  ],
+  "statistical_note": "Cross-metric conclusions use only within-dataset ranks and wins. Raw error differences and intervals are reported separately for ROC-AUC error and log loss. Failure to detect a difference is not evidence of equivalence without a pre-specified equivalence margin."
+}
