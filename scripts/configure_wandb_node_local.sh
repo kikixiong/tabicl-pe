@@ -3,7 +3,8 @@ set -euo pipefail
 
 : "${SLURM_JOB_ID:?SLURM_JOB_ID must be set}"
 
-LOCAL_WANDB_ROOT="${SLURM_TMPDIR:-${TMPDIR:-/tmp}}/tabicl-wandb-${SLURM_JOB_ID}"
+: "${TMPDIR:?TMPDIR must be configured when SLURM_TMPDIR is unavailable}"
+LOCAL_WANDB_ROOT="${SLURM_TMPDIR:-$TMPDIR}/tabicl-wandb-${SLURM_JOB_ID}"
 export WANDB_LOG="${WANDB_LOG:-True}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_PROJECT="${WANDB_PROJECT:-TabICLv2-Identity}"

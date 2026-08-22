@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import timeit
 import warnings
 import functools
@@ -449,7 +450,18 @@ class Trainer:
             "scheduler_state": self.scheduler.state_dict(),
             "curr_step": self.curr_step,
         }
-        torch.save(checkpoint, checkpoint_path)
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            dir=self.config.checkpoint_dir,
+            prefix=f".{name}.",
+            suffix=".tmp",
+        )
+        os.close(file_descriptor)
+        try:
+            torch.save(checkpoint, temporary_path)
+            os.replace(temporary_path, checkpoint_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
 
     def manage_checkpoint(self):
         """Manage temporary checkpoints by deleting the oldest when limit is exceeded."""

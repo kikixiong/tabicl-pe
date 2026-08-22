@@ -19,7 +19,13 @@ WANDB_DIR="${WANDB_DIR:-$ROOT/artifacts/wandb}"
 mkdir -p "$CKPT_DIR" "$WANDB_DIR"
 
 RESUME_ARGS=(--checkpoint_path "$STAGE1_CKPT" --only_load_model True)
-if compgen -G "$CKPT_DIR/step-*.ckpt" >/dev/null; then
+if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
+  [[ -f "$RESUME_CHECKPOINT" ]] || {
+    echo "resume checkpoint does not exist: $RESUME_CHECKPOINT" >&2
+    exit 1
+  }
+  RESUME_ARGS=(--checkpoint_path "$RESUME_CHECKPOINT")
+elif compgen -G "$CKPT_DIR/step-*.ckpt" >/dev/null; then
   RESUME_ARGS=()
 fi
 

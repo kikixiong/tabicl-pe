@@ -2,7 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tabicl-wandb-local.XXXXXX")"
+: "${TMPDIR:?TMPDIR must be configured}"
+TEST_ROOT="$(mktemp -d "$TMPDIR/tabicl-wandb-local.XXXXXX")"
+trap 'find "$TEST_ROOT" -depth -delete' EXIT
 
 env \
   -u SLURM_TMPDIR \
