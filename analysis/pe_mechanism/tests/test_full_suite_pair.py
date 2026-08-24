@@ -1457,7 +1457,8 @@ def test_runner_aggregator_and_slurm_wrapper_are_syntax_checked_and_bounded() ->
         assert "--exec-bound" not in source
         assert "monitor_python=" not in source
         assert "ensure_real_directory \"$monitor_root\"" in source
-        assert 'ensure_real_directory "$runtime_root/home/tmp" runtime-tmp' in source
+        assert 'ensure_real_directory "$runtime_home/tmp" runtime-tmp' in source
+        assert 'export HOME="$runtime_home"' in source
         assert 'export TMPDIR="$HOME/tmp"' in source
         assert 'export TMP="$TMPDIR"' in source
         assert 'export TEMP="$TMPDIR"' in source

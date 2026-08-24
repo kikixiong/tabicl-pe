@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import pickle
 import subprocess
+import tarfile
 from types import SimpleNamespace
 from typing import Any
 
@@ -23,6 +27,14 @@ from pe_mechanism.fingerprint_causal import (
     fingerprint_checkpoint_contract,
     load_and_validate_captures,
     make_fingerprint_causal_system,
+)
+from pe_mechanism.fingerprint_causal_verification import (
+    _safe_extract_results,
+    verify_fingerprint_causal_run,
+)
+from pe_mechanism.tabarena_evaluation import (
+    _FIXED_CLASSIFIER_OPTIONS,
+    _archive_directory,
 )
 
 
@@ -45,6 +57,13 @@ RUNNER_SPEC = importlib.util.spec_from_file_location(
 assert RUNNER_SPEC is not None and RUNNER_SPEC.loader is not None
 RUNNER_MODULE = importlib.util.module_from_spec(RUNNER_SPEC)
 RUNNER_SPEC.loader.exec_module(RUNNER_MODULE)
+VERIFIER = PACKAGE_ROOT / "scripts" / "verify_fingerprint_tabarena_causal.py"
+VERIFIER_SPEC = importlib.util.spec_from_file_location(
+    "verify_fingerprint_tabarena_causal", VERIFIER
+)
+assert VERIFIER_SPEC is not None and VERIFIER_SPEC.loader is not None
+VERIFIER_MODULE = importlib.util.module_from_spec(VERIFIER_SPEC)
+VERIFIER_SPEC.loader.exec_module(VERIFIER_MODULE)
 
 
 class _HookTarget(torch.nn.Module):
@@ -227,6 +246,250 @@ def _capture_grid(root: Path) -> tuple[str, ...]:
     return roster
 
 
+def _synthetic_causal_run(tmp_path: Path) -> dict[str, Path | str]:
+    run = tmp_path / "run"
+    run.mkdir()
+    capture_root = run / "private_predictions"
+    roster = _capture_grid(capture_root)
+    captures = load_and_validate_captures(capture_root, roster=roster)
+
+    checkpoint = tmp_path / "fingerprint.ckpt"
+    _checkpoint(checkpoint)
+    checkpoint_sha = RUNNER_MODULE._sha256(checkpoint)
+    analysis_sha = "a" * 40
+    model_sha = "b" * 40
+    tabarena_sha = "c" * 40
+    roster_path = tmp_path / "roster.json"
+    roster_path.write_text(
+        json.dumps(
+            {
+                "count": 1,
+                "names": ["toy"],
+                "source_commit": tabarena_sha,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    roster_sha = RUNNER_MODULE._sha256(roster_path)
+
+    errors = {
+        "correct": 0.2,
+        "zero": 0.3,
+        "permuted": 0.4,
+        "collapsed": 0.1,
+    }
+    normalized = []
+    results_root = tmp_path / "results"
+    for index, intervention in enumerate(FINGERPRINT_INTERVENTIONS):
+        framework = (
+            "TabICL_Fullsize_Fingerprint_Step50000_Causal_"
+            + intervention.capitalize()
+            + "_c1_default"
+        )
+        raw = {
+            "experiment_metadata": {},
+            "framework": framework,
+            "memory_usage": None,
+            "metric": "roc_auc",
+            "metric_error": errors[intervention],
+            "problem_type": "binary",
+            "simulation_artifacts": None,
+            "task_metadata": {
+                "tid": 7,
+                "name": "toy",
+                "fold": 0,
+                "repeat": 0,
+                "sample": 0,
+                "split_idx": 0,
+            },
+            "time_infer_s": 0.2 + index,
+            "time_train_s": 0.1 + index,
+        }
+        destination = results_root / intervention / "results.pkl"
+        destination.parent.mkdir(parents=True)
+        with destination.open("wb") as handle:
+            pickle.dump(raw, handle)
+        normalized.append(
+            {
+                "arm": intervention,
+                "framework": framework,
+                "dataset": "toy",
+                "task_id": 7,
+                "fold": 0,
+                "repeat": 0,
+                "sample": 0,
+                "split_idx": 0,
+                "problem_type": "binary",
+                "metric": "roc_auc",
+                "metric_error": errors[intervention],
+                "time_train_s": 0.1 + index,
+                "time_infer_s": 0.2 + index,
+            }
+        )
+    _archive_directory(results_root, run / "results.tar.gz")
+    rows = {(row["arm"], row["dataset"]): row for row in normalized}
+    comparisons = aggregate_causal_results(
+        rows,
+        roster=roster,
+        n_resamples=10_000,
+        seed=42,
+    )
+    comparison_sha = hashlib.sha256(
+        json.dumps(
+            comparisons,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    summary = {
+        "schema_version": 1,
+        "study": "fullsize-fingerprint-step50000-tabarena-causal",
+        "formal_eligible": False,
+        "leaderboard_replication": False,
+        "seed": 42,
+        "comparison_step": 50_000,
+        "task_subset": "lite",
+        "task_count": 1,
+        "result_count": 4,
+        "condition_order": list(FINGERPRINT_INTERVENTIONS),
+        **comparisons,
+        "permutation_audit": {
+            "algorithm": "cyclic_shift_left_one_v1",
+            "h_greater_than_one_has_no_fixed_points": True,
+            "single_token_degenerate_dataset_count": 0,
+            "single_token_degenerate_datasets": [],
+        },
+        "datasets": [
+            {
+                "dataset": "toy",
+                "task_id": 7,
+                "problem_type": "binary",
+                "metric": "roc_auc",
+                "feature_token_count": 2,
+                "conditions": {
+                    intervention: {
+                        "metric_error": errors[intervention],
+                        "time_train_s": 0.1 + index,
+                        "time_infer_s": 0.2 + index,
+                    }
+                    for index, intervention in enumerate(FINGERPRINT_INTERVENTIONS)
+                },
+            }
+        ],
+        "checkpoint": {
+            "sha256": checkpoint_sha,
+            "size_bytes": checkpoint.stat().st_size,
+            "contract": fingerprint_checkpoint_contract(checkpoint),
+        },
+        "code_provenance": {
+            "analysis_sha": analysis_sha,
+            "model_sha": model_sha,
+            "tabarena_sha": tabarena_sha,
+            "roster_file_sha256": roster_sha,
+        },
+        "inference_budget": {
+            "n_estimators": 1,
+            "augmentation": "none",
+            "classifier_options": dict(_FIXED_CLASSIFIER_OPTIONS),
+        },
+        "prediction_capture": {
+            "private": True,
+            "dtype": "float32",
+            "four_way_alignment_fields": [
+                "shape",
+                "encoded_target",
+                "row",
+                "test_target",
+                "class",
+                "train_content",
+                "test_content",
+            ],
+        },
+    }
+    runtime = {
+        "schema_version": 1,
+        "python": "3.10.0",
+        "numpy": "2.0.0",
+        "pandas": "2.0.0",
+        "scikit_learn": "1.6.0",
+        "openml": "0.15.0",
+        "autogluon_core": "1.4.0",
+        "torch": "2.5.0",
+        "tabarena": "0.1.0",
+        "tabicl": "2.0.0",
+        "benchmark_code_sha": tabarena_sha,
+        "cuda_available": True,
+        "cuda_device_count": 1,
+        "cuda_device_name": "NVIDIA A10",
+        "cuda_device_capability": [8, 6],
+        "cuda_runtime": "12.1",
+        "cudnn": 8900,
+        "nvidia_driver": "535.0",
+        "duration_seconds": 1.0,
+        "result_count": 4,
+    }
+    captures_manifest = RUNNER_MODULE._capture_manifest(
+        captures,
+        root=capture_root,
+        interventions=FINGERPRINT_INTERVENTIONS,
+        roster=roster,
+    )
+    for name, payload in (
+        ("summary.json", summary),
+        ("runtime.json", runtime),
+        ("captures_manifest.json", captures_manifest),
+    ):
+        (run / name).write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+    artifacts = {
+        name: {
+            "sha256": RUNNER_MODULE._sha256(run / name),
+            "size_bytes": (run / name).stat().st_size,
+        }
+        for name in (
+            "summary.json",
+            "runtime.json",
+            "results.tar.gz",
+            "captures_manifest.json",
+        )
+    }
+    (run / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "study": "fullsize-fingerprint-step50000-tabarena-causal",
+                "formal_eligible": False,
+                "contains_private_predictions": True,
+                "artifacts": artifacts,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    return {
+        "run": run,
+        "results": results_root,
+        "checkpoint": checkpoint,
+        "checkpoint_sha": checkpoint_sha,
+        "roster": roster_path,
+        "roster_sha": roster_sha,
+        "scratch": scratch,
+        "analysis_sha": analysis_sha,
+        "model_sha": model_sha,
+        "tabarena_sha": tabarena_sha,
+        "comparison_sha": comparison_sha,
+    }
+
+
 def test_private_float32_capture_grid_aligns_and_detects_target_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -252,6 +515,232 @@ def test_private_float32_capture_grid_aligns_and_detects_target_mismatch(
 
     with pytest.raises(ValueError, match="test_target_sha256"):
         load_and_validate_captures(tmp_path, roster=roster)
+
+
+def test_capture_validation_recomputes_permutation_semantics(tmp_path: Path) -> None:
+    roster = _capture_grid(tmp_path)
+    digest = hashlib.sha256(b"toy").hexdigest()
+    record_path = tmp_path / "permuted" / digest / "capture.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["causal_metadata"]["permutation"]["algorithm"] = "forged"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="permutation evidence"):
+        load_and_validate_captures(tmp_path, roster=roster)
+
+
+def test_postpublication_verifier_rehashes_and_recomputes_complete_run(
+    tmp_path: Path,
+) -> None:
+    fixture = _synthetic_causal_run(tmp_path)
+
+    report = verify_fingerprint_causal_run(
+        fixture["run"],
+        checkpoint=fixture["checkpoint"],
+        roster_path=fixture["roster"],
+        scratch_root=fixture["scratch"],
+        expected_checkpoint_sha256=fixture["checkpoint_sha"],
+        expected_analysis_sha=fixture["analysis_sha"],
+        expected_model_sha=fixture["model_sha"],
+        expected_tabarena_sha=fixture["tabarena_sha"],
+        expected_roster_sha256=fixture["roster_sha"],
+        expected_task_count=1,
+    )
+
+    assert report["status"] == "verified"
+    assert report["task_count"] == 1
+    assert report["result_count"] == 4
+    assert report["capture_record_count"] == 4
+    assert report["capture_file_count"] == 8
+    assert report["bootstrap_resamples"] == 10_000
+    assert report["recomputed_comparisons_sha256"] == fixture["comparison_sha"]
+    assert not list(fixture["scratch"].iterdir())
+
+    capture = next((fixture["run"] / "private_predictions").rglob("capture.json"))
+    capture.write_bytes(capture.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="expected SHA-256"):
+        verify_fingerprint_causal_run(
+            fixture["run"],
+            checkpoint=fixture["checkpoint"],
+            roster_path=fixture["roster"],
+            scratch_root=fixture["scratch"],
+            expected_checkpoint_sha256=fixture["checkpoint_sha"],
+            expected_analysis_sha=fixture["analysis_sha"],
+            expected_model_sha=fixture["model_sha"],
+            expected_tabarena_sha=fixture["tabarena_sha"],
+            expected_roster_sha256=fixture["roster_sha"],
+            expected_task_count=1,
+        )
+
+
+def test_postpublication_verifier_rejects_unsafe_results_archive(tmp_path: Path) -> None:
+    payload = b"unsafe"
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        member = tarfile.TarInfo("tabarena-results/../escape/results.pkl")
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+
+    with pytest.raises(ValueError, match="unsafe member"):
+        _safe_extract_results(buffer.getvalue(), tmp_path)
+
+
+def test_postpublication_verifier_rejects_overlaps_and_repacked_metric(
+    tmp_path: Path,
+) -> None:
+    fixture = _synthetic_causal_run(tmp_path)
+    run = Path(fixture["run"])
+    common = {
+        "checkpoint": fixture["checkpoint"],
+        "roster_path": fixture["roster"],
+        "expected_checkpoint_sha256": fixture["checkpoint_sha"],
+        "expected_analysis_sha": fixture["analysis_sha"],
+        "expected_model_sha": fixture["model_sha"],
+        "expected_tabarena_sha": fixture["tabarena_sha"],
+        "expected_roster_sha256": fixture["roster_sha"],
+        "expected_task_count": 1,
+    }
+    with pytest.raises(ValueError, match="scratch_root"):
+        verify_fingerprint_causal_run(
+            run,
+            scratch_root=run / "private_predictions",
+            **common,
+        )
+    with pytest.raises(ValueError, match="must not overlap"):
+        VERIFIER_MODULE._receipt_path(
+            str(run / "verification.json"),
+            run_dir=run,
+        )
+    with pytest.raises(ValueError, match="verifier repository"):
+        VERIFIER_MODULE._receipt_path(
+            str(PACKAGE_ROOT / "verification-receipt-never-create.json"),
+            run_dir=run,
+        )
+
+    result_path = Path(fixture["results"]) / "correct" / "results.pkl"
+    with result_path.open("rb") as handle:
+        result = pickle.load(handle)
+    result["metric_error"] = 0.9
+    with result_path.open("wb") as handle:
+        pickle.dump(result, handle)
+    archive_path = run / "results.tar.gz"
+    _archive_directory(Path(fixture["results"]), archive_path)
+    manifest_path = run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["results.tar.gz"] = {
+        "sha256": RUNNER_MODULE._sha256(archive_path),
+        "size_bytes": archive_path.stat().st_size,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="differs from the causal summary"):
+        verify_fingerprint_causal_run(
+            run,
+            scratch_root=fixture["scratch"],
+            **common,
+        )
+
+
+def test_verifier_git_provenance_requires_clean_detached_exact_head(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(repository), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "-q")
+    tracked = repository / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git(
+        "-c",
+        "user.name=Verifier Test",
+        "-c",
+        "user.email=verifier@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "fixture",
+    )
+    head = git("rev-parse", "HEAD").stdout.strip()
+    with pytest.raises(ValueError, match="detached HEAD"):
+        VERIFIER_MODULE._git_head(repository, head)
+    git("checkout", "--detach", "-q", head)
+
+    assert VERIFIER_MODULE._git_head(repository, head) == head
+    with pytest.raises(ValueError, match="HEAD mismatch"):
+        VERIFIER_MODULE._git_head(repository, "0" * 40)
+    tracked.write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="must be clean"):
+        VERIFIER_MODULE._git_head(repository, head)
+
+
+def test_verifier_cli_writes_private_code_bound_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    receipt_parent = tmp_path / "receipts"
+    receipt_parent.mkdir()
+    receipt = receipt_parent / "verification.json"
+    verifier_sha = "d" * 40
+
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    monkeypatch.setattr(
+        VERIFIER_MODULE,
+        "_git_head",
+        lambda _root, expected: expected,
+    )
+    monkeypatch.setattr(
+        VERIFIER_MODULE,
+        "verify_fingerprint_causal_run",
+        lambda *_args, **_kwargs: {
+            "status": "verified",
+            "task_count": 1,
+            "result_count": 4,
+        },
+    )
+    monkeypatch.setattr(
+        VERIFIER_MODULE.sys,
+        "argv",
+        [
+            str(VERIFIER),
+            "--run-dir",
+            str(run),
+            "--fingerprint-checkpoint",
+            str(tmp_path / "checkpoint.ckpt"),
+            "--receipt",
+            str(receipt),
+            "--expected-verifier-sha",
+            verifier_sha,
+        ],
+    )
+
+    assert VERIFIER_MODULE.main() == 0
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["verifier_provenance"]["git_sha"] == verifier_sha
+    for name in (
+        "script_sha256",
+        "verification_module_sha256",
+        "capture_module_sha256",
+    ):
+        assert len(payload["verifier_provenance"][name]) == 64
+    assert payload["verifier_runtime"]["python"]
+    assert payload["verifier_runtime"]["numpy"] == np.__version__
+    assert receipt.stat().st_mode & 0o777 == 0o600
 
 
 def test_causal_aggregation_keeps_metrics_separate_and_delta_direction() -> None:

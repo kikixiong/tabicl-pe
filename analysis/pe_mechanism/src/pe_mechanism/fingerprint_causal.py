@@ -502,8 +502,19 @@ def load_and_validate_captures(
             record_path = directory / "capture.json"
             prediction_path = directory / "predictions.npz"
             record = json.loads(record_path.read_text(encoding="utf-8"))
+            if not isinstance(record, Mapping) or set(record) != {
+                "schema_version",
+                "dataset",
+                "dataset_sha256",
+                "intervention",
+                "causal_metadata",
+                "prediction_file",
+                "prediction_evidence",
+            }:
+                raise ValueError("causal capture fields differ from the frozen schema")
             if (
-                record.get("dataset") != dataset
+                record.get("schema_version") != 1
+                or record.get("dataset") != dataset
                 or record.get("dataset_sha256") != digest
                 or record.get("intervention") != intervention
                 or record.get("prediction_file") != "predictions.npz"
@@ -513,29 +524,35 @@ def load_and_validate_captures(
             if record.get("prediction_evidence") != observed:
                 raise ValueError("causal prediction evidence changed after capture")
             metadata = record.get("causal_metadata")
-            if not isinstance(metadata, Mapping) or metadata.get("intervention") != intervention:
+            if (
+                not isinstance(metadata, Mapping)
+                or set(metadata)
+                != {
+                    "intervention",
+                    "forward_call_count",
+                    "feature_token_count",
+                    "permutation",
+                }
+                or metadata.get("intervention") != intervention
+            ):
                 raise ValueError("causal intervention metadata mismatch")
+            call_count = metadata.get("forward_call_count")
+            token_count = metadata.get("feature_token_count")
+            if (
+                isinstance(call_count, bool)
+                or not isinstance(call_count, int)
+                or call_count < 1
+                or isinstance(token_count, bool)
+                or not isinstance(token_count, int)
+                or token_count < 1
+            ):
+                raise ValueError("causal intervention counts are invalid")
             if intervention == "permuted":
                 permutation = metadata.get("permutation")
-                if not isinstance(permutation, Mapping):
-                    raise ValueError("permuted condition lacks permutation evidence")
-                token_count = permutation.get("token_count")
-                if token_count == 1:
-                    if (
-                        permutation.get("effective") is not False
-                        or permutation.get("fixed_point_count") != 1
-                        or permutation.get("degenerate_reason")
-                        != "single_feature_token_has_no_derangement"
-                    ):
-                        raise ValueError("H=1 permutation is not explicitly degenerate")
-                elif (
-                    not isinstance(token_count, int)
-                    or token_count < 2
-                    or permutation.get("effective") is not True
-                    or permutation.get("fixed_point_count") != 0
-                    or permutation.get("degenerate_reason") is not None
+                if not isinstance(permutation, Mapping) or permutation != (
+                    cyclic_derangement_indices(token_count)[1]
                 ):
-                    raise ValueError("permuted condition is not a fixed-point-free derangement")
+                    raise ValueError("permuted condition has invalid permutation evidence")
             elif metadata.get("permutation") is not None:
                 raise ValueError("non-permuted condition contains permutation evidence")
             by_dataset[dataset] = record

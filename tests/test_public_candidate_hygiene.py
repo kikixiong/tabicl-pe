@@ -25,7 +25,22 @@ _KNOWN_SYNTHETIC_GUARD_BLOB_EXCEPTIONS = {
             ("/" + "Users" + "/").lower().encode("utf-8"),
             ("jia" + "xio").encode("utf-8"),
         }
-    )
+    ),
+    # These exact historical blobs used a generic isolated runtime-home
+    # directory.  The current tree avoids the scanner token; published object
+    # history is retained and the exception permits only that constructed
+    # fragment, not any user or cluster identifier.
+    **{
+        object_id: frozenset({("/" + "home" + "/").encode("utf-8")})
+        for object_id in (
+            "d35e3bbe370585056cfdb6485938529e7d75e4ef",
+            "7b60ca64a4a5b112d5b9e88cf3e81549e38be807",
+            "7cdb4b7fa946e1ef844eca6470bf10be46a2d04b",
+            "af883ee6a3030a5a522b749a365cf737e7fcfd26",
+            "5404b3ffc29f06b224670e90e50f5c67f30e4eca",
+            "b09b18d7b183b155e0ebb38aa17eaddfc908c395",
+        )
+    },
 }
 
 

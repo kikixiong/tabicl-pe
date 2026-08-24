@@ -201,11 +201,12 @@ gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader | sed -n '1p')
 }
 
 runtime_root="$run_root/.slurm-runtime/${SLURM_ARRAY_JOB_ID:-manual}-${PE_PAIR_PHASE}-${SLURM_ARRAY_TASK_ID}"
-ensure_real_directory "$runtime_root/home" runtime-home
+runtime_home="$runtime_root/runtime-home"
+ensure_real_directory "$runtime_home" runtime-home
 ensure_real_directory "$runtime_root/cache/huggingface" runtime-huggingface
 ensure_real_directory "$runtime_root/cache/xdg" runtime-xdg
-ensure_real_directory "$runtime_root/home/tmp" runtime-tmp
-export HOME="$runtime_root/home"
+ensure_real_directory "$runtime_home/tmp" runtime-tmp
+export HOME="$runtime_home"
 export HF_HOME="$runtime_root/cache/huggingface"
 export XDG_CACHE_HOME="$runtime_root/cache/xdg"
 export TMPDIR="$HOME/tmp"
