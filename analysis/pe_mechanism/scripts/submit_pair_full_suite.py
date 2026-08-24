@@ -31,6 +31,10 @@ from pe_mechanism.python_environment import (  # noqa: E402
 
 _WARN_FREE_GIB = 22
 _BLOCK_FREE_GIB = 20
+_FULL_ARRAY_BY_MODE = {
+    "beyond-h100": "0-7%2",
+    "tabarena-a10": "0-7%1",
+}
 _TERMINAL_STATES = frozenset(
     {
         "BOOT_FAIL",
@@ -321,6 +325,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
+    full_array = _FULL_ARRAY_BY_MODE[args.mode]
     analysis_root = _absolute(args.analysis_root, label="analysis_root").resolve(
         strict=True
     )
@@ -503,7 +508,7 @@ def main() -> int:
             ).encode("utf-8")
         ).hexdigest(),
         "full_policy": {
-            "array": "0-7%2",
+            "array": full_array,
             "dependency": "afterok:CANARY_JOB_ID",
             "qos": "medium",
             "walltime": "24:00:00",
@@ -537,7 +542,7 @@ def main() -> int:
             qos="medium",
             walltime="24:00:00",
             dependency=canary_id,
-            array="0-7%2",
+            array=full_array,
         )
         full_id = _submit(full_command)
         created_jobs.append(full_id)

@@ -1623,6 +1623,10 @@ def test_submitter_holds_canary_and_git_preflight_requires_clean_detached(
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    assert module._FULL_ARRAY_BY_MODE == {
+        "beyond-h100": "0-7%2",
+        "tabarena-a10": "0-7%1",
+    }
     wrapper = tmp_path / "worker.sh"
     wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
     command = module._sbatch_command(
