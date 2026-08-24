@@ -30,6 +30,8 @@ _PROBLEM_TYPES = frozenset({"binary", "multiclass"})
 _SPLIT_REGIMES = frozenset({"iid", "grouped", "temporal"})
 _BOOTSTRAP_SEED = 20_260_817
 _BOOTSTRAP_RESAMPLES = 20_000
+_STAGE3_TERMINAL_STEP = 10_000
+_STAGE3_CUMULATIVE_TRAINING_STEPS = 550_000
 _PINNED_ROSTERS = {
     "beyondarena": {
         "count": 89,
@@ -84,6 +86,7 @@ class PairManifest:
     pair_id: str
     formal_eligible: bool
     model_source_sha: str
+    checkpoint_stage: str
     arms: tuple[Arm, Arm]
     inference: Mapping[str, Any]
     checkpoint_contract: Mapping[str, Any]
@@ -262,7 +265,11 @@ def load_pair_manifest(path: Path, *, verify_checkpoints: bool = True) -> PairMa
     }
     optional_fields = {
         name
-        for name in ("legacy_snapshot_receipts", "training_receipts")
+        for name in (
+            "checkpoint_stage",
+            "legacy_snapshot_receipts",
+            "training_receipts",
+        )
         if name in payload
     }
     payload = _exact_object(
@@ -277,6 +284,11 @@ def load_pair_manifest(path: Path, *, verify_checkpoints: bool = True) -> PairMa
     if formal_eligible is not False:
         raise ValueError("every full-suite pair campaign must set formal_eligible=false")
     model_sha = _git_sha(payload["model_source_sha"], label="model_source_sha")
+    checkpoint_stage = _identifier(
+        payload.get("checkpoint_stage", "stage1"), label="checkpoint_stage"
+    )
+    if checkpoint_stage not in {"stage1", "stage3"}:
+        raise ValueError("checkpoint_stage must be stage1 or stage3")
 
     arm_values = payload["arms"]
     if not isinstance(arm_values, list) or len(arm_values) != 2:
@@ -379,6 +391,7 @@ def load_pair_manifest(path: Path, *, verify_checkpoints: bool = True) -> PairMa
         pair_id=pair_id,
         formal_eligible=formal_eligible,
         model_source_sha=model_sha,
+        checkpoint_stage=checkpoint_stage,
         arms=(arms[0], arms[1]),
         inference=normalized_inference,
         checkpoint_contract={},
@@ -393,6 +406,7 @@ def load_pair_manifest(path: Path, *, verify_checkpoints: bool = True) -> PairMa
             pair_id=pair.pair_id,
             formal_eligible=pair.formal_eligible,
             model_source_sha=pair.model_source_sha,
+            checkpoint_stage=pair.checkpoint_stage,
             arms=pair.arms,
             inference=pair.inference,
             checkpoint_contract=contract,
@@ -407,7 +421,7 @@ def validate_checkpoint_pair(pair: PairManifest) -> dict[str, Any]:
     import torch
 
     def validate_legacy_receipt(
-        arm: Arm, path: Path, *, expected_step: int
+        arm: Arm, path: Path, *, expected_stage: str, expected_step: int
     ) -> dict[str, Any]:
         receipt, receipt_file_sha = _load_json_file(
             path, label=f"legacy snapshot receipt for {arm.arm_id}"
@@ -455,7 +469,7 @@ def validate_checkpoint_pair(pair: PairManifest) -> dict[str, Any]:
             or receipt["kind"] != "tabicl-legacy-pilot-checkpoint-snapshot"
             or receipt["classification"] != "exploratory-pilot-only"
             or receipt["mode"] != arm.arm_id
-            or receipt["stage"] != "stage1"
+            or receipt["stage"] != expected_stage
             or receipt["step"] != expected_step
             or receipt["source_provenance_status"]
             != "operational-history-only-not-checkpoint-bound"
@@ -739,29 +753,47 @@ def validate_checkpoint_pair(pair: PairManifest) -> dict[str, Any]:
 
     step = steps[first]
     exact_pairs = {
-        (250_000, ("rope", "none")),
-        (50_000, ("rope", "fingerprint")),
-        (500_000, ("rope", "none")),
+        ("stage1", 250_000, ("rope", "none")),
+        ("stage1", 50_000, ("rope", "fingerprint")),
+        ("stage1", 500_000, ("rope", "none")),
+        ("stage3", _STAGE3_TERMINAL_STEP, ("rope", "none")),
     }
-    if (step, pair.arm_order) not in exact_pairs:
+    if (pair.checkpoint_stage, step, pair.arm_order) not in exact_pairs:
         raise ValueError(
-            "pair must be exactly step-250000 rope/none, step-50000 rope/fingerprint, "
-            "or step-500000 rope/none"
+            "pair must be exactly stage1 step-250000 rope/none, stage1 step-50000 "
+            "rope/fingerprint, stage1 step-500000 rope/none, or exploratory stage3 "
+            "step-10000 rope/none"
         )
-    if step in {250_000, 500_000} and pair.legacy_snapshot_receipts is None:
-        raise ValueError(f"step-{step} rope/none requires two snapshot receipts")
-    if step != 50_000 and pair.training_receipts is not None:
-        raise ValueError("training receipts are only valid for the step-50000 pair")
-    if step == 50_000 and pair.legacy_snapshot_receipts is not None:
-        raise ValueError("step-50000 pair must not claim legacy snapshot receipts")
+    receipt_bound_pair = pair.checkpoint_stage == "stage3" or step in {
+        250_000,
+        500_000,
+    }
+    if receipt_bound_pair and pair.legacy_snapshot_receipts is None:
+        raise ValueError(
+            f"{pair.checkpoint_stage} step-{step} rope/none requires two snapshot receipts"
+        )
+    if (
+        (pair.checkpoint_stage != "stage1" or step != 50_000)
+        and pair.training_receipts is not None
+    ):
+        raise ValueError(
+            "training receipts are only valid for the stage1 step-50000 pair"
+        )
+    if (
+        pair.checkpoint_stage == "stage1"
+        and step == 50_000
+        and pair.legacy_snapshot_receipts is not None
+    ):
+        raise ValueError("stage1 step-50000 pair must not claim legacy snapshot receipts")
 
     streams = {arm: payloads[arm].get("prior_stream") for arm in pair.arm_order}
     if all(stream is None for stream in streams.values()):
-        if step in {250_000, 500_000} and pair.legacy_snapshot_receipts is not None:
+        if receipt_bound_pair and pair.legacy_snapshot_receipts is not None:
             receipt_evidence = {
                 arm.arm_id: validate_legacy_receipt(
                     arm,
                     pair.legacy_snapshot_receipts[arm.arm_id],
+                    expected_stage=pair.checkpoint_stage,
                     expected_step=step,
                 )
                 for arm in pair.arms
@@ -783,7 +815,8 @@ def validate_checkpoint_pair(pair: PairManifest) -> dict[str, Any]:
             }
         else:
             raise ValueError(
-                "missing prior_stream is only accepted for receipt-bound step-250000/500000 pairs"
+                "missing prior_stream is only accepted for receipt-bound stage1 "
+                "step-250000/500000 or stage3 step-10000 pairs"
             )
     else:
         if not all(isinstance(stream, Mapping) for stream in streams.values()):
@@ -792,7 +825,7 @@ def validate_checkpoint_pair(pair: PairManifest) -> dict[str, Any]:
             raise ValueError("paired checkpoints have different prior_stream state")
         stream = validate_prior_stream(streams[first], step=step)
         prior_contract = {"mode": "exact", "state": stream}
-        if step == 50_000:
+        if pair.checkpoint_stage == "stage1" and step == 50_000:
             prior_contract["training_receipts"] = validate_training_receipts(
                 streams={arm: streams[arm] for arm in pair.arm_order}  # type: ignore[misc]
             )
@@ -801,12 +834,13 @@ def validate_checkpoint_pair(pair: PairManifest) -> dict[str, Any]:
                 arm.arm_id: validate_legacy_receipt(
                     arm,
                     pair.legacy_snapshot_receipts[arm.arm_id],
+                    expected_stage=pair.checkpoint_stage,
                     expected_step=step,
                 )
                 for arm in pair.arms
             }
     config_bytes = _canonical_json(comparable[first])
-    return {
+    contract = {
         "comparison_step": step,
         "prior_stream": prior_contract,
         "shared_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
@@ -819,6 +853,14 @@ def validate_checkpoint_pair(pair: PairManifest) -> dict[str, Any]:
             for arm in pair.arm_order
         },
     }
+    if pair.checkpoint_stage == "stage3":
+        contract.update(
+            {
+                "comparison_stage": "stage3",
+                "cumulative_training_steps": _STAGE3_CUMULATIVE_TRAINING_STEPS,
+            }
+        )
+    return contract
 
 
 def load_roster(path: Path, *, enforce_pinned: bool = True) -> Roster:

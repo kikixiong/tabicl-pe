@@ -114,11 +114,15 @@ def _pair(
     step: int = 50_000,
     include_prior_stream: bool = True,
     formal_eligible: bool = False,
+    checkpoint_stage: str = "stage1",
     legacy_receipts: bool | None = None,
     training_receipts: bool | None = None,
 ):
     if legacy_receipts is None:
-        legacy_receipts = step in {250_000, 500_000}
+        legacy_receipts = checkpoint_stage == "stage3" or step in {
+            250_000,
+            500_000,
+        }
     if training_receipts is None:
         training_receipts = step == 50_000 and include_prior_stream
     arm_ids = ("rope", "fingerprint") if step == 50_000 else ("rope", "none")
@@ -159,7 +163,7 @@ def _pair(
                 "continuation_id": f"unit-legacy-{step}",
                 "created_at_utc": "2026-08-17T00:00:00+00:00",
                 "mode": arm_id,
-                "stage": "stage1",
+                "stage": checkpoint_stage,
                 "step": step,
                 "continuation_source_commit": MODEL_SHA,
                 "source_provenance_status": "operational-history-only-not-checkpoint-bound",
@@ -206,6 +210,8 @@ def _pair(
                     "classifier_options": _FIXED_CLASSIFIER_OPTIONS,
                 },
             }
+    if checkpoint_stage != "stage1":
+        manifest_payload["checkpoint_stage"] = checkpoint_stage
     if legacy_receipts:
         manifest_payload["legacy_snapshot_receipts"] = receipt_paths
     if training_receipts:
@@ -851,6 +857,9 @@ def test_step500k_legacy_pair_requires_two_matching_immutable_snapshot_receipts(
         legacy_receipts=True,
     )
     assert pair.formal_eligible is False
+    assert pair.checkpoint_stage == "stage1"
+    assert "comparison_stage" not in pair.checkpoint_contract
+    assert "cumulative_training_steps" not in pair.checkpoint_contract
     assert pair.checkpoint_contract["prior_stream"]["mode"] == "same_step_legacy"
     assert set(pair.checkpoint_contract["prior_stream"]["receipts"]) == {
         "rope",
@@ -861,6 +870,97 @@ def test_step500k_legacy_pair_requires_two_matching_immutable_snapshot_receipts(
     payload["continuation_id"] = "different"
     receipt.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="self-hash|disagree"):
+        load_pair_manifest(pair.path)
+
+
+def test_stage3_terminal_pair_is_explicit_receipt_bound_and_exploratory(
+    tmp_path: Path,
+) -> None:
+    pair = _pair(
+        tmp_path,
+        checkpoint_stage="stage3",
+        step=10_000,
+        include_prior_stream=False,
+    )
+    assert pair.formal_eligible is False
+    assert pair.checkpoint_stage == "stage3"
+    assert pair.arm_order == ("rope", "none")
+    assert pair.checkpoint_contract["comparison_stage"] == "stage3"
+    assert pair.checkpoint_contract["comparison_step"] == 10_000
+    assert pair.checkpoint_contract["cumulative_training_steps"] == 550_000
+    assert pair.checkpoint_contract["prior_stream"]["mode"] == "same_step_legacy"
+
+
+def test_stage3_terminal_profile_fails_closed(tmp_path: Path) -> None:
+    wrong_step = tmp_path / "wrong-step"
+    wrong_step.mkdir()
+    with pytest.raises(ValueError, match="exploratory stage3 step-10000 rope/none"):
+        _pair(
+            wrong_step,
+            checkpoint_stage="stage3",
+            step=9_999,
+            include_prior_stream=False,
+        )
+
+    missing_receipts = tmp_path / "missing-receipts"
+    missing_receipts.mkdir()
+    with pytest.raises(ValueError, match="requires two snapshot receipts"):
+        _pair(
+            missing_receipts,
+            checkpoint_stage="stage3",
+            step=10_000,
+            include_prior_stream=False,
+            legacy_receipts=False,
+        )
+
+    wrong_order = tmp_path / "wrong-order"
+    wrong_order.mkdir()
+    pair = _pair(
+        wrong_order,
+        checkpoint_stage="stage3",
+        step=10_000,
+        include_prior_stream=False,
+    )
+    manifest = json.loads(pair.path.read_text(encoding="utf-8"))
+    manifest["arms"].reverse()
+    pair.path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="exploratory stage3 step-10000 rope/none"):
+        load_pair_manifest(pair.path)
+
+    formal = tmp_path / "formal"
+    formal.mkdir()
+    with pytest.raises(ValueError, match="formal_eligible=false"):
+        _pair(
+            formal,
+            checkpoint_stage="stage3",
+            step=10_000,
+            include_prior_stream=False,
+            formal_eligible=True,
+        )
+
+
+def test_stage3_terminal_receipt_must_bind_stage3(tmp_path: Path) -> None:
+    pair = _pair(
+        tmp_path,
+        checkpoint_stage="stage3",
+        step=10_000,
+        include_prior_stream=False,
+    )
+    receipt_path = pair.legacy_snapshot_receipts["none"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["stage"] = "stage1"
+    body = {key: value for key, value in receipt.items() if key != "manifest_sha256"}
+    receipt["manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not bind the none checkpoint"):
         load_pair_manifest(pair.path)
 
 
