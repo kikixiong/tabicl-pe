@@ -60,6 +60,22 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _rewrite_snapshot_receipt(path: Path, **updates: Any) -> None:
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    receipt.update(updates)
+    body = {key: value for key, value in receipt.items() if key != "manifest_sha256"}
+    receipt["manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+
+
 def _prior_stream(step: int) -> dict[str, Any]:
     schema = json.dumps(
         {
@@ -119,7 +135,7 @@ def _pair(
     training_receipts: bool | None = None,
 ):
     if legacy_receipts is None:
-        legacy_receipts = checkpoint_stage == "stage3" or step in {
+        legacy_receipts = checkpoint_stage in {"stage2", "stage3"} or step in {
             250_000,
             500_000,
         }
@@ -891,6 +907,73 @@ def test_stage3_terminal_pair_is_explicit_receipt_bound_and_exploratory(
     assert pair.checkpoint_contract["prior_stream"]["mode"] == "same_step_legacy"
 
 
+def test_stage2_terminal_pair_is_explicit_receipt_bound_and_exploratory(
+    tmp_path: Path,
+) -> None:
+    pair = _pair(
+        tmp_path,
+        checkpoint_stage="stage2",
+        step=40_000,
+        include_prior_stream=False,
+    )
+    assert pair.formal_eligible is False
+    assert pair.checkpoint_stage == "stage2"
+    assert pair.arm_order == ("rope", "none")
+    assert pair.checkpoint_contract["comparison_stage"] == "stage2"
+    assert pair.checkpoint_contract["comparison_step"] == 40_000
+    assert pair.checkpoint_contract["cumulative_training_steps"] == 540_000
+    assert pair.checkpoint_contract["prior_stream"]["mode"] == "same_step_legacy"
+
+
+def test_stage2_terminal_profile_fails_closed(tmp_path: Path) -> None:
+    wrong_step = tmp_path / "wrong-step"
+    wrong_step.mkdir()
+    with pytest.raises(ValueError, match="exploratory stage2 step-40000 rope/none"):
+        _pair(
+            wrong_step,
+            checkpoint_stage="stage2",
+            step=39_999,
+            include_prior_stream=False,
+        )
+
+    missing_receipts = tmp_path / "missing-receipts"
+    missing_receipts.mkdir()
+    with pytest.raises(ValueError, match="requires two snapshot receipts"):
+        _pair(
+            missing_receipts,
+            checkpoint_stage="stage2",
+            step=40_000,
+            include_prior_stream=False,
+            legacy_receipts=False,
+        )
+
+    wrong_order = tmp_path / "wrong-order"
+    wrong_order.mkdir()
+    pair = _pair(
+        wrong_order,
+        checkpoint_stage="stage2",
+        step=40_000,
+        include_prior_stream=False,
+    )
+    manifest = json.loads(pair.path.read_text(encoding="utf-8"))
+    manifest["arms"].reverse()
+    pair.path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="exploratory stage2 step-40000 rope/none"):
+        load_pair_manifest(pair.path)
+
+    wrong_receipt_stage = tmp_path / "wrong-receipt-stage"
+    wrong_receipt_stage.mkdir()
+    pair = _pair(
+        wrong_receipt_stage,
+        checkpoint_stage="stage2",
+        step=40_000,
+        include_prior_stream=False,
+    )
+    _rewrite_snapshot_receipt(pair.legacy_snapshot_receipts["none"], stage="stage1")
+    with pytest.raises(ValueError, match="does not bind the none checkpoint"):
+        load_pair_manifest(pair.path)
+
+
 def test_stage3_terminal_profile_fails_closed(tmp_path: Path) -> None:
     wrong_step = tmp_path / "wrong-step"
     wrong_step.mkdir()
@@ -947,19 +1030,7 @@ def test_stage3_terminal_receipt_must_bind_stage3(tmp_path: Path) -> None:
         include_prior_stream=False,
     )
     receipt_path = pair.legacy_snapshot_receipts["none"]
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    receipt["stage"] = "stage1"
-    body = {key: value for key, value in receipt.items() if key != "manifest_sha256"}
-    receipt["manifest_sha256"] = hashlib.sha256(
-        json.dumps(
-            body,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    _rewrite_snapshot_receipt(receipt_path, stage="stage1")
     with pytest.raises(ValueError, match="does not bind the none checkpoint"):
         load_pair_manifest(pair.path)
 

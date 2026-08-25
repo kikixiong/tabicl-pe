@@ -30,6 +30,8 @@ _PROBLEM_TYPES = frozenset({"binary", "multiclass"})
 _SPLIT_REGIMES = frozenset({"iid", "grouped", "temporal"})
 _BOOTSTRAP_SEED = 20_260_817
 _BOOTSTRAP_RESAMPLES = 20_000
+_STAGE2_TERMINAL_STEP = 40_000
+_STAGE2_CUMULATIVE_TRAINING_STEPS = 540_000
 _STAGE3_TERMINAL_STEP = 10_000
 _STAGE3_CUMULATIVE_TRAINING_STEPS = 550_000
 _PINNED_ROSTERS = {
@@ -287,8 +289,8 @@ def load_pair_manifest(path: Path, *, verify_checkpoints: bool = True) -> PairMa
     checkpoint_stage = _identifier(
         payload.get("checkpoint_stage", "stage1"), label="checkpoint_stage"
     )
-    if checkpoint_stage not in {"stage1", "stage3"}:
-        raise ValueError("checkpoint_stage must be stage1 or stage3")
+    if checkpoint_stage not in {"stage1", "stage2", "stage3"}:
+        raise ValueError("checkpoint_stage must be stage1, stage2, or stage3")
 
     arm_values = payload["arms"]
     if not isinstance(arm_values, list) or len(arm_values) != 2:
@@ -756,15 +758,16 @@ def validate_checkpoint_pair(pair: PairManifest) -> dict[str, Any]:
         ("stage1", 250_000, ("rope", "none")),
         ("stage1", 50_000, ("rope", "fingerprint")),
         ("stage1", 500_000, ("rope", "none")),
+        ("stage2", _STAGE2_TERMINAL_STEP, ("rope", "none")),
         ("stage3", _STAGE3_TERMINAL_STEP, ("rope", "none")),
     }
     if (pair.checkpoint_stage, step, pair.arm_order) not in exact_pairs:
         raise ValueError(
             "pair must be exactly stage1 step-250000 rope/none, stage1 step-50000 "
-            "rope/fingerprint, stage1 step-500000 rope/none, or exploratory stage3 "
-            "step-10000 rope/none"
+            "rope/fingerprint, stage1 step-500000 rope/none, exploratory stage2 "
+            "step-40000 rope/none, or exploratory stage3 step-10000 rope/none"
         )
-    receipt_bound_pair = pair.checkpoint_stage == "stage3" or step in {
+    receipt_bound_pair = pair.checkpoint_stage in {"stage2", "stage3"} or step in {
         250_000,
         500_000,
     }
@@ -816,7 +819,7 @@ def validate_checkpoint_pair(pair: PairManifest) -> dict[str, Any]:
         else:
             raise ValueError(
                 "missing prior_stream is only accepted for receipt-bound stage1 "
-                "step-250000/500000 or stage3 step-10000 pairs"
+                "step-250000/500000, stage2 step-40000, or stage3 step-10000 pairs"
             )
     else:
         if not all(isinstance(stream, Mapping) for stream in streams.values()):
@@ -853,7 +856,14 @@ def validate_checkpoint_pair(pair: PairManifest) -> dict[str, Any]:
             for arm in pair.arm_order
         },
     }
-    if pair.checkpoint_stage == "stage3":
+    if pair.checkpoint_stage == "stage2":
+        contract.update(
+            {
+                "comparison_stage": "stage2",
+                "cumulative_training_steps": _STAGE2_CUMULATIVE_TRAINING_STEPS,
+            }
+        )
+    elif pair.checkpoint_stage == "stage3":
         contract.update(
             {
                 "comparison_stage": "stage3",
